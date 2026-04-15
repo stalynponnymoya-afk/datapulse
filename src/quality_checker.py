@@ -386,7 +386,6 @@ def check_column_relationships(df):
                         ),
                         "sample_indices": subset[mismatches].index.tolist()[:5],
                     })
-
     if found_relationships:
         issues["product_relationships"] = found_relationships
 
