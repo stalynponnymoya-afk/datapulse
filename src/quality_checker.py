@@ -410,6 +410,88 @@ def check_column_relationships(df):
 
 
 # =====================================================
+# CHECK 8: TIPOS DE VARIABLES
+# =====================================================
+
+def analyze_variable_types(df):
+    """
+    Analiza el tipo de cada variable/columna y genera estadísticas.
+    
+    Returns:
+        - table: DataFrame con información de cada variable
+        - type_summary: Conteo de variables por tipo de dato
+    
+    La tabla incluye:
+        - column: Nombre de la columna
+        - dtype: Tipo de dato de pandas
+        - inferred_type: Tipo inferred (numeric, categorical, datetime, text, boolean)
+        - unique_count: Número de valores únicos
+        - unique_pct: Porcentaje de valores únicos
+        - null_count: Conteo de nulos
+        - null_pct: Porcentaje de nulos
+        - sample_values: Lista con hasta 5 valores ejemplo
+    
+    La lista por tipo agrupa las columnas que comparten el mismo tipo inferred.
+    """
+    variable_table = []
+    type_groups = {}
+    
+    for col in df.columns:
+        dtype = df[col].dtype
+        non_null = df[col].dropna()
+        unique_vals = non_null.unique()
+        
+        # Inferir tipo de variable
+        if pd.api.types.is_bool_dtype(dtype):
+            inferred = "boolean"
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            inferred = "datetime"
+        elif pd.api.types.is_numeric_dtype(dtype):
+            if len(unique_vals) <= 2:
+                # Pocos valores únicos puede ser categórico binario
+                inferred = "binary"
+            elif non_null.dtype in ['int64', 'int32', 'int16', 'int8']:
+                inferred = "integer"
+            else:
+                inferred = "float"
+        else:
+            # Tipo objeto o string
+            unique_pct = len(unique_vals) / len(non_null) * 100 if len(non_null) > 0 else 0
+            
+            if len(unique_vals) <= 10:
+                # Pocas categorías = categórico
+                inferred = "categorical"
+            elif len(unique_vals) / len(df) < 0.05:
+                # Baja cardinalidad = categórico
+                inferred = "categorical"
+            else:
+                inferred = "text"
+        
+        # Agregar al grupo por tipo
+        if inferred not in type_groups:
+            type_groups[inferred] = []
+        type_groups[inferred].append(col)
+        
+        # Construir fila de la tabla
+        variable_table.append({
+            "column": col,
+            "dtype": str(dtype),
+            "inferred_type": inferred,
+            "unique_count": int(len(unique_vals)),
+            "unique_pct": round(len(unique_vals) / len(df) * 100, 2) if len(df) > 0 else 0,
+            "null_count": int(df[col].isna().sum()),
+            "null_pct": round(df[col].isna().mean() * 100, 2),
+            "sample_values": unique_vals[:5].tolist() if len(unique_vals) > 0 else [],
+        })
+    
+    return {
+        "variable_table": variable_table,
+        "type_summary": {k: len(v) for k, v in type_groups.items()},
+        "type_groups": type_groups,
+    }
+
+
+# =====================================================
 # REPORTE PRINCIPAL
 # =====================================================
 
@@ -436,6 +518,7 @@ def generate_report(filepath):
     text_issues = check_text_inconsistencies(df)
     date_issues = check_invalid_dates(df)
     relationship_issues = check_column_relationships(df)
+    variable_types = analyze_variable_types(df)
 
     # --- Calcular score ---
     score = 100.0
@@ -465,6 +548,7 @@ def generate_report(filepath):
         "file": filepath,
         "shape": {"rows": len(df), "columns": len(df.columns)},
         "data_types": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "variable_analysis": variable_types,
         "null_analysis": nulls,
         "duplicate_analysis": duplicates,
         "outlier_analysis": outliers,
