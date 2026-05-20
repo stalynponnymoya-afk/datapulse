@@ -1,0 +1,64 @@
+{
+  "file": "Dummy Data HSS.csv",
+  "shape": {
+    "rows": 4572,
+    "columns": 5
+  },
+  "column_types": {
+    "TV": "float64",
+    "Radio": "float64",
+    "Social Media": "float64",
+    "Influencer": "str",
+    "Sales": "float64"
+  },
+  "null_counts": {
+    "TV": 10,
+    "Radio": 4,
+    "Social Media": 6,
+    "Influencer": 0,
+    "Sales": 6
+  },
+  "duplicates": 0,
+  "numeric_summary": {
+    "TV": {
+      "mean": 54.06685664182376,
+      "std": 26.125053891841468,
+      "min": 10.0,
+      "max": 100.0,
+      "skew": 0.0691864081643139
+    },
+    "Radio": {
+      "mean": 18.160355892662654,
+      "std": 9.676958456095429,
+      "min": 0.000683948,
+      "max": 48.87116125,
+      "skew": 0.14315004222832936
+    },
+    "Social Media": {
+      "mean": 3.323956161385458,
+      "std": 2.212670263921655,
+      "min": 3.13e-05,
+      "max": 13.98166208,
+      "skew": 0.6449131347081314
+    },
+    "Sales": {
+      "mean": 192.46660210662066,
+      "std": 93.13309168784247,
+      "min": 31.19940869,
+      "max": 364.0797515,
+      "skew": 0.0695010843586766
+    }
+  },
+  "Influencer_unique": [
+    "Mega",
+    "Micro",
+    "Nano",
+    "Macro"
+  ],
+  "Influencer_value_counts": {
+    "Mega": 1158,
+    "Micro": 1153,
+    "Nano": 1139,
+    "Macro": 1122
+  }
+}
