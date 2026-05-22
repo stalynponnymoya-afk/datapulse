@@ -1,6 +1,29 @@
 """
-DataPulse - Quality Checker v2
-Analiza la calidad de un dataset y genera un reporte detallado.
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    DATAPULSE QUALITY CHECKER v3.0                             ║
+║                   Autonomous Data Quality Analyzer                          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Módulo de análisis de calidad de datos para DataPulse.                     ║
+║  Detecta problemas comunes en datasets y genera reportes detallados.        ║
+║                                                                               ║
+║  CAPACIDADES:                                                                ║
+║  • Valores nulos y su distribución                                          ║
+║  • Filas y columnas duplicadas                                              ║
+║  • Outliers usando método IQR                                                ║
+║  • Valores negativos en columnas numéricas                                   ║
+║  • Inconsistencias de texto (mayúsculas/minúsculas, espacios)               ║
+║  • Fechas inválidas o no parseables                                         ║
+║  • Relaciones inconsistentes entre columnas                                  ║
+║  • Análisis de tipos de variables                                           ║
+║                                                                               ║
+║  INTEGRACIÓN CON GRAFO DE CONOCIMIENTO:                                     ║
+║  Este módulo puede consultarse para alimentar el Grafo de Conocimiento      ║
+║  de DataPulse. Los problemas detectados se mapean a las categorías          ║
+║  del grafo para determinar las acciones de limpieza apropiadas.             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Módulo de análisis de calidad de datos para DataPulse.
+Detecta problemas comunes en datasets y genera reportes detallados.
 
 Detecta:
   - Valores nulos
@@ -13,15 +36,16 @@ Detecta:
 
 Formatos soportados: CSV, Excel, JSON, Parquet
 """
+
 import pandas as pd
 import numpy as np
 import re
 from datetime import datetime
+from typing import Dict, List, Any, Optional
 
-
-# =====================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # CARGA DE DATOS (CSV, Excel, JSON, Parquet)
-# =====================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def load_dataset(filepath):
     """
