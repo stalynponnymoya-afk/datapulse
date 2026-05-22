@@ -1,21 +1,60 @@
 """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        DATAPULSE API v3.0                                     ║
+║                   FastAPI REST Endpoints                                     ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  API REST para análisis de calidad de datos mediante HTTP.                  ║
+║                                                                               ║
+║  ENDPOINTS:                                                                  ║
+║  • GET  /health          - Health check                                      ║
+║  • POST /analyze          - Analiza archivo y genera reporte de calidad       ║
+║  • POST /compare          - Detecta data drift entre dos archivos            ║
+║                                                                               ║
+║  INTEGRACIÓN:                                                                ║
+║  Esta API se conecta con el módulo quality_checker.py                        ║
+║  para realizar el análisis y puede integrarse con el pipeline principal      ║
+║  de DataPulse para ejecutarse como servicio web.                             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
 DataPulse API - FastAPI
 Endpoints para analizar calidad de datos via HTTP.
 """
+
 import os
 import tempfile
+from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 
 # Importar nuestro checker (está en src/)
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.quality_checker import generate_report
+from src.quality_checker import generate_report, load_dataset
 
-# Crear la app
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN DE LA APP
+# ═══════════════════════════════════════════════════════════════════════════════
+
 app = FastAPI(
     title="DataPulse API",
-    description="Monitor automático de calidad de datos",
-    version="1.0.0",
+    description="""
+## DataPulse API v3.0
+
+API REST para análisis automático de calidad de datos.
+
+### Características:
+- **Análisis de calidad**: Detecta nulos, duplicados, outliers, inconsistencias
+- **Comparación de datasets**: Detecta data drift entre versiones
+- **Multi-formato**: Soporta CSV, Excel, JSON, Parquet
+- **Score de calidad**: Genera puntuación 0-100 con veredicto
+
+### Integración con Grafo de Conocimiento:
+Los resultados del análisis pueden alimentar el Grafo de Conocimiento
+de DataPulse para determinar las acciones de limpieza apropiadas.
+    """,
+    version="3.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 
