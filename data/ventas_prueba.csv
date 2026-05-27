@@ -1,0 +1,6 @@
+id_cliente,edad,email,monto_transaccion,categoria
+C001,25,test@test.com,100.5,A
+C002,34,user@host.com,,B
+C001,25,test@test.com,100.5,A
+C003,-999,invalid_mail,-50.0,C
+C004,45,ok@ok.com,300.0,
