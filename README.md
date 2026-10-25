@@ -22,7 +22,7 @@ DataPulse combines four technologies in a single orchestrated pipeline:
 |---|---|---|
 | **Orchestrator** | LangGraph | State machine with 7 nodes, conditional retry logic |
 | **Reasoning** | LLaMA 3.3 70B via Groq | Diagnoses column types, detects problems, builds technical brief |
-| **Decision Rules** | NetworkX (Knowledge Graph) | ~58 deterministic statistical rules for cleaning decisions |
+| **Decision Rules** | NetworkX (Knowledge Graph) | ~58 base statistical rules + 24 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) — over 100 edges total |
 | **Autonomous Agent** | OpenHands Cloud API | Writes, executes, and validates the cleaning code autonomously |
 
 ### Pipeline Architecture
@@ -57,7 +57,7 @@ Your CSV/XLSX/JSON/Parquet file
 
 ### Knowledge Graph
 
-The Knowledge Graph is a `MultiDiGraph` (NetworkX) with ~58 rules organized in 6 categories:
+The Knowledge Graph is a `MultiDiGraph` (NetworkX) with ~58 base statistical rules organized in 6 categories, plus 24 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) — over 100 edges total:
 
 1. **Structural Integrity** — duplicates, empty rows/columns, column name normalization
 2. **String Cleaning** — whitespace, line breaks, case normalization, email/phone validation
@@ -150,7 +150,7 @@ requests
      ```
 3. Run the orchestrator script:
    ```bash
-   python "datapulse_2 (2).py"
+   python datapulse_prod.py
    ```
    *Note: If executed locally, the script automatically detects CSV/XLSX/JSON/Parquet files in the current working directory, or automatically generates a mock dataset (`ventas_prueba.csv`) to test-run the complete pipeline.*
 
@@ -194,7 +194,7 @@ DataPulse combina cuatro tecnologías en un pipeline orquestado:
 |---|---|---|
 | **Orquestador** | LangGraph | Máquina de estados con 7 nodos y lógica de retry condicional |
 | **Razonamiento** | LLaMA 3.3 70B vía Groq | Diagnostica tipos de columnas, detecta problemas, construye brief técnico |
-| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | ~58 reglas estadísticas deterministas para decisiones de limpieza |
+| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | ~58 reglas estadísticas base + 24 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) — más de 100 aristas totales |
 | **Agente Autónomo** | OpenHands Cloud API | Escribe, ejecuta y valida el código de limpieza de forma autónoma |
 
 ### Arquitectura del Pipeline
@@ -229,7 +229,7 @@ Tu archivo CSV/XLSX/JSON/Parquet
 
 ### Grafo de Conocimiento
 
-El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con ~58 reglas organizadas en 6 categorías:
+El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con ~58 reglas estadísticas base organizadas en 6 categorías, más 24 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) — superando las 100 aristas totales:
 
 1. **Integridad Estructural** — duplicados, filas/columnas vacías, normalización de nombres
 2. **Limpieza de Texto** — espacios, saltos de línea, normalización de caja, validación email/teléfono
@@ -322,7 +322,7 @@ requests
      ```
 3. Ejecuta el script del orquestador:
    ```bash
-   python "datapulse_2 (2).py"
+   python datapulse_prod.py
    ```
    *Nota: Si se ejecuta de forma local, el script detectará automáticamente archivos de datos (CSV/XLSX/JSON/Parquet) en tu directorio de trabajo actual, o generará un dataset de prueba mock (`ventas_prueba.csv`) de forma automática para simular el flujo completo del pipeline.*
 

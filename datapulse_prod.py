@@ -11,10 +11,12 @@ Original file is located at
 
 import os
 import re
+import sys
 import json
 import base64
 import time
 import glob
+import subprocess
 import requests
 import pandas as pd
 import networkx as nx
@@ -22,6 +24,7 @@ from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from operator import add
 from datetime import datetime
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from github import Github
@@ -43,7 +46,7 @@ MIN_SCORE_PASS    = 70
 # ║  Funciona con cualquier CSV, XLSX, JSON o Parquet.          ║
 # ║                                                             ║
 # ║  Ejemplos:                                                  ║
-# ║    GITHUB_DATA_FILE = "Dummy Data HSS.csv"   # raíz repo    ║
+# ║    GITHUB_DATA_FILE = "data/dummy_data_hss.csv"             ║
 # ║    GITHUB_DATA_FILE = "data/ventas_2024.xlsx"               ║
 # ║    GITHUB_DATA_FILE = "datasets/clientes.json"              ║
 # ║    GITHUB_DATA_FILE = ""   ← vacío = sube un archivo local  ║
@@ -90,6 +93,18 @@ TIPO_MAP = {
     "monto":                           "Variable_Financiera",
     "billing":                         "Variable_Financiera",
     "amount":                          "Variable_Financiera",
+    "precio":                          "Variable_Financiera",
+    # Aliases en inglés que el LLM puede devolver
+    "numeric_continuous":              "Variable_Numerica_Continua",
+    "numeric_discrete":                "Variable_Numerica_Discreta",
+    "boolean":                         "Variable_Booleana",
+    "categorical_nominal":             "Variable_Categorica_Nominal",
+    "categorical_ordinal":             "Variable_Categorica_Ordinal",
+    "datetime":                        "Variable_Temporal_Timestamp",
+    "free_text":                       "Texto_General",
+    "identifier":                      "Variable_Identificador",
+    "contact":                         "Variable_Contacto",
+    "financial":                       "Variable_Financiera",
 }
 
 PROBLEMA_MAP = {
@@ -98,12 +113,21 @@ PROBLEMA_MAP = {
     "nulos_altos":                     "Nulos_Criticos",
     "nulos_criticos":                  "Nulos_Criticos",
     "outlier_severo":                  "Outlier_Severo",
+    "outlier_extremo":                 "Outlier_Severo",
     "tipo_incorrecto":                 "Formato_No_Estandar",
     "nulos_disfrazados":              "Nulos_Criticos",
     "duplicados":                      "Duplicados_Registros",
     "inconsistencia_formato":          "Formato_No_Estandar",
     "escala_diferente":                "Escalas_Diferentes",
+    "cardinalidad_baja":               "Cardinalidad_Baja",
+    "cardinalidad_media":              "Cardinalidad_Baja",
+    "colinealidad_alta":               "Colinealidad_Alta",
+    "valores_negativos_inesperados":   "Rango_Invalido",
+    "rango_invalido":                  "Rango_Invalido",
     "ninguno":                         "Ninguno",
+    "none":                            "Ninguno",
+    "clean":                           "Ninguno",
+    "no_issues":                       "Ninguno",
     "sin_problema":                    "Ninguno",
     "limpio":                          "Ninguno",
     "ok":                              "Ninguno",
@@ -116,6 +140,16 @@ PROBLEMA_MAP = {
     "formato_id_inconsistente":        "Formato_ID_Inconsistente",
     "valores_constantes":              "Valores_Constantes",
     "tipos_mixtos":                    "Tipos_Mixtos",
+}
+
+# Problemas estructurales que no dependen del tipo de variable: sus reglas
+# cuelgan del nodo origen "Esquema_General" en el grafo de conocimiento.
+ESQUEMA_GENERAL_TARGETS = {
+    "Duplicados_Registros",
+    "Valores_Constantes",
+    "Encoding_Incorrecto",
+    "Filas_Vacias_Total",
+    "Columnas_Vacias_Total",
 }
 
 #Aqui estan todas las reglas logicas que pueden ser editadas , agregadas
@@ -932,6 +966,45 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
         justificacion_en="Missing IDs are NOT imputed: flagged for traceability.")
 
     # ═══════════════════════════════════════════════════════════
+    # REGLAS FALTANTES — Variable_Numerica_Discreta (nulos, outliers, rango)
+    # ═══════════════════════════════════════════════════════════
+
+    kg.add_edge("Variable_Numerica_Discreta", "Nulos_Bajos",
+        accion="fillna_median",
+        confianza=0.87,
+        parametros={},
+        justificacion_es="En discretas con pocos nulos, la mediana preserva un valor entero válido sin sesgo.",
+        justificacion_en="In discrete variables with low nulls, median preserves a valid integer value without bias.")
+
+    kg.add_edge("Variable_Numerica_Discreta", "Nulos_Medios",
+        accion="fillna_median",
+        confianza=0.86,
+        parametros={},
+        justificacion_es="La mediana es robusta ante asimetría en conteos o variables enteras.",
+        justificacion_en="Median is robust to skewness in count or integer variables.")
+
+    kg.add_edge("Variable_Numerica_Discreta", "Nulos_Criticos",
+        accion="sklearn_knn_imputer",
+        confianza=0.80,
+        parametros={"n_neighbors": 5},
+        justificacion_es="Imputación multivariada para preservar correlaciones cuando los nulos superan el 30%.",
+        justificacion_en="Multivariate imputation to preserve correlations when nulls exceed 30%.")
+
+    kg.add_edge("Variable_Numerica_Discreta", "Outlier_Severo",
+        accion="scipy_winsorize",
+        confianza=0.85,
+        parametros={"limits": [0.01, 0.01]},
+        justificacion_es="Winsorización al 1-99% controla valores extremos en conteos sin eliminar registros.",
+        justificacion_en="1-99% winsorization controls extreme count values without dropping records.")
+
+    kg.add_edge("Variable_Numerica_Discreta", "Rango_Invalido",
+        accion="clip_to_valid_range",
+        confianza=0.85,
+        parametros={"strategy": "clip_or_nan"},
+        justificacion_es="Valores negativos o imposibles en conteos/edades convertidos a NaN.",
+        justificacion_en="Negative or impossible values in counts/ages converted to NaN.")
+
+    # ═══════════════════════════════════════════════════════════
     # FIN REGLAS NUEVAS
     # ═══════════════════════════════════════════════════════════
     return kg
@@ -955,6 +1028,7 @@ def agregar_reglas_dominio(kg):
     Agrega ~120 reglas de dominio a un grafo existente.
     Llamar después de construir_grafo_conocimiento().
     """
+    count_before = kg.number_of_edges()
 
     # Nodos de problema de dominio nuevos
     problemas_dominio = [
@@ -1048,7 +1122,7 @@ def agregar_reglas_dominio(kg):
             "flag_suffix": "_rango_invalido",
         },
         confianza=0.90,
-        justificacion="Valores fuera de rango clínico fisiológicamente posible convertidos a NaN y marcados",
+        justificacion_es="Valores fuera de rango clínico fisiológicamente posible convertidos a NaN y marcados",
         justificacion_en="Values outside physiologically possible clinical range converted to NaN and flagged")
 
     # ── 1.2 SIGNOS VITALES — Datos limpios ──────────────────────
@@ -1061,7 +1135,7 @@ def agregar_reglas_dominio(kg):
             "exclude_from_encoding": True,
         },
         confianza=0.88,
-        justificacion="Signo vital limpio: mantener como numérico, no aplicar encoding ni escalado",
+        justificacion_es="Signo vital limpio: mantener como numérico, no aplicar encoding ni escalado",
         justificacion_en="Clean vital sign: keep as numeric, do not apply encoding or scaling")
 
     # ── 1.3 VALORES DE LABORATORIO ──────────────────────────────
@@ -1091,7 +1165,7 @@ def agregar_reglas_dominio(kg):
             "accion_fuera_rango": "set_nan_y_flag",
         },
         confianza=0.87,
-        justificacion="Valores de laboratorio fuera de rango imposible marcados como NaN",
+        justificacion_es="Valores de laboratorio fuera de rango imposible marcados como NaN",
         justificacion_en="Lab values outside impossible range flagged as NaN")
 
     kg.add_edge("Variable_Clinica_Laboratorio", "Nulos_Bajos",
@@ -1099,21 +1173,21 @@ def agregar_reglas_dominio(kg):
         parametros={"strategy": "flag_missing", "flag_suffix": "_lab_missing",
                     "reason": "valores de laboratorio NO se imputan con media/mediana"},
         confianza=0.90,
-        justificacion="Valores de lab faltantes NO se imputan estadísticamente — cada resultado depende del paciente. Se marcan.",
+        justificacion_es="Valores de lab faltantes NO se imputan estadísticamente — cada resultado depende del paciente. Se marcan.",
         justificacion_en="Missing lab values are NOT statistically imputed — each result is patient-specific. Flagged instead.")
 
     kg.add_edge("Variable_Clinica_Laboratorio", "Nulos_Medios",
         accion="flag_no_imputar",
         parametros={"strategy": "flag_missing", "flag_suffix": "_lab_missing"},
         confianza=0.90,
-        justificacion="Lab con nulos moderados: marcar, NO imputar. Imputar distorsiona diagnóstico clínico.",
+        justificacion_es="Lab con nulos moderados: marcar, NO imputar. Imputar distorsiona diagnóstico clínico.",
         justificacion_en="Lab with moderate nulls: flag, DO NOT impute. Imputation distorts clinical diagnosis.")
 
     kg.add_edge("Variable_Clinica_Laboratorio", "Ninguno",
         accion="mantener_sin_transformar",
         parametros={"ensure_dtype": "float64", "exclude_from_scaling": True},
         confianza=0.88,
-        justificacion="Lab limpio: mantener valores originales, no escalar (el valor absoluto tiene significado clínico)",
+        justificacion_es="Lab limpio: mantener valores originales, no escalar (el valor absoluto tiene significado clínico)",
         justificacion_en="Clean lab: keep original values, do not scale (absolute value has clinical meaning)")
 
     # ── 1.4 CÓDIGOS MÉDICOS (ICD-10, CPT, CIE) ─────────────────
@@ -1147,7 +1221,7 @@ def agregar_reglas_dominio(kg):
             "flag_suffix": "_codigo_invalido",
         },
         confianza=0.85,
-        justificacion="Códigos médicos validados contra formato oficial. Inválidos marcados, no eliminados.",
+        justificacion_es="Códigos médicos validados contra formato oficial. Inválidos marcados, no eliminados.",
         justificacion_en="Medical codes validated against official format. Invalid flagged, not removed.")
 
     kg.add_edge("Variable_Clinica_Codigo", "Ninguno",
@@ -1155,7 +1229,7 @@ def agregar_reglas_dominio(kg):
         parametros={"strategy": "keep_as_string", "strip": True, "upper": True,
                     "exclude_from_encoding": True},
         confianza=0.87,
-        justificacion="Código médico limpio: mantener como string categorica, NO aplicar OneHot ni LabelEncode",
+        justificacion_es="Código médico limpio: mantener como string categorica, NO aplicar OneHot ni LabelEncode",
         justificacion_en="Clean medical code: keep as categorical string, DO NOT apply OneHot or LabelEncode")
 
     # ── 1.5 FECHAS CLÍNICAS — Consistencia ──────────────────────
@@ -1180,7 +1254,7 @@ def agregar_reglas_dominio(kg):
             "flag_suffix": "_fecha_inconsistente",
         },
         confianza=0.90,
-        justificacion="Pares de fechas clínicas validados por lógica temporal (ingreso<=egreso, nacimiento<=ingreso)",
+        justificacion_es="Pares de fechas clínicas validados por lógica temporal (ingreso<=egreso, nacimiento<=ingreso)",
         justificacion_en="Clinical date pairs validated by temporal logic (admission<=discharge, birth<=admission)")
 
     kg.add_edge("Variable_Clinica_Fecha", "Ninguno",
@@ -1194,7 +1268,7 @@ def agregar_reglas_dominio(kg):
             ],
         },
         confianza=0.85,
-        justificacion="Fecha clínica limpia: convertir a datetime, extraer componentes, calcular estancia",
+        justificacion_es="Fecha clínica limpia: convertir a datetime, extraer componentes, calcular estancia",
         justificacion_en="Clean clinical date: convert to datetime, extract components, calculate length of stay")
 
 
@@ -1230,7 +1304,7 @@ def agregar_reglas_dominio(kg):
             "max_decimals": 4,
         },
         confianza=0.84,
-        justificacion="Montos validados: negativos marcados pero no eliminados (pueden ser devoluciones), extremos flaggeados",
+        justificacion_es="Montos validados: negativos marcados pero no eliminados (pueden ser devoluciones), extremos flaggeados",
         justificacion_en="Amounts validated: negatives flagged not removed (may be refunds), extremes flagged")
 
     # ── 2.2 TASAS Y PORCENTAJES FINANCIEROS ──────────────────────
@@ -1250,14 +1324,14 @@ def agregar_reglas_dominio(kg):
             },
         },
         confianza=0.83,
-        justificacion="Tasas financieras validadas contra rangos de mercado documentados",
+        justificacion_es="Tasas financieras validadas contra rangos de mercado documentados",
         justificacion_en="Financial rates validated against documented market ranges")
 
     kg.add_edge("Variable_Financiera_Tasa", "Ninguno",
         accion="mantener_como_float",
         parametros={"ensure_dtype": "float64", "round_decimals": 4},
         confianza=0.86,
-        justificacion="Tasa limpia: mantener como float con 4 decimales de precisión",
+        justificacion_es="Tasa limpia: mantener como float con 4 decimales de precisión",
         justificacion_en="Clean rate: keep as float with 4 decimal precision")
 
     # ── 2.3 RATIOS FINANCIEROS ──────────────────────────────────
@@ -1285,14 +1359,14 @@ def agregar_reglas_dominio(kg):
             },
         },
         confianza=0.82,
-        justificacion="Ratios financieros validados contra rangos de IFRS/Basel III/CFA",
+        justificacion_es="Ratios financieros validados contra rangos de IFRS/Basel III/CFA",
         justificacion_en="Financial ratios validated against IFRS/Basel III/CFA ranges")
 
     kg.add_edge("Variable_Financiera_Ratio", "Ninguno",
         accion="mantener_y_clasificar",
         parametros={"ensure_dtype": "float64", "flag_extreme_quartiles": True},
         confianza=0.84,
-        justificacion="Ratio limpio: mantener, marcar valores en cuartiles extremos para revisión",
+        justificacion_es="Ratio limpio: mantener, marcar valores en cuartiles extremos para revisión",
         justificacion_en="Clean ratio: keep, flag extreme quartile values for review")
 
     # ── 2.4 CONSISTENCIA CONTABLE ────────────────────────────────
@@ -1317,7 +1391,7 @@ def agregar_reglas_dominio(kg):
             "flag_suffix": "_contabilidad_inconsistente",
         },
         confianza=0.88,
-        justificacion="Validación de ecuación contable básica (IFRS). Filas inconsistentes marcadas.",
+        justificacion_es="Validación de ecuación contable básica (IFRS). Filas inconsistentes marcadas.",
         justificacion_en="Basic accounting equation validation (IFRS). Inconsistent rows flagged.")
 
 
@@ -1374,7 +1448,7 @@ def agregar_reglas_dominio(kg):
             },
         },
         confianza=0.85,
-        justificacion="Indicadores económicos validados contra rangos históricos documentados por IMF/World Bank/UNDP",
+        justificacion_es="Indicadores económicos validados contra rangos históricos documentados por IMF/World Bank/UNDP",
         justificacion_en="Economic indicators validated against historical ranges documented by IMF/World Bank/UNDP")
 
     kg.add_edge("Variable_Economica_Indicador", "Ninguno",
@@ -1385,21 +1459,21 @@ def agregar_reglas_dominio(kg):
             "percentile_threshold": [1, 99],
         },
         confianza=0.84,
-        justificacion="Indicador económico limpio: mantener, marcar percentiles extremos para revisión",
+        justificacion_es="Indicador económico limpio: mantener, marcar percentiles extremos para revisión",
         justificacion_en="Clean economic indicator: keep, flag extreme percentiles for review")
 
     kg.add_edge("Variable_Economica_Indicador", "Nulos_Bajos",
         accion="interpolate_temporal",
         parametros={"method": "linear", "limit_direction": "both", "limit": 2},
         confianza=0.82,
-        justificacion="Indicadores económicos con pocos nulos: interpolación temporal (series anuales/trimestrales)",
+        justificacion_es="Indicadores económicos con pocos nulos: interpolación temporal (series anuales/trimestrales)",
         justificacion_en="Economic indicators with few nulls: temporal interpolation (annual/quarterly series)")
 
     kg.add_edge("Variable_Economica_Indicador", "Nulos_Medios",
         accion="flag_no_imputar",
         parametros={"strategy": "flag_missing", "flag_suffix": "_dato_faltante"},
         confianza=0.85,
-        justificacion="Indicadores con nulos moderados: NO imputar (distorsiona análisis de política). Marcar.",
+        justificacion_es="Indicadores con nulos moderados: NO imputar (distorsiona análisis de política). Marcar.",
         justificacion_en="Indicators with moderate nulls: DO NOT impute (distorts policy analysis). Flag instead.")
 
 
@@ -1455,7 +1529,7 @@ def agregar_reglas_dominio(kg):
             },
         },
         confianza=0.88,
-        justificacion="Exposiciones validadas contra PEL/TLV oficiales. Valores sobre límite clasificados por nivel de riesgo.",
+        justificacion_es="Exposiciones validadas contra PEL/TLV oficiales. Valores sobre límite clasificados por nivel de riesgo.",
         justificacion_en="Exposures validated against official PEL/TLVs. Over-limit values classified by risk level.")
 
     kg.add_edge("Variable_Ocupacional_Exposicion", "Ninguno",
@@ -1466,7 +1540,7 @@ def agregar_reglas_dominio(kg):
             "exclude_from_encoding": True,
         },
         confianza=0.85,
-        justificacion="Exposición limpia: mantener valor numérico y clasificar nivel de riesgo",
+        justificacion_es="Exposición limpia: mantener valor numérico y clasificar nivel de riesgo",
         justificacion_en="Clean exposure: keep numeric value and classify risk level")
 
     kg.add_edge("Variable_Ocupacional_Exposicion", "Rango_Ocupacional_Invalido",
@@ -1486,7 +1560,7 @@ def agregar_reglas_dominio(kg):
             "accion_invalido": "set_nan_y_flag",
         },
         confianza=0.86,
-        justificacion="Mediciones ambientales fuera de rango físico posible convertidas a NaN",
+        justificacion_es="Mediciones ambientales fuera de rango físico posible convertidas a NaN",
         justificacion_en="Environmental measurements outside physically possible range converted to NaN")
 
     # ── 4.2 INCIDENTES Y ACCIDENTABILIDAD ────────────────────────
@@ -1513,7 +1587,7 @@ def agregar_reglas_dominio(kg):
             },
         },
         confianza=0.86,
-        justificacion="Métricas de accidentabilidad validadas contra definiciones OSHA/ILO",
+        justificacion_es="Métricas de accidentabilidad validadas contra definiciones OSHA/ILO",
         justificacion_en="Accident metrics validated against OSHA/ILO definitions")
 
     kg.add_edge("Variable_Ocupacional_Incidente", "Ninguno",
@@ -1527,14 +1601,14 @@ def agregar_reglas_dominio(kg):
             },
         },
         confianza=0.83,
-        justificacion="Incidentes limpios: mantener y calcular tasas estandarizadas OSHA si hay campos suficientes",
+        justificacion_es="Incidentes limpios: mantener y calcular tasas estandarizadas OSHA si hay campos suficientes",
         justificacion_en="Clean incidents: keep and calculate OSHA standardized rates if sufficient fields exist")
 
     kg.add_edge("Variable_Ocupacional_Incidente", "Nulos_Bajos",
         accion="fillna_zero",
         parametros={"fill_value": 0},
         confianza=0.84,
-        justificacion="Incidentes con nulos bajos: 0 es supuesto válido (no reportado = no ocurrió) en contexto OSHA",
+        justificacion_es="Incidentes con nulos bajos: 0 es supuesto válido (no reportado = no ocurrió) en contexto OSHA",
         justificacion_en="Incidents with low nulls: 0 is valid assumption (not reported = did not occur) in OSHA context")
 
 
@@ -1542,8 +1616,7 @@ def agregar_reglas_dominio(kg):
     # MAPEO DE TIPOS DE DOMINIO — agregar al TIPO_MAP existente
     # ═══════════════════════════════════════════════════════════════
 
-    count_before = kg.number_of_edges()
-    print(f"✅ Reglas de dominio agregadas: {kg.number_of_edges() - count_before + len(problemas_dominio)} reglas en 4 dominios")
+    print(f"✅ Reglas de dominio agregadas: {kg.number_of_edges() - count_before} reglas en 4 dominios")
     print(f"   Nodos totales: {kg.number_of_nodes()}")
     print(f"   Edges totales: {kg.number_of_edges()}")
 
@@ -1665,22 +1738,6 @@ kg = KNOWLEDGE_GRAPH
 # DATAPULSE — LANGGRAPH ORQUESTADOR (Post-Grafo cargado)
 # ═══════════════════════════════════════════════════════════════
 
-# !pip install langgraph langchain-groq langchain-core PyGithub
-
-import networkx as nx
-from typing import TypedDict, Annotated, List, Dict, Any, Optional
-from operator import add
-from datetime import datetime
-
-# LangGraph / LangChain
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage
-
-# GitHub
-from github import Github
-
 # API keys already loaded above — skipping duplicate load
 class DataPulseState(TypedDict):
     # Ingesta
@@ -1741,7 +1798,14 @@ def extract_json_from_markdown(text: str) -> dict:
         text = text[3:]
     if text.endswith("```"):
         text = text[:-3]
-    return json.loads(text.strip())
+    text = text.strip()
+
+    # El LLM puede agregar texto antes o después del objeto JSON: aislarlo
+    # por la primera '{' y la última '}' antes de parsear.
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        text = match.group(0)
+    return json.loads(text)
 
 def serialize_metadata(df: pd.DataFrame, filename: str) -> dict:
     """Produce la metadata estructurada exacta del documento del proyecto."""
@@ -1795,7 +1859,7 @@ def node_ingestar(state: DataPulseState) -> DataPulseState:
         raise ValueError(f"Formato no soportado: {ext}")
 
     metadata = serialize_metadata(df, state["filename"])
-    return {**state, "metadata": metadata}
+    return {"metadata": metadata}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1805,7 +1869,7 @@ def node_ingestar(state: DataPulseState) -> DataPulseState:
 DIAGNOSTIC_PROMPT = """Eres un ingeniero de datos senior especializado en calidad de datos. Analiza la metadata del dataset y devuelve UN SOLO JSON válido (sin markdown, sin explicaciones) con el diagnóstico por columna.
 
 Para cada columna, infiere estos campos:
-- tipo_inferido: uno de [numerica_continua_simetrica, numerica_continua_sesgada, numerica_discreta, binaria, categorica_nominal, categorica_ordinal, temporal_fecha_puntual, temporal_serie, texto_libre, identificador, contacto, financiero]
+- tipo_inferido: uno de [numerica_continua_simetrica, numerica_continua_sesgada, numerica_discreta, binaria, categorica_nominal, categorica_ordinal, temporal_fecha_puntual, temporal_serie, texto_libre, identificador, contacto, financiero, signo_vital, laboratorio, codigo_medico, fecha_clinica, tasa_interes, ratio_financiero, indicador_economico, exposicion, incidente]
 - dtype_actual: el dtype de pandas
 - problemas: LISTA de todos los problemas detectados (puede tener varios). Valores posibles:
     nulos_bajos, nulos_medios, nulos_altos, nulos_criticos,
@@ -1818,6 +1882,9 @@ Para cada columna, infiere estos campos:
     cardinalidad_baja, cardinalidad_media, cardinalidad_excesiva,
     colinealidad_alta,
     valores_negativos_inesperados, ← negativos en columnas que deberían ser ≥0 (edad, precio, cantidad)
+    rango_clinico_invalido, codigo_medico_invalido, fecha_clinica_inconsistente,
+    rango_financiero_invalido, consistencia_contable, rango_economico_invalido,
+    rango_ocupacional_invalido, exposicion_limite_excedido,
     ninguno
 - problema_principal: el problema más crítico de la lista (una sola cadena)
 - severidad: uno de [baja, media, alta, critica]
@@ -1854,7 +1921,7 @@ def node_diagnosticar(state: DataPulseState) -> DataPulseState:
     prompt = DIAGNOSTIC_PROMPT.format(metadata_json=json.dumps(state["metadata"], ensure_ascii=False, indent=2))
     response = llm.invoke([HumanMessage(content=prompt)])
     diagnostico = extract_json_from_markdown(response.content)
-    return {**state, "diagnostico": diagnostico}
+    return {"diagnostico": diagnostico}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1864,77 +1931,15 @@ def node_diagnosticar(state: DataPulseState) -> DataPulseState:
 def _map_tipo_problema(tipo_inferido: str, problema: str) -> tuple:
     """
     Mapea los tipos/problemas del LLM a los nodos del grafo kg.
+
+    Consulta los diccionarios globales TIPO_MAP y PROBLEMA_MAP, que incluyen
+    tanto las reglas estadísticas base como las reglas de dominio (Salud,
+    Finanzas, Economía y Seguridad Ocupacional).
+
     Retorna (source_node, target_node) o (None, None) si no hay match.
     """
-    # Mapeo de tipos inferidos a nodos SOURCE del grafo
-    # Cubre tanto los tipos base como los tipos extendidos del nuevo prompt
-    tipo_map = {
-        # tipos base
-        "numerica_continua_simetrica": "Variable_Numerica_Continua",
-        "numerica_continua_sesgada":   "Variable_Numerica_Continua",
-        "numerica_continua":           "Variable_Numerica_Continua",
-        "numerica_discreta":           "Variable_Numerica_Discreta",
-        "binaria":                     "Variable_Booleana",
-        "categorica_nominal":          "Variable_Categorica_Nominal",
-        "categorica_ordinal":          "Variable_Categorica_Ordinal",
-        "temporal_fecha_puntual":      "Variable_Temporal_Timestamp",
-        "temporal_serie":              "Variable_Temporal_Timestamp",
-        "temporal":                    "Variable_Temporal_Timestamp",
-        "texto_libre":                 "Texto_General",
-        "texto":                       "Texto_General",
-        # tipos extendidos (nuevo diagnóstico)
-        "identificador":               "Variable_Identificador",
-        "id":                          "Variable_Identificador",
-        "contacto":                    "Variable_Contacto",
-        "email":                       "Variable_Contacto",
-        "telefono":                    "Variable_Contacto",
-        "financiero":                  "Variable_Financiera",
-        "monto":                       "Variable_Financiera",
-        "precio":                      "Variable_Financiera",
-        # aliases que el LLM puede devolver
-        "numeric_continuous":          "Variable_Numerica_Continua",
-        "numeric_discrete":            "Variable_Numerica_Discreta",
-        "boolean":                     "Variable_Booleana",
-        "categorical_nominal":         "Variable_Categorica_Nominal",
-        "categorical_ordinal":         "Variable_Categorica_Ordinal",
-        "datetime":                    "Variable_Temporal_Timestamp",
-        "free_text":                   "Texto_General",
-        "identifier":                  "Variable_Identificador",
-        "contact":                     "Variable_Contacto",
-        "financial":                   "Variable_Financiera",
-    }
-
-    # Mapeo de problemas a nodos TARGET del grafo
-    problema_map = {
-        "nulos_bajos":                    "Nulos_Bajos",
-        "nulos_medios":                   "Nulos_Medios",
-        "nulos_altos":                    "Nulos_Criticos",
-        "nulos_criticos":                 "Nulos_Criticos",
-        "outlier_severo":                 "Outlier_Severo",
-        "outlier_extremo":                "Outlier_Severo",
-        "tipo_incorrecto":                "Formato_No_Estandar",
-        "nulos_disfrazados":              "Nulos_Criticos",   # centinelas → tratar como nulos
-        "duplicados":                     "Duplicados_Registros",
-        "inconsistencia_formato":         "Formato_No_Estandar",
-        "escala_diferente":               "Escalas_Diferentes",
-        "cardinalidad_baja":              "Cardinalidad_Baja",
-        "cardinalidad_media":             "Cardinalidad_Baja",
-        "cardinalidad_excesiva":          "Cardinalidad_Excesiva",
-        "colinealidad_alta":              "Colinealidad_Alta",
-        "valores_negativos_inesperados":  "Rango_Invalido",   # mapeado al nodo de rango
-        "rango_invalido":                 "Rango_Invalido",
-        "espacios_extra":                 "Espacios_Extra",
-        "pii_detectado":                  "PII_Detectado",
-        "valores_constantes":             "Valores_Constantes",
-        "tipos_mixtos":                   "Tipos_Mixtos",
-        "ninguno":                        None,
-        "none":                           None,
-        "clean":                          None,
-        "no_issues":                      None,
-    }
-
-    src = tipo_map.get(tipo_inferido)
-    tgt = problema_map.get(problema)
+    src = TIPO_MAP.get(tipo_inferido)
+    tgt = PROBLEMA_MAP.get(problema)
     return src, tgt
 
 
@@ -1970,12 +1975,18 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
 
         for problema in problemas_lista:
             _, tgt = _map_tipo_problema(tipo, problema)
-            if src is None or tgt is None:
+            if tgt is None:
                 fallbacks_col.append(problema)
                 continue
             edges_data = []
-            if kg.has_edge(src, tgt):
+            if src is not None and kg.has_edge(src, tgt):
                 for key, data in kg[src][tgt].items():
+                    edges_data.append(data)
+            if not edges_data and tgt in ESQUEMA_GENERAL_TARGETS and kg.has_edge("Esquema_General", tgt):
+                # Problemas estructurales (duplicados, filas/columnas vacías,
+                # valores constantes, encoding) no dependen del tipo de variable:
+                # la regla vive bajo el nodo origen "Esquema_General".
+                for key, data in kg["Esquema_General"][tgt].items():
                     edges_data.append(data)
             if not edges_data:
                 fallbacks_col.append(problema)
@@ -2003,7 +2014,7 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             "diagnostico_original": diag,
         }
 
-    return {**state, "acciones_grafo": acciones}
+    return {"acciones_grafo": acciones}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2063,26 +2074,121 @@ def node_planificar(state: DataPulseState) -> DataPulseState:
     plan = parsed.get("plan_acciones", [])
     brief = parsed.get("brief_tecnico", "")
 
-    return {**state, "plan_acciones": plan, "brief_tecnico": brief}
+    return {"plan_acciones": plan, "brief_tecnico": brief}
 
 
 # ═══════════════════════════════════════════════════════════════
 # 8. NODE 5 — EJECUTAR (OpenHands Cloud API)
 # ═══════════════════════════════════════════════════════════════
 
+LOCAL_GENERATION_PROMPT = """Eres un ingeniero de datos senior. Escribe el script Python COMPLETO y ejecutable que aplica el siguiente plan de limpieza sobre el dataset indicado.
+
+{brief}
+
+## ARCHIVO DE DATOS
+- Ruta: {data_path}
+- Formato: {file_ext}
+- Filas: {filas}
+- Columnas: {columnas}
+
+## ENTREGABLES OBLIGATORIOS
+1. Guarda el script como datapulse_pipeline.py
+2. Al ejecutarse, debe escribir en el directorio de trabajo:
+   - quality_report.json con EXACTAMENTE este formato:
+     {{"score_before": <int 0-100>, "score_after": <int 0-100>, "score": <mismo que score_after>}}
+   - cleaning_log.json con la lista de decisiones aplicadas (columna, accion, justificacion)
+   - processed_data.csv con el dataset limpio
+3. Debe imprimir al final: print('"score":', score_after)
+
+Devuelve ÚNICAMENTE el código Python, sin markdown ni explicaciones."""
+
+
+def _run_local_groq_pipeline(state: DataPulseState) -> dict:
+    """
+    Fallback sin OPENHANDS_API_KEY: usa ChatGroq para generar el pipeline,
+    lo ejecuta localmente con subprocess y lee los reportes reales generados.
+    Permite probar el flujo completo solo con GROQ_API_KEY.
+    """
+    run_dir = os.path.join("outputs", datetime.now().strftime("%Y%m%d-%H%M%S") + "-local")
+    os.makedirs(run_dir, exist_ok=True)
+
+    llm = get_groq_llm()
+    prompt = LOCAL_GENERATION_PROMPT.format(
+        brief=state.get("brief_tecnico", ""),
+        data_path=os.path.abspath(state["filename_path"]),
+        file_ext=state.get("file_ext", ""),
+        filas=state["metadata"].get("filas", "?"),
+        columnas=state["metadata"].get("columnas", "?"),
+    )
+    response = llm.invoke([HumanMessage(content=prompt)])
+    codigo = response.content.strip()
+    # Quitar envoltorios markdown si el LLM los agrega
+    if codigo.startswith("```"):
+        codigo = re.sub(r"^```[a-zA-Z]*\n?", "", codigo)
+        codigo = re.sub(r"\n?```$", "", codigo).strip()
+
+    script_path = os.path.join(run_dir, "datapulse_pipeline.py")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(codigo)
+
+    archivos_generados = {"datapulse_pipeline.py": codigo}
+    status = "finished"
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "datapulse_pipeline.py"],
+            cwd=run_dir, capture_output=True, text=True, timeout=OH_TIMEOUT_SEG,
+        )
+        stdout = proc.stdout or ""
+        if proc.returncode != 0:
+            status = "error"
+            print(f"   ⚠️ Pipeline local terminó con código {proc.returncode}")
+            print((proc.stderr or "")[-500:])
+    except subprocess.TimeoutExpired:
+        status = "error"
+        stdout = ""
+        print(f"   ⚠️ Pipeline local excedió {OH_TIMEOUT_SEG}s")
+
+    # Leer los reportes reales generados localmente
+    for fname in ("quality_report.json", "cleaning_log.json", "processed_data.csv"):
+        fpath = os.path.join(run_dir, fname)
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                archivos_generados[fname] = f.read()
+
+    score = 0
+    if "quality_report.json" in archivos_generados:
+        try:
+            qr = json.loads(archivos_generados["quality_report.json"])
+            s = qr.get("score") or qr.get("score_after") or qr.get("score_despues")
+            if isinstance(s, (int, float)):
+                score = int(s)
+        except Exception:
+            pass
+    if score == 0:
+        m = re.search(r'"score"\s*[:\s]+(\d+)', stdout)
+        if m:
+            score = int(m.group(1))
+
+    print(f"   📈 Score (local Groq): {score}")
+
+    return {
+        "intentos": state.get("intentos", 0) + 1,
+        "openhands_status": status,
+        "score_despues": score,
+        "codigo": codigo,
+        "archivos_generados": archivos_generados,
+    }
+
+
 def node_ejecutar(state: DataPulseState) -> DataPulseState:
     """
     OpenHands Cloud API — sube archivo a GitHub + flujo real de 5 pasos.
+    Sin OPENHANDS_API_KEY, genera y ejecuta el pipeline localmente con Groq.
     """
     if not OPENHANDS_API_KEY:
-        return {
-            **state,
-            "intentos": state.get("intentos", 0) + 1,
-            "openhands_status": "finished",
-            "score_despues": 85,
-            "codigo": "# simulado — sin OPENHANDS_API_KEY",
-            "archivos_generados": {},
-        }
+        print("   ℹ️ OPENHANDS_API_KEY vacío — generando pipeline local con Groq...")
+        return _run_local_groq_pipeline(state)
 
     headers = {
         "Authorization": f"Bearer {OPENHANDS_API_KEY}",
@@ -2294,8 +2400,16 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
                     act = ev.get("action")
                     if isinstance(act, dict):
                         kind = act.get("kind", "")
-                        if kind == "FileEditorAction" and act.get("command") == "create" and act.get("file_text"):
-                            archivos[act.get("path", "")] = act["file_text"]
+                        if kind == "FileEditorAction":
+                            path = act.get("path", "")
+                            cmd = act.get("command", "")
+                            if cmd == "create" and act.get("file_text"):
+                                archivos[path] = act["file_text"]
+                            elif cmd == "str_replace" and path in archivos:
+                                old = act.get("old_str", "")
+                                new = act.get("new_str", "")
+                                if old:
+                                    archivos[path] = archivos[path].replace(old, new)
                         elif kind == "FinishAction":
                             finish_msg = act.get("message", "")
                     obs = ev.get("observation")
@@ -2352,7 +2466,6 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         print(f"   📈 Score: {score}")
 
         return {
-            **state,
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": final_status,
             "score_despues": score,
@@ -2364,7 +2477,6 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         err_msg = f"{type(e).__name__}: {str(e)[:300]}"
         print(f"   ❌ {err_msg}")
         return {
-            **state,
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": "error",
             "error_history": [err_msg],
@@ -2390,35 +2502,17 @@ def router_validar_score(state: DataPulseState) -> str:
     return "end_no_commit"
 
 def node_validar_score(state: DataPulseState) -> DataPulseState:
-    # Este nodo principalmente actúa como passthrough antes del router
-    # El router usa el estado para decidir la transición
-    return state
+    # Nodo passthrough: el router lee el estado para decidir la transición.
+    # No modifica ninguna clave, por eso retorna un diccionario vacío.
+    return {}
 
 
 # ═══════════════════════════════════════════════════════════════
 # 10. NODE 7 — COMMIT A GITHUB
 # ═══════════════════════════════════════════════════════════════
 
-def node_commit(state: DataPulseState) -> DataPulseState:
-    try:
-        from github import Auth as GithubAuth
-        g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
-    except ImportError:
-        g = Github(GITHUB_TOKEN)  # fallback para PyGitHub < 1.58
-    repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
-    
-    try:
-        base = repo.get_branch("main")
-    except Exception:
-        base = repo.get_branch("master")
-        
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    branch_name = f"feature/datapulse-{ts}"
-
-    # Crear rama
-    repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base.commit.sha)
-
-    # Preparar archivos a subir
+def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
+    """Construye la lista (path_en_repo, contenido) de archivos a publicar."""
     files_to_commit = []
 
     # 1. Auditoría
@@ -2440,42 +2534,84 @@ def node_commit(state: DataPulseState) -> DataPulseState:
 
     # 2. Agregar los archivos generados reales de OpenHands si existen en el estado
     archivos_generados = state.get("archivos_generados", {})
-    
+
     # Si OpenHands no los tiene, pero tenemos código en 'codigo', lo guardamos como fallback
     if not archivos_generados and state.get("codigo"):
         archivos_generados = {"datapulse_pipeline.py": state["codigo"]}
-        
+
     for original_path, content in archivos_generados.items():
         fname = os.path.basename(original_path)
-        
+
         # Omitir archivos vacíos o directorios
         if not fname or not content:
             continue
-            
+
         # Regla de tamaño: si supera 50MB, omitimos
         try:
             content_bytes = content.encode('utf-8')
         except AttributeError:
             content_bytes = content
-            
+
         if len(content_bytes) > 50 * 1024 * 1024:
             print(f"   ⚠️ Archivo {fname} omitido de GitHub por superar el límite de 50MB ({len(content_bytes)/(1024*1024):.2f}MB).")
             continue
-            
-        # Subir a la rama
+
+        # Ubicar en la raíz o bajo outputs/{ts}/ según su tipo
         if fname in ("datapulse_pipeline.py", "quality_report.json", "cleaning_log.json", "eda_report.html") or "_clean.csv" in fname or "processed_data.csv" in fname:
             files_to_commit.append((fname, content))
         else:
             files_to_commit.append((f"outputs/{ts}/{fname}", content))
 
-    # Commit y push de cada archivo — eliminar versión previa si existe
-    commit_msg = f"DataPulse run {ts} — score: {state['score_despues']}"
+    return files_to_commit
+
+
+def _save_outputs_locally(files_to_commit: list, ts: str) -> str:
+    """Guarda todos los archivos generados en outputs/{ts}/ y retorna la ruta."""
+    out_dir = os.path.join("outputs", ts)
+    os.makedirs(out_dir, exist_ok=True)
     for path_in_repo, content in files_to_commit:
+        dest = os.path.join(out_dir, os.path.basename(path_in_repo))
+        if isinstance(content, (bytes, bytearray)):
+            with open(dest, "wb") as f:
+                f.write(content)
+        else:
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(content)
+        print(f"   💾 Guardado local: {dest}")
+    return out_dir
+
+
+def node_commit(state: DataPulseState) -> DataPulseState:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    files_to_commit = _build_files_to_commit(state, ts)
+
+    # Sin token → publicar en el sistema de archivos local
+    if not GITHUB_TOKEN:
+        print("   ℹ️ GITHUB_TOKEN vacío — guardando salidas localmente en outputs/.")
+        _save_outputs_locally(files_to_commit, ts)
+        return {"github_url": f"local://outputs/{ts}"}
+
+    try:
         try:
-            if isinstance(content, str):
-                encoded_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-            else:
-                encoded_content = base64.b64encode(content).decode('utf-8')
+            from github import Auth as GithubAuth
+            g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
+        except ImportError:
+            g = Github(GITHUB_TOKEN)  # fallback para PyGitHub < 1.58
+        repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+
+        try:
+            base = repo.get_branch("main")
+        except Exception:
+            base = repo.get_branch("master")
+
+        branch_name = f"feature/datapulse-{ts}"
+
+        # Crear rama
+        repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base.commit.sha)
+
+        # Commit y push de cada archivo — eliminar versión previa si existe
+        commit_msg = f"DataPulse run {ts} — score: {state['score_despues']}"
+        for path_in_repo, content in files_to_commit:
             try:
                 existing = repo.get_contents(path_in_repo, ref=branch_name)
                 repo.delete_file(
@@ -2486,18 +2622,25 @@ def node_commit(state: DataPulseState) -> DataPulseState:
                 )
             except Exception:
                 pass  # archivo nuevo, nada que eliminar
+            # PyGithub codifica en Base64 internamente: pasar el contenido tal cual
             repo.create_file(
                 path=path_in_repo,
                 message=commit_msg,
-                content=encoded_content,
+                content=content,
                 branch=branch_name,
             )
             print(f"   ✅ Versionado en GitHub: {path_in_repo}")
-        except Exception as e:
-            print(f"   ❌ Error subiendo {path_in_repo} a GitHub: {e}")
 
-    url = f"https://github.com/{GITHUB_USERNAME}/{GITHUB_REPO}/tree/{branch_name}"
-    return {**state, "github_url": url}
+        url = f"https://github.com/{GITHUB_USERNAME}/{GITHUB_REPO}/tree/{branch_name}"
+        return {"github_url": url}
+
+    except Exception as e:
+        # 403 Forbidden, token inválido o falta de permisos (p. ej. un usuario
+        # externo que clona el repo): conservar el trabajo en disco.
+        print(f"   ⚠️ GitHub no disponible ({type(e).__name__}: {str(e)[:200]})")
+        print("   ℹ️ Guardando salidas localmente en outputs/.")
+        _save_outputs_locally(files_to_commit, ts)
+        return {"github_url": f"local://outputs/{ts}"}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2575,7 +2718,7 @@ def run_datapulse(
         run_datapulse("/content/mis_datos.csv")
 
     Uso — archivo ya en GitHub (recomendado para evitar re-uploads):
-        run_datapulse(github_file="Dummy Data HSS.csv")
+        run_datapulse(github_file="data/dummy_data_hss.csv")
         run_datapulse(github_file="data/ventas.xlsx", github_branch="dev")
 
     Si GITHUB_DATA_FILE está configurado arriba, no hace falta pasar argumentos:
@@ -2607,7 +2750,7 @@ def run_datapulse(
         raise ValueError(
             "Debes indicar un archivo. Ejemplos:\n"
             "  run_datapulse('/content/datos.csv')\n"
-            "  run_datapulse(github_file='Dummy Data HSS.csv')\n"
+            "  run_datapulse(github_file='data/dummy_data_hss.csv')\n"
             "  O configurar GITHUB_DATA_FILE al inicio del script."
         )
 
