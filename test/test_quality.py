@@ -247,6 +247,40 @@ def test_router_retry_policy():
         f"(OH_MAX_RETRIES={OH_MAX_RETRIES}, OH_MAX_SCORE_RETRIES={OH_MAX_SCORE_RETRIES})"
     )
 
+def test_extract_json_robust():
+    """
+    El extractor debe tolerar vallas markdown, prosa/razonamiento alrededor y
+    respuestas truncadas, y dar un error claro ante una respuesta vacía.
+    """
+    from datapulse_prod import extract_json_from_markdown
+
+    # JSON limpio y envuelto en markdown
+    assert extract_json_from_markdown('{"a": 1}') == {"a": 1}
+    assert extract_json_from_markdown('```json\n{"a": 1}\n```') == {"a": 1}
+
+    # Prosa con llaves antes/después del JSON real (rompía la regex codiciosa)
+    assert extract_json_from_markdown(
+        'La clave {"id","edad"} son columnas.\n{"a": {"b": 2}}\nfin {"y"}'
+    ) == {"a": {"b": 2}}
+
+    # Respuesta truncada a mitad: se rescatan las columnas completas
+    truncado = '{"col_1": {"tipo": "x"}, "col_2": {"tipo": "y"}, "col_3": {"tipo": "trun'
+    res = extract_json_from_markdown(truncado)
+    assert res["col_1"] == {"tipo": "x"} and res["col_2"] == {"tipo": "y"}
+
+    # Respuesta vacía: error explícito, no JSONDecodeError
+    for vacio in ("", "   \n  "):
+        try:
+            extract_json_from_markdown(vacio)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Una respuesta vacía debe lanzar ValueError")
+
+    print("✅ Extractor JSON: markdown, prosa, truncamiento y vacío resueltos")
+
+
+
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -263,6 +297,7 @@ if __name__ == "__main__":
         test_esquema_general_fallback()
         test_all_map_combinations_resolve()
         test_router_retry_policy()
+        test_extract_json_robust()
 
         print("\n" + "=" * 60)
         print("✅ ALL TESTS PASSED")

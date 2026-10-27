@@ -121,6 +121,11 @@ requests
 > `llama-3.3-70b-versatile` because it was free on Groq's tier, but Groq **deprecated it
 > on 16 Aug 2026** (it moved to Enterprise / contact-sales). Pick any model your Groq
 > account has access to — see the [Groq supported models](https://console.groq.com/docs/models).
+>
+> **Reasoning models** (GPT-OSS, Qwen, Muse, MiniMax) spend part of the token budget
+> thinking before answering. DataPulse detects them and raises `max_tokens` to 8192 with
+> `reasoning_effort="low"`, so the JSON reply is not truncated. If you pick a model with a
+> very low completion limit, raise `max_tokens` in `get_groq_llm()` accordingly.
 
 ### Quick Start
 
@@ -307,6 +312,11 @@ requests
 > `llama-3.3-70b-versatile` porque era gratuito en el tier de Groq, pero Groq **lo deprecó
 > el 16/08/2026** (pasó a Enterprise / contacto con ventas). Usa cualquier modelo al que tu
 > cuenta de Groq tenga acceso — ver [modelos soportados de Groq](https://console.groq.com/docs/models).
+>
+> **Modelos de razonamiento** (GPT-OSS, Qwen, Muse, MiniMax) gastan parte del presupuesto
+> de tokens pensando antes de responder. DataPulse los detecta y sube `max_tokens` a 8192
+> con `reasoning_effort="low"`, para que la respuesta JSON no se trunque. Si eliges un
+> modelo con un límite de salida muy bajo, sube `max_tokens` en `get_groq_llm()`.
 
 ### Inicio Rápido
 

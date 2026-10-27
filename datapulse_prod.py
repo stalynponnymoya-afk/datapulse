@@ -1788,31 +1788,172 @@ class DataPulseState(TypedDict):
 # 3. HELPERS Y CLIENTES
 # ═══════════════════════════════════════════════════════════════
 
+# Modelos de Groq con razonamiento explícito: gastan parte del presupuesto de
+# tokens en pensar y admiten el parámetro reasoning_effort.
+_REASONING_MODEL_HINTS = ("gpt-oss", "qwen", "muse", "minimax")
+
+
+def _is_reasoning_model(model_name: str) -> bool:
+    return any(hint in model_name.lower() for hint in _REASONING_MODEL_HINTS)
+
+
 def get_groq_llm():
-    return ChatGroq(
+    kwargs = dict(
         groq_api_key=GROQ_API_KEY,
         model_name=GROQ_MODEL,
-        temperature=0.1,
-        max_tokens=4096
+        # Los modelos de razonamiento consumen tokens pensando antes de emitir
+        # la respuesta: un presupuesto corto trunca el JSON y rompe el parseo.
+        max_tokens=8192,
     )
+    if _is_reasoning_model(GROQ_MODEL):
+        # Groq recomienda 0.5-0.7 y effort bajo en modelos de razonamiento;
+        # temperaturas muy bajas provocan repeticiones que también truncan.
+        kwargs["temperature"] = 0.6
+        kwargs["reasoning_effort"] = "low"
+    else:
+        kwargs["temperature"] = 0.1
+    return ChatGroq(**kwargs)
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Quita una valla ```lang ... ``` que envuelva toda la respuesta."""
+    match = re.match(r"^```[a-zA-Z0-9_-]*\s*\n?(.*?)\n?```\s*$", text.strip(), re.DOTALL)
+    return match.group(1).strip() if match else text.strip()
+
+
+def _structures_balanced(text: str) -> bool:
+    """True si las comillas y los pares llave/corchete del texto están cerrados."""
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if not stack:
+                return False
+            stack.pop()
+    return not stack and not in_string
+
+
+def _scan_largest_json_object(text: str) -> Optional[dict]:
+    """
+    Devuelve el objeto JSON de mayor extensión presente en el texto.
+
+    Recorre cada '{' con JSONDecoder.raw_decode en lugar de una regex
+    codiciosa: ignora prosa o razonamiento que contenga llaves, y al preferir
+    el objeto más largo descarta fragmentos anidados pequeños.
+    """
+    decoder = json.JSONDecoder()
+    best: Optional[dict] = None
+    best_span = 0
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            obj, end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and end > best_span:
+            best, best_span = obj, end
+    return best
+
+
+def _close_open_structures(text: str) -> str:
+    """Cierra comillas, llaves y corchetes abiertos para rescatar JSON truncado."""
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if stack:
+                stack.pop()
+
+    repaired = text + ('"' if in_string else "")
+    repaired = repaired.rstrip()
+    while repaired and repaired[-1] in ",:":
+        repaired = repaired[:-1].rstrip()
+    for opener in reversed(stack):
+        repaired += "}" if opener == "{" else "]"
+    return repaired
+
+
+def _repair_truncated_json(text: str) -> Optional[dict]:
+    """Recupera un objeto JSON truncado: se queda con el prefijo válido más largo."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    body = text[start:]
+
+    cuts = [len(body)]
+    cuts.extend(match.start() for match in re.finditer(r"[,{]", body))
+    for cut in sorted(cuts, reverse=True):
+        candidate = _close_open_structures(body[:cut].rstrip().rstrip(","))
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
 
 def extract_json_from_markdown(text: str) -> dict:
-    """Extrae JSON de respuestas del LLM que vienen envueltas en markdown."""
-    text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
+    """
+    Extrae el objeto JSON de una respuesta del LLM.
 
-    # El LLM puede agregar texto antes o después del objeto JSON: aislarlo
-    # por la primera '{' y la última '}' antes de parsear.
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        text = match.group(0)
-    return json.loads(text)
+    Estrategias: parseo directo y, si falla, según el balance de estructuras,
+    búsqueda del objeto válido más extenso (JSON completo rodeado de prosa) o
+    reparación del JSON truncado (respuesta cortada a mitad).
+    """
+    if not text or not text.strip():
+        raise ValueError("El LLM devolvió una respuesta vacía; no hay JSON que extraer.")
+
+    cleaned = _strip_markdown_fences(text)
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Si las estructuras están balanceadas el JSON está completo, sólo rodeado
+    # de prosa: el objeto válido más extenso es la respuesta real. Si están
+    # desbalanceadas, la respuesta se truncó y hay que repararla.
+    if _structures_balanced(cleaned):
+        parsed = _scan_largest_json_object(cleaned)
+    else:
+        parsed = _repair_truncated_json(cleaned)
+    if parsed is not None:
+        return parsed
+
+    raise ValueError(
+        "No se pudo extraer JSON válido de la respuesta del LLM. "
+        f"Inicio de la respuesta: {cleaned[:300]!r}"
+    )
 
 def serialize_metadata(df: pd.DataFrame, filename: str) -> dict:
     """Produce la metadata estructurada exacta del documento del proyecto."""
@@ -2127,8 +2268,20 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         filas=state["metadata"].get("filas", "?"),
         columnas=state["metadata"].get("columnas", "?"),
     )
-    response = llm.invoke([HumanMessage(content=prompt)])
-    codigo = response.content.strip()
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+    except Exception as exc:
+        msg = f"Groq no pudo generar el pipeline: {type(exc).__name__}: {str(exc)[:300]}"
+        print(f"   ❌ {msg}")
+        return {
+            "intentos": state.get("intentos", 0) + 1,
+            "openhands_status": "error",
+            "error_history": [msg],
+            "score_despues": 0,
+            "codigo": "",
+            "archivos_generados": {},
+        }
+    codigo = (response.content or "").strip()
     # Quitar envoltorios markdown si el LLM los agrega
     if codigo.startswith("```"):
         codigo = re.sub(r"^```[a-zA-Z]*\n?", "", codigo)
@@ -2162,6 +2315,12 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         if os.path.exists(fpath):
             with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
                 archivos_generados[fname] = f.read()
+
+    if status == "finished" and not any(
+        name in archivos_generados for name in ("quality_report.json", "cleaning_log.json")
+    ):
+        status = "error"
+        print("   ⚠️ El pipeline local no generó quality_report.json ni cleaning_log.json")
 
     score = 0
     if "quality_report.json" in archivos_generados:
@@ -2842,8 +3001,14 @@ def main() -> None:
     # ── Detectar archivo de datos ─────────────────────────────────
     formatos = ["*.csv", "*.xlsx", "*.json", "*.parquet"]
     archivos_locales = []
-    for pat in formatos:
-        archivos_locales.extend(glob.glob(pat))
+    for carpeta in (".", "data", "datasets"):
+        for pat in formatos:
+            archivos_locales.extend(sorted(glob.glob(os.path.join(carpeta, pat))))
+    # Los reportes de salida no son datasets de entrada
+    archivos_locales = [
+        p for p in archivos_locales
+        if os.path.basename(p) not in ("quality_report.json", "cleaning_log.json")
+    ]
 
     if archivos_locales:
         filepath = os.path.abspath(archivos_locales[0])
