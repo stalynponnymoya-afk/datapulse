@@ -129,7 +129,7 @@ requests
 #### Option B: Local Execution (Standard Python Environment)
 1. Clone the repository and install the dependencies:
    ```bash
-   pip install pandas numpy networkx langgraph langchain-groq pygithub requests openpyxl pyarrow
+   pip install -r requirements.txt
    ```
 2. Configure the required environment variables:
    * On Linux/macOS:
@@ -301,7 +301,7 @@ requests
 #### Opción B: Ejecución Local (Entorno Python Estándar)
 1. Clona el repositorio e instala las dependencias:
    ```bash
-   pip install pandas numpy networkx langgraph langchain-groq pygithub requests openpyxl pyarrow
+   pip install -r requirements.txt
    ```
 2. Configura las variables de entorno obligatorias:
    * En Linux/macOS:
