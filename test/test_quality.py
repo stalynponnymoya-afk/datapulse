@@ -204,6 +204,50 @@ def test_all_map_combinations_resolve():
     print(f"✅ All {len(combos)} graph-backed (type, problem) combinations resolved")
 
 
+def test_router_retry_policy():
+    """
+    Infra failures must not re-launch sandboxes (short budget), while a low
+    score from a successful run must still get an autocorrection retry.
+    """
+    from datapulse_prod import (
+        router_validar_score,
+        OH_MAX_RETRIES,
+        OH_MAX_SCORE_RETRIES,
+        OH_RETRY_ON_LOW_SCORE,
+    )
+
+    def walk(status, score):
+        intentos, path = 0, []
+        while True:
+            intentos += 1
+            decision = router_validar_score(
+                {"intentos": intentos, "openhands_status": status, "score_despues": score}
+            )
+            path.append(decision)
+            if decision != "retry":
+                return path
+
+    # Error de infraestructura: presupuesto corto, nunca commit.
+    infra = walk("error", 0)
+    assert infra[-1] == "end_no_commit", infra
+    assert "commit" not in infra, infra
+
+    # Score bajo con ejecución OK: se agota el presupuesto de autocorrección.
+    # OH_MAX_SCORE_RETRIES es el total de intentos, así que los reintentos son uno menos.
+    assert OH_RETRY_ON_LOW_SCORE, "Autocorrection should be enabled by default"
+    low = walk("finished", 40)
+    assert low.count("retry") == OH_MAX_SCORE_RETRIES - 1, low
+    assert len(low) <= OH_MAX_SCORE_RETRIES, low
+    assert low[-1] == "end_no_commit", low
+
+    # Score suficiente: commit directo.
+    assert walk("finished", 85) == ["commit"]
+    print(
+        f"✅ Router: infra={infra} | low_score={low} "
+        f"(OH_MAX_RETRIES={OH_MAX_RETRIES}, OH_MAX_SCORE_RETRIES={OH_MAX_SCORE_RETRIES})"
+    )
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("🧪 DataPulse Test Suite")
@@ -218,6 +262,7 @@ if __name__ == "__main__":
         test_clean_data_edges_activated()
         test_esquema_general_fallback()
         test_all_map_combinations_resolve()
+        test_router_retry_policy()
 
         print("\n" + "=" * 60)
         print("✅ ALL TESTS PASSED")

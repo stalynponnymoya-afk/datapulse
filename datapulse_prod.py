@@ -37,7 +37,9 @@ GITHUB_REPO       = "datapulse"
 GROQ_MODEL        = "llama-3.3-70b-versatile"
 OH_TIMEOUT_SEG    = 900    # ventana de ejecución remota en OpenHands (~15 min)
 OH_STARTUP_TIMEOUT_SEG = 600  # espera máxima a que el sandbox quede READY
-OH_MAX_RETRIES    = 1      # 1 intento real: evita re-lanzar sandboxes por fallos de infra
+OH_MAX_RETRIES    = 1      # reintentos ante fallo de infraestructura (no re-lanzar sandboxes)
+OH_RETRY_ON_LOW_SCORE  = True   # reintentar cuando el score queda bajo el umbral
+OH_MAX_SCORE_RETRIES   = 2      # presupuesto de intentos por score bajo (autocorrección)
 MIN_SCORE_PASS    = 70
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -2496,11 +2498,16 @@ def router_validar_score(state: DataPulseState) -> str:
     intentos = state.get("intentos", 0)
     status = state.get("openhands_status", "")
 
-    if status == "error" and intentos < OH_MAX_RETRIES:
-        return "retry"
+    # Fallo de infraestructura: presupuesto corto para no re-lanzar sandboxes.
+    if status == "error":
+        return "retry" if intentos < OH_MAX_RETRIES else "end_no_commit"
+
     if score >= MIN_SCORE_PASS:
         return "commit"
-    if intentos < OH_MAX_RETRIES:
+
+    # Autocorrección: un score bajo con ejecución correcta sí merece reintento,
+    # con su propio presupuesto para no entrar en bucle.
+    if OH_RETRY_ON_LOW_SCORE and intentos < OH_MAX_SCORE_RETRIES:
         return "retry"
     return "end_no_commit"
 
