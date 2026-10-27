@@ -1,0 +1,35 @@
+# DataPulse — Dependencias opcionales
+# ===================================
+# NO son necesarias para ejecutar el orquestador ni los tests.
+# Instálalas solo si tu caso de uso las requiere:
+#
+#   pip install -r requirements.txt -r requirements-optional.txt
+#
+# Contexto: el orquestador nunca importa estos paquetes. Los nombres de acción
+# del Grafo de Conocimiento ("sklearn_knn_imputer", "scipy_winsorize", etc.) son
+# solo etiquetas: el código de limpieza que DataPulse GENERA
+# (datapulse_pipeline.py) es quien las usa en tiempo de ejecución.
+
+# ── Limpieza avanzada del pipeline generado ─────────────────────────────────
+# El pipeline generado puede emitir KNNImputer, IterativeImputer, IsolationForest,
+# StandardScaler, PowerTransformer, winsorize, boxcox, etc.
+scipy==1.18.1
+scikit-learn==1.9.1
+
+# ── Formato heredado .xls ───────────────────────────────────────────────────
+# node_ingestar acepta ext in ("xlsx", "xls"). pandas resuelve .xls con xlrd y
+# .xlsx con openpyxl. Solo hace falta si ingieres ficheros .xls antiguos.
+xlrd>=2.0.1
+
+# ── Gráficos para EDA (eda_report.html) ─────────────────────────────────────
+# Referenciados como entregable en node_commit, aún no generados por el orquestador.
+matplotlib>=3.9.0
+seaborn>=0.13.0
+
+# ── Entorno Colab ───────────────────────────────────────────────────────────
+# datapulse_prod.py importa google.colab dentro de try/except y degrada a
+# variables de entorno. NO instalar fuera de Colab (no existe en PyPI).
+# google-colab
+
+# NOTA sobre fastparquet: se retiró. pyarrow ya es el motor parquet por defecto
+# de pandas y cubre la lectura/escritura; fastparquet era redundante.

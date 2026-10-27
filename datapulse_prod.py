@@ -34,7 +34,11 @@ from github import Github
 # ════════════════════════════════════════════════
 GITHUB_USERNAME   = "stalynponnymoya-afk"
 GITHUB_REPO       = "datapulse"
-GROQ_MODEL        = "llama-3.3-70b-versatile"
+# Modelo de Groq: configurable por el usuario. Anteriormente se usaba
+# "llama-3.3-70b-versatile", que Groq deprecó el 16/08/2026 (pasó a Enterprise);
+# su reemplazo recomendado es "openai/gpt-oss-120b". Puedes cambiarlo con la
+# variable de entorno GROQ_MODEL según los modelos disponibles en tu cuenta.
+GROQ_MODEL        = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 OH_TIMEOUT_SEG    = 900    # ventana de ejecución remota en OpenHands (~15 min)
 OH_STARTUP_TIMEOUT_SEG = 600  # espera máxima a que el sandbox quede READY
 OH_MAX_RETRIES    = 1      # reintentos ante fallo de infraestructura (no re-lanzar sandboxes)

@@ -21,7 +21,7 @@ DataPulse combines four technologies in a single orchestrated pipeline:
 | Component | Technology | Role |
 |---|---|---|
 | **Orchestrator** | LangGraph | State machine with 7 nodes, conditional retry logic |
-| **Reasoning** | LLaMA 3.3 70B via Groq | Diagnoses column types, detects problems, builds technical brief |
+| **Reasoning** | Groq-hosted LLM (user-selectable, default `openai/gpt-oss-120b`) | Diagnoses column types, detects problems, builds technical brief |
 | **Decision Rules** | NetworkX (Knowledge Graph) | ~58 base statistical rules + 24 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) — over 100 edges total |
 | **Autonomous Agent** | OpenHands Cloud API | Writes, executes, and validates the cleaning code autonomously |
 
@@ -112,9 +112,15 @@ requests
 
 | Key | Service | Purpose |
 |---|---|---|
-| `GROQ_API_KEY` | [Groq Cloud](https://console.groq.com) | LLM inference (LLaMA 3.3 70B) |
+| `GROQ_API_KEY` | [Groq Cloud](https://console.groq.com) | LLM inference (model selectable via `GROQ_MODEL`) |
 | `OPENHANDS_API_KEY` | [OpenHands](https://app.all-hands.dev) | Autonomous code agent |
 | `GITHUB_TOKEN` | [GitHub](https://github.com/settings/tokens) | Repository access (scope: repo) |
+
+> **About the LLM model.** The model is user-selectable via the `GROQ_MODEL` environment
+> variable; the default is `openai/gpt-oss-120b`. We originally used
+> `llama-3.3-70b-versatile` because it was free on Groq's tier, but Groq **deprecated it
+> on 16 Aug 2026** (it moved to Enterprise / contact-sales). Pick any model your Groq
+> account has access to — see the [Groq supported models](https://console.groq.com/docs/models).
 
 ### Quick Start
 
@@ -131,10 +137,17 @@ requests
    ```bash
    pip install -r requirements.txt
    ```
+   This covers the orchestrator, the `src/` package, the API and the tests. For the
+   generated pipeline's advanced cleaning (scipy/scikit-learn), legacy `.xls` files or
+   EDA charts, also install the optional set:
+   ```bash
+   pip install -r requirements.txt -r requirements-optional.txt
+   ```
 2. Configure the required environment variables:
    * On Linux/macOS:
      ```bash
      export GROQ_API_KEY="your_groq_key"
+     export GROQ_MODEL="openai/gpt-oss-120b"   # optional, override the default model
      export OPENHANDS_API_KEY="your_openhands_key"
      export GITHUB_TOKEN="your_github_token"
      export GITHUB_USERNAME="your_github_username"
@@ -143,6 +156,7 @@ requests
    * On Windows (PowerShell):
      ```powershell
      $env:GROQ_API_KEY="your_groq_key"
+     $env:GROQ_MODEL="openai/gpt-oss-120b"   # optional, override the default model
      $env:OPENHANDS_API_KEY="your_openhands_key"
      $env:GITHUB_TOKEN="your_github_token"
      $env:GITHUB_USERNAME="your_github_username"
@@ -159,7 +173,7 @@ requests
 - Knowledge Graph covers common statistical cases. Domain-specific datasets (medical, regulated financial) may fall back to LLM decisions with lower confidence
 - OpenHands execution takes 1-5 minutes per run
 - GitHub API has a 100MB file size limit
-- Groq free tier: 100K tokens/day — approximately 5-10 full pipeline runs
+- LLM rate limits depend on the Groq model you select via `GROQ_MODEL` and your plan tier
 - OpenHands outputs are non-deterministic: two runs on the same input may produce slightly different code
 
 ### Tech Stack Decision: Why This Combination?
@@ -193,7 +207,7 @@ DataPulse combina cuatro tecnologías en un pipeline orquestado:
 | Componente | Tecnología | Rol |
 |---|---|---|
 | **Orquestador** | LangGraph | Máquina de estados con 7 nodos y lógica de retry condicional |
-| **Razonamiento** | LLaMA 3.3 70B vía Groq | Diagnostica tipos de columnas, detecta problemas, construye brief técnico |
+| **Razonamiento** | LLM alojado en Groq (elegible por el usuario, por defecto `openai/gpt-oss-120b`) | Diagnostica tipos de columnas, detecta problemas, construye brief técnico |
 | **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | ~58 reglas estadísticas base + 24 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) — más de 100 aristas totales |
 | **Agente Autónomo** | OpenHands Cloud API | Escribe, ejecuta y valida el código de limpieza de forma autónoma |
 
@@ -284,9 +298,15 @@ requests
 
 | Key | Servicio | Propósito |
 |---|---|---|
-| `GROQ_API_KEY` | [Groq Cloud](https://console.groq.com) | Inferencia LLM (LLaMA 3.3 70B) |
+| `GROQ_API_KEY` | [Groq Cloud](https://console.groq.com) | Inferencia LLM (modelo elegible vía `GROQ_MODEL`) |
 | `OPENHANDS_API_KEY` | [OpenHands](https://app.all-hands.dev) | Agente autónomo de código |
 | `GITHUB_TOKEN` | [GitHub](https://github.com/settings/tokens) | Acceso al repositorio (scope: repo) |
+
+> **Sobre el modelo LLM.** El modelo es elegible por el usuario mediante la variable de
+> entorno `GROQ_MODEL`; por defecto es `openai/gpt-oss-120b`. Originalmente usábamos
+> `llama-3.3-70b-versatile` porque era gratuito en el tier de Groq, pero Groq **lo deprecó
+> el 16/08/2026** (pasó a Enterprise / contacto con ventas). Usa cualquier modelo al que tu
+> cuenta de Groq tenga acceso — ver [modelos soportados de Groq](https://console.groq.com/docs/models).
 
 ### Inicio Rápido
 
@@ -303,10 +323,17 @@ requests
    ```bash
    pip install -r requirements.txt
    ```
+   Esto cubre el orquestador, el paquete `src/`, la API y los tests. Para la limpieza
+   avanzada del pipeline generado (scipy/scikit-learn), ficheros `.xls` heredados o
+   gráficos EDA, instala también el conjunto opcional:
+   ```bash
+   pip install -r requirements.txt -r requirements-optional.txt
+   ```
 2. Configura las variables de entorno obligatorias:
    * En Linux/macOS:
      ```bash
      export GROQ_API_KEY="tu_key_groq"
+     export GROQ_MODEL="openai/gpt-oss-120b"   # opcional, sobrescribe el modelo por defecto
      export OPENHANDS_API_KEY="tu_key_openhands"
      export GITHUB_TOKEN="tu_token_github"
      export GITHUB_USERNAME="tu_usuario_github"
@@ -315,6 +342,7 @@ requests
    * En Windows (PowerShell):
      ```powershell
      $env:GROQ_API_KEY="tu_key_groq"
+     $env:GROQ_MODEL="openai/gpt-oss-120b"   # opcional, sobrescribe el modelo por defecto
      $env:OPENHANDS_API_KEY="tu_key_openhands"
      $env:GITHUB_TOKEN="tu_token_github"
      $env:GITHUB_USERNAME="tu_usuario_github"
@@ -331,7 +359,7 @@ requests
 - El Grafo de Conocimiento cubre casos estadísticos comunes. Datasets de dominio muy específico (médico, financiero regulado) pueden caer en decisiones del LLM con menor confianza
 - La ejecución de OpenHands toma 1-5 minutos por corrida
 - GitHub API tiene límite de 100MB por archivo
-- Groq tier gratuito: 100K tokens/día — aproximadamente 5-10 ejecuciones completas del pipeline
+- Los límites de tasa del LLM dependen del modelo de Groq que elijas vía `GROQ_MODEL` y de tu plan
 - Los outputs de OpenHands son no deterministas: dos ejecuciones sobre el mismo input pueden producir código ligeramente diferente
 
 ### Decisiones Técnicas: ¿Por Qué Esta Combinación?
