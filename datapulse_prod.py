@@ -35,8 +35,9 @@ from github import Github
 GITHUB_USERNAME   = "stalynponnymoya-afk"
 GITHUB_REPO       = "datapulse"
 GROQ_MODEL        = "llama-3.3-70b-versatile"
-OH_TIMEOUT_SEG    = 300
-OH_MAX_RETRIES    = 3
+OH_TIMEOUT_SEG    = 900    # ventana de ejecución remota en OpenHands (~15 min)
+OH_STARTUP_TIMEOUT_SEG = 600  # espera máxima a que el sandbox quede READY
+OH_MAX_RETRIES    = 1      # 1 intento real: evita re-lanzar sandboxes por fallos de infra
 MIN_SCORE_PASS    = 70
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -2257,8 +2258,10 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
 
         # ── PASO 2: Esperar READY ──────────────────────────────
         conv_id = None
-        for i in range(20):
-            time.sleep(10)
+        START_POLL_INTERVAL = 10
+        start_polls = max(int(OH_STARTUP_TIMEOUT_SEG / START_POLL_INTERVAL), 20)
+        for i in range(start_polls):
+            time.sleep(START_POLL_INTERVAL)
             r = requests.get(
                 f"{base}/app-conversations/start-tasks?ids={task_id}",
                 headers=headers, timeout=30,
@@ -2269,7 +2272,7 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
             if not (isinstance(data, list) and data and data[0]):
                 continue
             st = data[0].get("status", "")
-            print(f"   ⏳ Start poll {i+1}: {st}")
+            print(f"   ⏳ Start poll {i+1}/{start_polls}: {st}")
             if st == "READY":
                 conv_id = data[0].get("app_conversation_id")
                 break
