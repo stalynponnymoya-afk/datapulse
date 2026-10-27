@@ -1,0 +1,106 @@
+{
+  "timestamp": "20261027-082720",
+  "filename_original": "ventas_prueba.csv",
+  "score_despues": 90,
+  "decisiones_knowledge_graph": 7,
+  "decisiones_llm_fallback": 1,
+  "plan_acciones": [
+    {
+      "columna": "id_cliente",
+      "problema": "duplicados",
+      "accion": "drop_duplicates",
+      "confianza": 0.99,
+      "fuente_decision": "knowledge_graph",
+      "parametros": {
+        "keep": "first",
+        "inplace": false,
+        "ignore_index": true
+      },
+      "justificacion": "Los registros duplicados distorsionan distribuciones y sesgan estadísticas. Se conserva la primera ocurrencia para preservar el orden temporal."
+    },
+    {
+      "columna": "edad",
+      "problema": "nulos_disfrazados",
+      "accion": "replace_sentinel",
+      "confianza": 0.85,
+      "fuente_decision": "knowledge_graph",
+      "parametros": {
+        "sentinel_values": [
+          -999
+        ],
+        "replace_with": null
+      },
+      "justificacion": "Los valores -999 son centinelas que indican datos faltantes; deben convertirse a NaN antes de cualquier imputación."
+    },
+    {
+      "columna": "edad",
+      "problema": "nulos_disfrazados",
+      "accion": "knn_impute",
+      "confianza": 0.82,
+      "fuente_decision": "knowledge_graph",
+      "parametros": {
+        "n_neighbors": 5,
+        "weights": "distance"
+      },
+      "justificacion": "KNNImputer aprovecha la correlación multivariada del dataset para estimar valores faltantes de forma menos sesgada que la imputación simple."
+    },
+    {
+      "columna": "edad",
+      "problema": "valores_negativos_inesperados",
+      "accion": "flag_and_nan",
+      "confianza": 0.83,
+      "fuente_decision": "knowledge_graph",
+      "parametros": {
+        "flag_column": "edad_negative_flag",
+        "replace_with": null
+      },
+      "justificacion": "Las edades negativas son errores lógicos; se marca con flag y se reemplaza por NaN para que la imputación posterior (si la hay) pueda corregirlos."
+    },
+    {
+      "columna": "email",
+      "problema": "ninguno",
+      "accion": "validate_email_format",
+      "confianza": 0.85,
+      "fuente_decision": "knowledge_graph",
+      "parametros": {
+        "exclude_from_model": true,
+        "validate_pattern": true
+      },
+      "justificacion": "Se valida que el formato del email sea correcto y se excluye de los modelos predictivos, ya que es un identificador de contacto."
+    },
+    {
+      "columna": "categoria",
+      "problema": "nulos_medios",
+      "accion": "fillna_categorical",
+      "confianza": 0.9,
+      "fuente_decision": "knowledge_graph",
+      "parametros": {
+        "value": "Unknown"
+      },
+      "justificacion": "Crear la categoría explícita 'Unknown' preserva la información de ausencia, que puede ser predictiva (MNAR)."
+    },
+    {
+      "columna": "monto_transaccion",
+      "problema": "nulos_medios",
+      "accion": "simple_imputer_median",
+      "confianza": 0.7,
+      "fuente_decision": "llm_fallback",
+      "parametros": {
+        "strategy": "median"
+      },
+      "justificacion": "Para los valores nulos intermedios (≈20%) la imputación con la mediana minimiza el sesgo sin asumir distribución normal."
+    },
+    {
+      "columna": "monto_transaccion",
+      "problema": "valores_negativos_inesperados",
+      "accion": "flag_and_clip",
+      "confianza": 0.85,
+      "fuente_decision": "knowledge_graph",
+      "parametros": {
+        "flag_negative": true,
+        "clip_min": 0
+      },
+      "justificacion": "Los montos negativos son errores; se marca con flag y se recortan a 0 para evitar valores imposibles en análisis financieros."
+    }
+  ]
+}
