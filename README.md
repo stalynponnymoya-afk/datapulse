@@ -138,8 +138,11 @@ The score that decides the commit is **not** the one written by the generated sc
 - `score_despues`: quality of the real `processed_data.csv` produced by the run.
 - `score_reportado`: what the script wrote in `quality_report.json` (informative only).
 
-If there is no `processed_data.csv` to read, the run ends as `sin_validar` and **nothing is
-committed**. When the score is below `DATAPULSE_MIN_SCORE_PASS`, a summary of the report (score
+If there is no `processed_data.csv` to read, the attempt ends as `sin_validar` and **nothing is
+committed**. It is retried only when the file should have existed and did not appear (the script
+did not write it, or the agent did not commit it); if the results could not be read at all,
+retrying would not help and the run stops. A `processed_data.csv` that exists but is not a valid
+dataset (empty, unreadable) counts as a validated failure with score 0. When the score is below `DATAPULSE_MIN_SCORE_PASS`, a summary of the report (score
 and main problems) is added to the error history so the next attempt knows what to fix.
 
 Attempt limits are **total attempts**, the first one included:
@@ -147,8 +150,9 @@ Attempt limits are **total attempts**, the first one included:
 | Situation | Status | Total attempts |
 |---|---|---|
 | Infrastructure failure (`error`, `timeout`, `stuck`, `stopped`) or the script crashed | `error`… | 2 (`OH_MAX_INTENTOS_INFRA`) |
-| Score below the threshold, or not validated (`sin_validar`) | `finished` / `sin_validar` | 3 (`OH_MAX_INTENTOS_SCORE`) |
-| Configuration or policy rejection (missing user/repo, data upload not allowed) | `rechazado` | 1 (no retry) |
+| Score below the threshold, or `processed_data.csv` should have existed and did not appear | `finished` / `sin_validar` | 3 (`OH_MAX_INTENTOS_SCORE`) |
+| Results could not be read (`sin_validar` with nothing to expect) | `sin_validar` | 1 (no retry) |
+| Configuration or policy rejection (missing user/repo, data upload not allowed, results not readable) | `rechazado` | 1 (no retry, no sandbox) |
 
 ### Environment Variables
 
@@ -168,11 +172,12 @@ Attempt limits are **total attempts**, the first one included:
 
 - **Data upload policy.** The raw dataset and any data file (`.csv`, `.tsv`, `.xlsx`, `.xls`,
   `.parquet`, data `.json`) are uploaded to GitHub **only** if `DATAPULSE_PERMITIR_SUBIDA_DATOS=1`
-  **and** the repository is private. Otherwise OpenHands mode does not start for a local file
-  (use local mode instead), and `node_commit` uploads only the script, the reports and
-  `audit_log.json`; data files stay in `outputs/`. A file that is already in GitHub
-  (`github_file=`) does not count as an upload, but without permission the agent is asked not to
-  commit data, so the run ends as `sin_validar`.
+  **and** the repository is private. Otherwise OpenHands mode does not start (status
+  `rechazado`, before any branch or sandbox is created) and suggests local mode: the dataset could
+  not be uploaded and `processed_data.csv` could not be read back to validate it. This also applies
+  to a file that is already in GitHub (`github_file=`): it does not count as an upload, but its
+  results would still be unreadable. In local mode, `node_commit` uploads only the script, the
+  reports and `audit_log.json`; data files stay in `outputs/`.
 - **Masked samples.** Before sending column samples to the LLM, emails become `u***@domain`,
   sequences of 6+ digits (IDs, phones, accounts) become `9`s of the same length, and
   high-cardinality text columns (>50 % unique: names, free text) become a shape pattern
@@ -397,8 +402,11 @@ El score que decide el commit **no** es el que escribe el script generado.
 - `score_despues`: calidad del `processed_data.csv` real de la ejecución.
 - `score_reportado`: lo que escribió el script en `quality_report.json` (solo informativo).
 
-Si no hay `processed_data.csv` que leer, la ejecución termina como `sin_validar` y **no hay
-commit**. Cuando el score queda bajo `DATAPULSE_MIN_SCORE_PASS`, se agrega al historial de errores
+Si no hay `processed_data.csv` que leer, el intento termina como `sin_validar` y **no hay
+commit**. Solo se reintenta cuando el archivo debía existir y no apareció (el script no lo escribió
+o el agente no hizo commit de él); si los resultados no se pudieron leer, reintentar no lo arregla
+y la ejecución termina. Un `processed_data.csv` que existe pero no es un dataset válido (vacío,
+ilegible) cuenta como un fallo validado con score 0. Cuando el score queda bajo `DATAPULSE_MIN_SCORE_PASS`, se agrega al historial de errores
 un resumen del reporte (score y principales problemas) para que el siguiente intento sepa qué
 corregir.
 
@@ -407,8 +415,9 @@ Los límites son **intentos totales**, incluido el primero:
 | Situación | Estado | Intentos totales |
 |---|---|---|
 | Fallo de infraestructura (`error`, `timeout`, `stuck`, `stopped`) o el script falló | `error`… | 2 (`OH_MAX_INTENTOS_INFRA`) |
-| Score bajo el umbral, o sin validar (`sin_validar`) | `finished` / `sin_validar` | 3 (`OH_MAX_INTENTOS_SCORE`) |
-| Rechazo por configuración o política (falta usuario/repo, subida de datos no permitida) | `rechazado` | 1 (sin reintento) |
+| Score bajo el umbral, o `processed_data.csv` debía existir y no apareció | `finished` / `sin_validar` | 3 (`OH_MAX_INTENTOS_SCORE`) |
+| Resultados ilegibles (`sin_validar` sin nada que esperar) | `sin_validar` | 1 (sin reintento) |
+| Rechazo por configuración o política (falta usuario/repo, subida de datos no permitida, resultados ilegibles) | `rechazado` | 1 (sin reintento ni sandbox) |
 
 ### Variables de Entorno
 
@@ -429,10 +438,11 @@ Los límites son **intentos totales**, incluido el primero:
 - **Política de subida de datos.** El dataset crudo y cualquier archivo de datos (`.csv`, `.tsv`,
   `.xlsx`, `.xls`, `.parquet`, `.json` de datos) se suben a GitHub **solo** si
   `DATAPULSE_PERMITIR_SUBIDA_DATOS=1` **y** el repositorio es privado. Si no, el modo OpenHands no
-  arranca con un archivo local (usa el modo local) y `node_commit` sube solo el script, los
-  reportes y `audit_log.json`; los archivos de datos quedan en `outputs/`. Un archivo que ya está
-  en GitHub (`github_file=`) no cuenta como subida, pero sin permiso se pide al agente que no haga
-  commit de datos, así que la ejecución termina como `sin_validar`.
+  arranca (estado `rechazado`, antes de crear rama o sandbox) y sugiere el modo local: no se podría
+  subir el dataset ni leer de vuelta `processed_data.csv` para validarlo. Esto aplica también a un
+  archivo que ya está en GitHub (`github_file=`): no cuenta como subida, pero sus resultados
+  seguirían siendo ilegibles. En modo local, `node_commit` sube solo el script, los reportes y
+  `audit_log.json`; los archivos de datos quedan en `outputs/`.
 - **Muestras enmascaradas.** Antes de enviar las muestras de cada columna al LLM, los emails pasan
   a `u***@dominio`, las secuencias de 6 o más dígitos (cédulas, teléfonos, cuentas) a `9` de la
   misma longitud y las columnas de texto de alta cardinalidad (>50 % únicos: nombres, texto libre)

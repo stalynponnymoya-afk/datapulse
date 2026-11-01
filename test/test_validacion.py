@@ -104,7 +104,8 @@ def test_score_antes_se_calcula_una_sola_vez(tmp_path, monkeypatch):
     assert llamadas == [processed]
 
 
-def test_sin_processed_es_sin_validar_y_no_hay_commit(tmp_path):
+def test_sin_validar_se_reintenta_si_processed_debia_existir(tmp_path):
+    """processed_data.csv debía existir y no apareció → sin_validar + reintento."""
     original = _csv(tmp_path, "orig.csv", _sucio())
     for ruta in (None, str(tmp_path / "no_existe.csv")):
         state = {
@@ -112,19 +113,36 @@ def test_sin_processed_es_sin_validar_y_no_hay_commit(tmp_path):
             "filename_path": original,
             "openhands_status": "finished",
             "ruta_processed": ruta,
+            "processed_esperado": True,
             "score_reportado": 95,
         }
         out = dp.node_validar_score(state)
         assert out["openhands_status"] == "sin_validar"
         assert out["score_despues"] == 0
-        assert "processed_data.csv" in out["error_history"][0]
+        assert "debía existir y no apareció" in out["error_history"][0]
 
-        for intentos in range(1, dp.OH_MAX_INTENTOS_SCORE + 2):
-            decision = dp.router_validar_score({**state, **out, "intentos": intentos})
-            assert decision != "commit"
-        assert dp.router_validar_score(
-            {**state, **out, "intentos": dp.OH_MAX_INTENTOS_SCORE}
-        ) == "end_no_commit"
+        decisiones = [
+            dp.router_validar_score({**state, **out, "intentos": n})
+            for n in range(1, dp.OH_MAX_INTENTOS_SCORE + 1)
+        ]
+        assert decisiones == ["retry"] * (dp.OH_MAX_INTENTOS_SCORE - 1) + ["end_no_commit"]
+
+
+def test_sin_validar_no_se_reintenta_si_no_se_podia_leer(tmp_path):
+    """Resultados ilegibles por diseño → sin_validar, fin inmediato, sin commit."""
+    original = _csv(tmp_path, "orig.csv", _sucio())
+    state = {
+        "filename": "orig.csv",
+        "filename_path": original,
+        "openhands_status": "finished",
+        "ruta_processed": None,
+        "processed_esperado": False,
+        "score_reportado": 95,
+    }
+    out = dp.node_validar_score(state)
+    assert out["openhands_status"] == "sin_validar"
+    assert "no se pudieron leer" in out["error_history"][0]
+    assert dp.router_validar_score({**state, **out, "intentos": 1}) == "end_no_commit"
 
 
 def test_sin_validar_aunque_el_score_previo_fuera_alto():
@@ -134,15 +152,21 @@ def test_sin_validar_aunque_el_score_previo_fuera_alto():
     ) == "end_no_commit"
 
 
-def test_processed_ilegible_es_sin_validar(tmp_path):
+def test_processed_invalido_es_score_cero_y_se_reintenta(tmp_path):
+    """processed_data.csv apareció pero está vacío: se validó y la limpieza falló."""
     vacio = tmp_path / "processed_data.csv"
     vacio.write_text("", encoding="utf-8")
-    out = dp.node_validar_score({
+    state = {
         "score_antes": 50,
         "openhands_status": "finished",
         "ruta_processed": str(vacio),
-    })
-    assert out["openhands_status"] == "sin_validar"
+        "processed_esperado": True,
+    }
+    out = dp.node_validar_score(state)
+    assert "openhands_status" not in out  # sigue "finished", no es sin_validar
+    assert out["score_despues"] == 0
+    assert "no es un dataset válido" in out["error_history"][0]
+    assert dp.router_validar_score({**state, **out, "intentos": 1}) == "retry"
 
 
 def test_error_de_ejecucion_no_valida(tmp_path):
@@ -238,6 +262,7 @@ def test_pipeline_local_end_to_end_con_validacion(tmp_path, monkeypatch):
     assert res["openhands_status"] == "finished", res
     assert res["score_reportado"] == 100
     assert res["ruta_processed"] and os.path.exists(res["ruta_processed"])
+    assert res["processed_esperado"] is True
     assert res["directorio_salida"] == os.path.dirname(res["ruta_processed"])
 
     val = dp.node_validar_score({**estado, **res})
@@ -250,7 +275,22 @@ def test_pipeline_local_script_que_falla(tmp_path, monkeypatch):
     res = dp._run_local_groq_pipeline(_estado_local(tmp_path))
     assert res["openhands_status"] == "error"
     assert res["ruta_processed"] is None
+    assert res["processed_esperado"] is False
     assert "boom" in res["error_history"][0]
+
+
+def test_pipeline_local_sin_processed_se_reintenta(tmp_path, monkeypatch):
+    """Modo local: el script terminó pero no escribió processed_data.csv."""
+    monkeypatch.chdir(tmp_path)
+    codigo = "import json\njson.dump({'score': 99}, open('quality_report.json', 'w'))\n"
+    monkeypatch.setattr(dp, "get_groq_llm", lambda: _LLMFalso(codigo))
+    estado = _estado_local(tmp_path)
+    res = dp._run_local_groq_pipeline(estado)
+    assert res["openhands_status"] == "finished"
+    assert res["ruta_processed"] is None and res["processed_esperado"] is True
+    val = dp.node_validar_score({**estado, **res})
+    assert val["openhands_status"] == "sin_validar"
+    assert dp.router_validar_score({**estado, **res, **val}) == "retry"
 
 
 def test_pipeline_local_groq_no_responde(tmp_path, monkeypatch):

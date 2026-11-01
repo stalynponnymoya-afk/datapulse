@@ -1829,6 +1829,7 @@ class DataPulseState(TypedDict):
     score_despues: int               # score real de processed_data.csv
     score_reportado: Optional[int]   # lo que dijo el script generado (informativo)
     ruta_processed: Optional[str]    # ruta local de processed_data.csv del intento
+    processed_esperado: bool         # True si el intento debía dejar un processed_data.csv legible
     directorio_salida: Optional[str] # carpeta local con las salidas del intento
 
     # Fuente del archivo (None = archivo local subido; str = path en repo)
@@ -2509,6 +2510,7 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
             "error_history": [msg],
             "score_reportado": None,
             "ruta_processed": None,
+            "processed_esperado": False,
             "directorio_salida": run_dir,
             "codigo": "",
             "archivos_generados": {},
@@ -2582,6 +2584,8 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         "openhands_status": status,
         "score_reportado": score_reportado,
         "ruta_processed": os.path.abspath(ruta_processed) if os.path.exists(ruta_processed) else None,
+        # El script local siempre debe escribir processed_data.csv en run_dir
+        "processed_esperado": status == "finished",
         "directorio_salida": os.path.abspath(run_dir),
         "codigo": codigo,
         "archivos_generados": archivos_generados,
@@ -2599,6 +2603,7 @@ def _rechazo_openhands(state: DataPulseState, msg: str) -> dict:
         "error_history": [msg],
         "score_reportado": None,
         "ruta_processed": None,
+        "processed_esperado": False,
         "archivos_generados": {},
     }
 
@@ -2612,11 +2617,9 @@ SALIDAS_OPENHANDS = (
 )
 
 
-def _construir_brief_openhands(
-    state: DataPulseState, data_path: str, rama: str, subir_datos: bool
-) -> str:
+def _construir_brief_openhands(state: DataPulseState, data_path: str, rama: str) -> str:
     """Arma el mensaje para OpenHands con la ruta real del dataset y los entregables."""
-    salidas = [s for s in SALIDAS_OPENHANDS if subir_datos or not _es_archivo_datos(s)]
+    salidas = SALIDAS_OPENHANDS
     mensaje = state["brief_tecnico"]
     mensaje += (
         f"\n\n## ARCHIVO DE DATOS"
@@ -2635,12 +2638,6 @@ def _construir_brief_openhands(
         f"\n5. Haz commit y push en la rama `{rama}` (no en otra) de estos archivos:"
         f"\n   {', '.join(salidas)}."
     )
-    if not subir_datos:
-        mensaje += (
-            "\n6. NO hagas commit de archivos de datos (.csv, .xlsx, .parquet, .json de"
-            "\n   datos): la política de privacidad de este repo no lo permite."
-        )
-
     prev_errs = (state.get("error_history") or [])[-2:]
     if prev_errs:
         mensaje += "\n\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
@@ -2665,24 +2662,35 @@ def _leer_contenido_github(repo, path: str, ref: str) -> bytes:
     return data
 
 
-def _leer_salidas_rama(repo, rama: str, run_dir: str, nombres) -> Dict[str, bytes]:
+def _es_no_encontrado(exc: Exception) -> bool:
+    """True si la excepción de PyGithub es un 404 (el archivo no existe en la rama)."""
+    return getattr(exc, "status", None) == 404 or "404" in str(exc)
+
+
+def _leer_salidas_rama(repo, rama: str, run_dir: str, nombres) -> tuple:
     """
     Descarga de la rama de trabajo las salidas indicadas y las guarda en
-    ``run_dir``. Devuelve {nombre: bytes} solo con las que se pudieron leer.
+    ``run_dir``. Devuelve ({nombre: bytes} leídos, {nombre: error} de los que
+    existían o podían existir pero NO se pudieron leer — distinto de un 404).
     """
     leidos: Dict[str, bytes] = {}
+    errores: Dict[str, str] = {}
     for nombre in nombres:
         try:
             data = _leer_contenido_github(repo, nombre, rama)
         except Exception as exc:
-            print(f"   ⚠️ {nombre} no está en la rama {rama} ({type(exc).__name__})")
+            if _es_no_encontrado(exc):
+                print(f"   ⚠️ {nombre} no está en la rama {rama}")
+            else:
+                errores[nombre] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                print(f"   ⚠️ {nombre} no se pudo leer de {rama} ({errores[nombre]})")
             continue
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, nombre), "wb") as f:
             f.write(data)
         leidos[nombre] = data
         print(f"   📥 {nombre} leído de {rama} ({len(data):,} bytes)")
-    return leidos
+    return leidos, errores
 
 
 def node_ejecutar(state: DataPulseState) -> DataPulseState:
@@ -2695,8 +2703,13 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         return _run_local_groq_pipeline(state)
 
     falta = _falta_repo_github()
+    if not GITHUB_TOKEN:
+        # Sin token PyGithub lanza un AssertionError vacío; mejor un mensaje claro.
+        falta = (f"{falta} " if falta else "") + (
+            "Falta GITHUB_TOKEN: OpenHands trabaja sobre una rama del repositorio."
+        )
     if falta:
-        msg = f"Modo OpenHands no disponible. {falta}"
+        msg = f"Modo OpenHands no disponible. {falta} Usa el modo local (deja OPENHANDS_API_KEY vacío)."
         print(f"   ❌ {msg}")
         return _rechazo_openhands(state, msg)
 
@@ -2714,16 +2727,25 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         archivo_en_github = bool(
             state.get("github_source_branch") and state.get("github_source_path")
         )
-        if not archivo_en_github and not subir_datos:
+        if not subir_datos:
+            # Sin permiso no se puede subir el dataset NI leer de vuelta
+            # processed_data.csv: el resultado nunca se podría validar, así
+            # que no se crea rama ni sandbox.
+            que_falla = (
+                "los resultados (processed_data.csv) no se podrían leer de vuelta para "
+                "validarlos"
+                if archivo_en_github
+                else "habría que subir el dataset a GitHub y los resultados no se podrían leer de vuelta"
+            )
             msg = (
-                "Modo OpenHands no arranca: habría que subir el dataset a GitHub y "
-                f"la subida de datos no está permitida ({motivo}). Usa el modo local "
-                "(deja OPENHANDS_API_KEY vacío) o, si el repo es privado y aceptas "
-                "subir los datos, define DATAPULSE_PERMITIR_SUBIDA_DATOS=1."
+                f"Modo OpenHands no arranca: {que_falla}, porque la subida de datos no está "
+                f"permitida ({motivo}). Usa el modo local (deja OPENHANDS_API_KEY vacío) o, "
+                "si el repo es privado y aceptas subir los datos, define "
+                "DATAPULSE_PERMITIR_SUBIDA_DATOS=1."
             )
             print(f"   ❌ {msg}")
             return _rechazo_openhands(state, msg)
-        print(f"   🔐 Subida de datos: {'sí' if subir_datos else 'no'} ({motivo})")
+        print(f"   🔐 Subida de datos: sí ({motivo})")
 
         # ── PASO 0: Preparar rama de trabajo con el archivo de datos ──
         # Siempre se crea una rama nueva: el agente hace commit de sus salidas
@@ -2807,7 +2829,7 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         print(f"   ✅ READY: {conv_id[:16]}...")
 
         # ── PASO 3: Enviar brief con referencia al archivo ──────
-        mensaje = _construir_brief_openhands(state, data_path, rama, subir_datos=subir_datos)
+        mensaje = _construir_brief_openhands(state, data_path, rama)
 
         r = requests.post(
             f"{base}/app-conversations/{conv_id}/send-message",
@@ -2964,9 +2986,7 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         # script escribe al ejecutarse (processed_data.csv, reportes) se lee
         # del commit que el agente hizo en la rama.
         run_dir = os.path.join("outputs", fecha + "-openhands")
-        # Sin permiso de subida no se pidió processed_data.csv → sin_validar.
-        nombres = [n for n in SALIDAS_OPENHANDS if subir_datos or not _es_archivo_datos(n)]
-        leidos = _leer_salidas_rama(repo, rama, run_dir, nombres)
+        leidos, errores_lectura = _leer_salidas_rama(repo, rama, run_dir, SALIDAS_OPENHANDS)
         for nombre, contenido in leidos.items():
             archivos.setdefault(nombre, contenido.decode("utf-8", errors="replace"))
         if "datapulse_pipeline.py" in leidos and not py_files:
@@ -2980,6 +3000,9 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
             "openhands_status": final_status,
             "score_reportado": score_reportado,
             "ruta_processed": os.path.abspath(ruta_processed) if "processed_data.csv" in leidos else None,
+            # Debía existir salvo que la rama no se pudiera leer (no es un 404):
+            # en ese caso reintentar el sandbox no lo arreglaría.
+            "processed_esperado": "processed_data.csv" not in errores_lectura,
             "directorio_salida": os.path.abspath(run_dir) if leidos else None,
             "codigo": codigo if codigo else "# OpenHands no generó .py",
             "archivos_generados": archivos,
@@ -2994,6 +3017,7 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
             "error_history": [err_msg],
             "score_reportado": None,
             "ruta_processed": None,
+            "processed_esperado": False,
             "archivos_generados": {},
         }
 
@@ -3021,14 +3045,19 @@ def router_validar_score(state: DataPulseState) -> str:
     if status in OH_ESTADOS_INFRA:
         return "retry" if intentos < OH_MAX_INTENTOS_INFRA else "end_no_commit"
 
-    if status != "sin_validar" and score >= MIN_SCORE_PASS:
+    puede_reintentar = OH_RETRY_ON_LOW_SCORE and intentos < OH_MAX_INTENTOS_SCORE
+
+    # Sin validar: nunca commit. Solo se reintenta si processed_data.csv debía
+    # existir y no apareció; si no se podía leer, reintentar no lo arregla.
+    if status == "sin_validar":
+        return "retry" if state.get("processed_esperado") and puede_reintentar else "end_no_commit"
+
+    if score >= MIN_SCORE_PASS:
         return "commit"
 
-    # Autocorrección: un score bajo (o un resultado sin validar) con ejecución
-    # correcta sí merece reintento, con su propio presupuesto.
-    if OH_RETRY_ON_LOW_SCORE and intentos < OH_MAX_INTENTOS_SCORE:
-        return "retry"
-    return "end_no_commit"
+    # Autocorrección: un score bajo con ejecución correcta sí merece reintento,
+    # con su propio presupuesto.
+    return "retry" if puede_reintentar else "end_no_commit"
 
 def _resumir_reporte(reporte: dict, max_items: int = 8) -> str:
     """Resume los principales problemas de un reporte de calidad en una línea."""
@@ -3067,7 +3096,11 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
 
     - score_antes: sobre el dataset original (se calcula una sola vez).
     - score_despues: sobre el processed_data.csv real del intento.
-    - Sin processed_data.csv → openhands_status = "sin_validar" (no hay commit).
+    - Sin processed_data.csv → openhands_status = "sin_validar" (no hay
+      commit). El router solo reintenta si debía existir y no apareció
+      (``processed_esperado``).
+    - processed_data.csv presente pero inválido (vacío, ilegible) → score 0:
+      se validó y la limpieza falló.
     - Score bajo el umbral → resumen del reporte en error_history para que el
       reintento sepa qué corregir.
     """
@@ -3084,17 +3117,25 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
             print(f"   ⚠️ No se pudo calcular el score del original: {type(exc).__name__}: {exc}")
 
     status = state.get("openhands_status", "")
-    if status == "error":
-        # Fallo de infraestructura o del script: el router decide el reintento.
+    if status in OH_ESTADOS_INFRA or status == "rechazado":
+        # Fallo de infraestructura/script o rechazo: no hay nada que validar y
+        # el estado no se toca, para que el router aplique su propia política.
         salida["score_despues"] = 0
         return salida
 
     ruta = state.get("ruta_processed")
     if not ruta or not os.path.exists(ruta):
-        msg = (
-            "Validación independiente imposible: no hay processed_data.csv disponible. "
-            "El script debe escribir processed_data.csv con el dataset limpio."
-        )
+        if state.get("processed_esperado"):
+            msg = (
+                "Validación independiente imposible: processed_data.csv debía existir y no "
+                "apareció. El script debe escribir processed_data.csv con el dataset limpio "
+                "(y, en OpenHands, hacer commit de él en la rama de trabajo)."
+            )
+        else:
+            msg = (
+                "Validación independiente imposible: los resultados de este intento no se "
+                "pudieron leer, así que no se puede validar processed_data.csv."
+            )
         print(f"   ⚠️ {msg}")
         salida.update({
             "openhands_status": "sin_validar",
@@ -3106,16 +3147,13 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
     try:
         reporte = generate_report_df(load_dataset(ruta), "processed_data.csv")
     except Exception as exc:
+        # El archivo apareció pero no es un dataset válido: la limpieza falló.
         msg = (
-            "Validación independiente imposible: processed_data.csv no se pudo "
-            f"analizar ({type(exc).__name__}: {str(exc)[:200]})."
+            "Validación independiente: processed_data.csv no es un dataset válido "
+            f"({type(exc).__name__}: {str(exc)[:200]}); score 0."
         )
         print(f"   ⚠️ {msg}")
-        salida.update({
-            "openhands_status": "sin_validar",
-            "score_despues": 0,
-            "error_history": [msg],
-        })
+        salida.update({"score_despues": 0, "error_history": [msg]})
         return salida
 
     score = reporte["quality_score"]
@@ -3414,6 +3452,7 @@ def run_datapulse(
         "score_despues":      0,
         "score_reportado":    None,
         "ruta_processed":     None,
+        "processed_esperado": False,
         "directorio_salida":  None,
         "archivos_generados": {},
         "openhands_status":   "",

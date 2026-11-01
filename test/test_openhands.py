@@ -195,6 +195,8 @@ def test_openhands_con_solo_un_py_queda_sin_validar(entorno):
     assert "score_despues" not in res  # ya no hay score inventado
     assert "datapulse_pipeline.py" in res["codigo"] or "limpio" in res["codigo"]
 
+    assert res["processed_esperado"] is True
+
     val = dp.node_validar_score({**estado, **res})
     assert val["openhands_status"] == "sin_validar"
     assert val["score_despues"] == 0
@@ -253,14 +255,28 @@ def test_brief_usa_la_ruta_real_y_pide_commit_en_la_rama(entorno):
     assert repo.creados == []
 
 
-def test_openhands_estado_terminal_de_error(entorno):
+@pytest.mark.parametrize("estado_final", ["stuck", "timeout", "stopped", "error"])
+def test_openhands_estado_terminal_de_error(entorno, estado_final):
+    """Pasando por node_validar_score: el estado de infraestructura se conserva."""
     estado, configurar = entorno
     repo = RepoFalso(private=True)
-    configurar(repo, OpenHandsFalso(estado_final="stuck", eventos=[]))
+    configurar(repo, OpenHandsFalso(estado_final=estado_final, eventos=[]))
     res = dp.node_ejecutar(estado)
-    assert res["openhands_status"] == "stuck"
-    assert dp.router_validar_score({**res, "intentos": 1}) == "retry"
-    assert dp.router_validar_score({**res, "intentos": 2}) == "end_no_commit"
+    assert res["openhands_status"] == estado_final
+    val = dp.node_validar_score({**estado, **res})
+    assert "openhands_status" not in val  # no se convierte en sin_validar
+    final = {**estado, **res, **val}
+    assert dp.router_validar_score({**final, "intentos": 1}) == "retry"
+    assert dp.router_validar_score({**final, "intentos": 2}) == "end_no_commit"
+
+
+def test_rechazado_se_conserva_tras_validar(entorno):
+    estado, configurar = entorno
+    configurar(RepoFalso(private=False), OpenHandsFalso())
+    res = dp.node_ejecutar(estado)
+    val = dp.node_validar_score({**estado, **res})
+    assert val == {"score_antes": val["score_antes"], "score_despues": 0}
+    assert dp.router_validar_score({**estado, **res, **val}) == "end_no_commit"
 
 
 def test_openhands_excepcion_de_red(entorno, monkeypatch):
@@ -423,25 +439,57 @@ def test_subida_permitida_en_repo_privado(entorno):
     assert "processed_data.csv" in oh.mensajes[0]
 
 
-def test_github_file_en_repo_publico_no_sube_datos(entorno):
-    """Un archivo ya en GitHub no cuenta como subida, pero no se piden ni leen datos."""
+@pytest.mark.parametrize("privado, permiso", [(False, "1"), (True, None)])
+def test_github_file_sin_poder_leer_resultados_se_rechaza(entorno, monkeypatch, privado, permiso):
+    """
+    Repo público (o sin permiso): aunque el dataset ya esté en GitHub, los
+    resultados no se podrían leer de vuelta → "rechazado" antes del sandbox.
+    """
     estado, configurar = entorno
+    if permiso is None:
+        monkeypatch.delenv("DATAPULSE_PERMITIR_SUBIDA_DATOS")
     estado = {**estado, "github_source_branch": "main", "github_source_path": "data/x.csv"}
-    salidas = {"processed_data.csv": _limpio_csv(), "quality_report.json": b'{"score": 90}'}
-    repo = RepoFalso(private=False, salidas=salidas)
+    repo = RepoFalso(private=privado)
     oh = OpenHandsFalso(eventos=[EVENTO_FIN])
     configurar(repo, oh)
 
     res = dp.node_ejecutar(estado)
-    assert res["openhands_status"] == "finished"
-    assert repo.creados == []
-    brief = oh.mensajes[0]
-    assert "NO hagas commit de archivos de datos" in brief
-    assert "processed_data.csv" not in brief.split("Haz commit y push")[1].split("\n")[1]
-    # Solo se leyó el reporte, no processed_data.csv → sin_validar
-    assert res["ruta_processed"] is None
-    assert res["score_reportado"] == 90
-    assert dp.node_validar_score({**estado, **res})["openhands_status"] == "sin_validar"
+    assert res["openhands_status"] == "rechazado"
+    msg = res["error_history"][0]
+    assert "no se podrían leer" in msg and "modo local" in msg
+    # Ni rama, ni subida, ni sandbox
+    assert repo.refs == [] and repo.creados == []
+    assert oh.conversaciones == [] and oh.mensajes == []
+    assert dp.router_validar_score(res) == "end_no_commit"
+
+
+def test_openhands_processed_no_commiteado_se_reintenta(entorno):
+    """El agente no dejó processed_data.csv en la rama (404): debía existir → reintento."""
+    estado, configurar = entorno
+    repo = RepoFalso(private=True, salidas={"quality_report.json": b'{"score": 99}'})
+    configurar(repo, OpenHandsFalso(eventos=[EVENTO_FIN]))
+    res = dp.node_ejecutar(estado)
+    assert res["ruta_processed"] is None and res["processed_esperado"] is True
+    val = dp.node_validar_score({**estado, **res})
+    assert val["openhands_status"] == "sin_validar"
+    assert dp.router_validar_score({**estado, **res, **val}) == "retry"
+
+
+def test_openhands_rama_ilegible_no_se_reintenta(entorno):
+    """La rama no se pudo leer (403, no un 404): reintentar el sandbox no lo arregla."""
+    estado, configurar = entorno
+
+    class RepoSinLectura(RepoFalso):
+        def get_contents(self, path, ref=None):
+            raise Exception("403 Forbidden: Resource not accessible by integration")
+
+    repo = RepoSinLectura(private=True)
+    configurar(repo, OpenHandsFalso(eventos=[EVENTO_FIN]))
+    res = dp.node_ejecutar(estado)
+    assert res["ruta_processed"] is None and res["processed_esperado"] is False
+    val = dp.node_validar_score({**estado, **res})
+    assert val["openhands_status"] == "sin_validar"
+    assert dp.router_validar_score({**estado, **res, **val, "intentos": 1}) == "end_no_commit"
 
 
 def test_sin_usuario_o_repo_openhands_falla_claro(entorno, monkeypatch):
@@ -455,6 +503,19 @@ def test_sin_usuario_o_repo_openhands_falla_claro(entorno, monkeypatch):
 
     with pytest.raises(ValueError, match="GITHUB_USERNAME"):
         dp._download_github_file("data/x.csv", "main", "/tmp/no_se_usa.csv")
+
+
+def test_openhands_sin_github_token_se_rechaza(entorno, monkeypatch):
+    """Antes: AssertionError vacío de PyGithub → 'error' y reintento inútil."""
+    estado, configurar = entorno
+    oh = OpenHandsFalso()
+    configurar(RepoFalso(), oh)
+    monkeypatch.setattr(dp, "GITHUB_TOKEN", "")
+    res = dp.node_ejecutar(estado)
+    assert res["openhands_status"] == "rechazado"
+    assert "GITHUB_TOKEN" in res["error_history"][0]
+    assert "modo local" in res["error_history"][0]
+    assert GithubFalso.pedidos == [] and oh.conversaciones == []
 
 
 def test_usuario_y_repo_sin_valor_por_defecto(monkeypatch):

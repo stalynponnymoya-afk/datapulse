@@ -221,12 +221,12 @@ def test_router_retry_policy():
     assert OH_MAX_INTENTOS_INFRA == 2
     assert OH_MAX_INTENTOS_SCORE == 3
 
-    def walk(status, score):
+    def walk(status, score, **extra):
         intentos, path = 0, []
         while True:
             intentos += 1
             decision = router_validar_score(
-                {"intentos": intentos, "openhands_status": status, "score_despues": score}
+                {"intentos": intentos, "openhands_status": status, "score_despues": score, **extra}
             )
             path.append(decision)
             if decision != "retry":
@@ -245,7 +245,11 @@ def test_router_retry_policy():
     assert low == ["retry"] * (OH_MAX_INTENTOS_SCORE - 1) + ["end_no_commit"], low
 
     # Sin validar: mismo presupuesto que el score bajo, nunca commit.
-    assert walk("sin_validar", 100) == low
+    # Sin validar: solo se reintenta si processed_data.csv debía existir y no
+    # apareció (mismo presupuesto que el score bajo); nunca hay commit.
+    assert walk("sin_validar", 100, processed_esperado=True) == low
+    assert walk("sin_validar", 100, processed_esperado=False) == ["end_no_commit"]
+    assert walk("sin_validar", 100) == ["end_no_commit"]
 
     # Rechazo por configuración/política: fin inmediato.
     assert walk("rechazado", 100) == ["end_no_commit"]
@@ -255,7 +259,7 @@ def test_router_retry_policy():
     assert walk("finished", MIN_SCORE_PASS) == ["commit"]
     assert walk("finished", MIN_SCORE_PASS - 1)[-1] == "end_no_commit"
 
-    # Estado incompleto: no explota y no hace commit.
+    # Estado incompleto: no explota y no hace commit (score 0 → autocorrección).
     assert router_validar_score({}) == "retry"
     print(f"✅ Router: infra={infra} | low_score={low}")
 
