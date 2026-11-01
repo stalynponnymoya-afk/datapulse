@@ -21,7 +21,7 @@ DataPulse combines four technologies in a single orchestrated pipeline:
 | Component | Technology | Role |
 |---|---|---|
 | **Orchestrator** | LangGraph | State machine with 7 nodes, conditional retry logic |
-| **Reasoning** | Groq-hosted LLM (user-selectable, default `openai/gpt-oss-120b`) | Diagnoses column types, detects problems, builds technical brief |
+| **Reasoning** | Claude Sonnet 5.5 (Anthropic) by default; Groq-hosted LLM as fallback | Diagnoses column types, detects problems, reads the Knowledge Graph decisions and writes the cleaning brief that OpenHands receives |
 | **Decision Rules** | NetworkX (Knowledge Graph) | 139 rules: 113 base statistical/structural rules + 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) |
 | **Autonomous Agent** | OpenHands Cloud API | Writes, executes, and validates the cleaning code autonomously |
 
@@ -114,7 +114,8 @@ requests
 
 | Key | Service | Purpose |
 |---|---|---|
-| `GROQ_API_KEY` | [Groq Cloud](https://console.groq.com) | LLM inference (model selectable via `GROQ_MODEL`) |
+| `ANTHROPIC_API_KEY` | [Anthropic Console](https://console.anthropic.com) | Claude Sonnet 5.5: diagnosis, planning and the brief for OpenHands (billed separately from a Claude subscription) |
+| `GROQ_API_KEY` | [Groq Cloud](https://console.groq.com) | Fallback LLM when there is no Anthropic key (model selectable via `GROQ_MODEL`) |
 | `OPENHANDS_API_KEY` | [OpenHands](https://app.all-hands.dev) | Autonomous code agent |
 | `GITHUB_TOKEN` | [GitHub](https://github.com/settings/tokens) | Repository access (scope: repo) |
 
@@ -158,20 +159,26 @@ Attempt limits are **total attempts**, the first one included:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GROQ_API_KEY` | — | Groq LLM (required) |
+| `ANTHROPIC_API_KEY` | — | Claude (Anthropic). If present, Claude is the LLM by default |
+| `DATAPULSE_LLM` | automatic | `claude` or `groq`. Empty: Claude if `ANTHROPIC_API_KEY` exists, otherwise Groq |
+| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Claude model |
+| `DATAPULSE_CLAUDE_EFFORT` | `medium` | Claude effort: `low`, `medium`, `high`, `xhigh` or `max` |
+| `GROQ_API_KEY` | — | Groq LLM (fallback when there is no Anthropic key) |
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model |
 | `OPENHANDS_API_KEY` | empty | Empty → **local mode** (the script is generated with Groq and run on your machine) |
 | `GITHUB_TOKEN` | empty | Empty → outputs are saved in `outputs/` |
 | `GITHUB_USERNAME`, `GITHUB_REPO` | **no default** | Target repo. If missing, OpenHands mode does not start and outputs are saved locally |
-
-> In Colab, `GROQ_API_KEY`, `GROQ_MODEL`, `OPENHANDS_API_KEY`, `GITHUB_TOKEN`, `GITHUB_USERNAME` and
-> `GITHUB_REPO` can be Colab Secrets (they take priority over environment variables). The
-> `DATAPULSE_*` options are environment variables only (`os.environ[...]` in a cell before importing).
 | `DATAPULSE_MIN_SCORE_PASS` | `70` | Minimum independent score to commit |
 | `DATAPULSE_PERMITIR_SUBIDA_DATOS` | unset | `1` allows uploading data files to GitHub (only if the repo is private) |
 | `DATAPULSE_ENMASCARAR` | `1` | `0` disables masking of the samples sent to the LLM |
 | `DATAPULSE_FECHAS_CENTINELA` | empty | Comma-separated sentinel dates (`1900-01-01,9999-12-31`) to **flag** (never impute) |
 | `DATAPULSE_API_MAX_MB` | `100` | Max upload size per file in the API (413 if exceeded) |
+
+> In Colab, the API keys, `GROQ_MODEL`, `CLAUDE_MODEL`, `DATAPULSE_LLM`, `DATAPULSE_CLAUDE_EFFORT`,
+> `GITHUB_USERNAME` and `GITHUB_REPO` can be Colab Secrets (they take priority over environment
+> variables). The other `DATAPULSE_*` options are environment variables only (`os.environ[...]` in a
+> cell before importing). No key is ever stored in the repository or printed: on import DataPulse
+> only shows where each value came from.
 
 ### Data Privacy
 
@@ -200,8 +207,9 @@ first, then environment variable — so a missing secret does not disable the ot
 
 | Secret | Needed for |
 |---|---|
-| `GROQ_API_KEY` | Always (diagnosis, planning and, in local mode, code generation) |
-| `OPENHANDS_API_KEY` | OpenHands mode. Leave it out to use **local mode** |
+| `ANTHROPIC_API_KEY` | Claude Sonnet 5.5: diagnosis, planning, the brief for OpenHands and, in local mode, code generation |
+| `GROQ_API_KEY` | Only if you have no Anthropic key (or set `DATAPULSE_LLM=groq`) |
+| `OPENHANDS_API_KEY` | OpenHands mode (OpenHands uses its own model, set in your OpenHands account). Leave it out to use **local mode** |
 | `GITHUB_TOKEN`, `GITHUB_USERNAME`, `GITHUB_REPO` | Publishing results to a GitHub branch (and OpenHands mode). Without them, results stay in `outputs/` |
 | `GROQ_MODEL` | Optional, to change the Groq model |
 
@@ -241,7 +249,8 @@ first, then environment variable — so a missing secret does not disable the ot
 2. Configure the required environment variables:
    * On Linux/macOS:
      ```bash
-     export GROQ_API_KEY="your_groq_key"
+     export ANTHROPIC_API_KEY="your_anthropic_key"   # Claude Sonnet 5.5 (default LLM)
+     export GROQ_API_KEY="your_groq_key"             # optional fallback
      export GROQ_MODEL="openai/gpt-oss-120b"   # optional, override the default model
      export OPENHANDS_API_KEY="your_openhands_key"
      export GITHUB_TOKEN="your_github_token"
@@ -250,7 +259,8 @@ first, then environment variable — so a missing secret does not disable the ot
      ```
    * On Windows (PowerShell):
      ```powershell
-     $env:GROQ_API_KEY="your_groq_key"
+     $env:ANTHROPIC_API_KEY="your_anthropic_key"   # Claude Sonnet 5.5 (default LLM)
+     $env:GROQ_API_KEY="your_groq_key"             # optional fallback
      $env:GROQ_MODEL="openai/gpt-oss-120b"   # optional, override the default model
      $env:OPENHANDS_API_KEY="your_openhands_key"
      $env:GITHUB_TOKEN="your_github_token"
@@ -302,7 +312,7 @@ DataPulse combina cuatro tecnologías en un pipeline orquestado:
 | Componente | Tecnología | Rol |
 |---|---|---|
 | **Orquestador** | LangGraph | Máquina de estados con 7 nodos y lógica de retry condicional |
-| **Razonamiento** | LLM alojado en Groq (elegible por el usuario, por defecto `openai/gpt-oss-120b`) | Diagnostica tipos de columnas, detecta problemas, construye brief técnico |
+| **Razonamiento** | Claude Sonnet 5.5 (Anthropic) por defecto; LLM alojado en Groq como respaldo | Diagnostica tipos de columnas, detecta problemas, lee las decisiones del Grafo de Conocimiento y redacta el brief de limpieza que recibe OpenHands |
 | **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | 139 reglas: 113 reglas estadísticas/estructurales base + 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) |
 | **Agente Autónomo** | OpenHands Cloud API | Escribe, ejecuta y valida el código de limpieza de forma autónoma |
 
@@ -395,7 +405,8 @@ requests
 
 | Key | Servicio | Propósito |
 |---|---|---|
-| `GROQ_API_KEY` | [Groq Cloud](https://console.groq.com) | Inferencia LLM (modelo elegible vía `GROQ_MODEL`) |
+| `ANTHROPIC_API_KEY` | [Anthropic Console](https://console.anthropic.com) | Claude Sonnet 5.5: diagnóstico, planificación y brief para OpenHands (se factura aparte de una suscripción de Claude) |
+| `GROQ_API_KEY` | [Groq Cloud](https://console.groq.com) | LLM de respaldo si no hay clave de Anthropic (modelo elegible vía `GROQ_MODEL`) |
 | `OPENHANDS_API_KEY` | [OpenHands](https://app.all-hands.dev) | Agente autónomo de código |
 | `GITHUB_TOKEN` | [GitHub](https://github.com/settings/tokens) | Acceso al repositorio (scope: repo) |
 
@@ -440,20 +451,26 @@ Los límites son **intentos totales**, incluido el primero:
 
 | Variable | Por defecto | Uso |
 |---|---|---|
-| `GROQ_API_KEY` | — | LLM de Groq (obligatoria) |
+| `ANTHROPIC_API_KEY` | — | Claude (Anthropic). Si existe, Claude es el LLM por defecto |
+| `DATAPULSE_LLM` | automático | `claude` o `groq`. Vacía: Claude si existe `ANTHROPIC_API_KEY`; si no, Groq |
+| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Modelo de Claude |
+| `DATAPULSE_CLAUDE_EFFORT` | `medium` | Esfuerzo de Claude: `low`, `medium`, `high`, `xhigh` o `max` |
+| `GROQ_API_KEY` | — | LLM de Groq (respaldo si no hay clave de Anthropic) |
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | Modelo de Groq |
 | `OPENHANDS_API_KEY` | vacía | Vacía → **modo local** (el script se genera con Groq y se ejecuta en tu máquina) |
 | `GITHUB_TOKEN` | vacía | Vacía → las salidas se guardan en `outputs/` |
 | `GITHUB_USERNAME`, `GITHUB_REPO` | **sin valor por defecto** | Repo destino. Si faltan, el modo OpenHands no arranca y las salidas se guardan en local |
-
-> En Colab, `GROQ_API_KEY`, `GROQ_MODEL`, `OPENHANDS_API_KEY`, `GITHUB_TOKEN`, `GITHUB_USERNAME` y
-> `GITHUB_REPO` pueden ser Secrets de Colab (tienen prioridad sobre las variables de entorno). Las
-> opciones `DATAPULSE_*` son solo variables de entorno (`os.environ[...]` en una celda antes de importar).
 | `DATAPULSE_MIN_SCORE_PASS` | `70` | Score independiente mínimo para hacer commit |
 | `DATAPULSE_PERMITIR_SUBIDA_DATOS` | sin definir | `1` permite subir archivos de datos a GitHub (solo si el repo es privado) |
 | `DATAPULSE_ENMASCARAR` | `1` | `0` desactiva el enmascarado de las muestras que se envían al LLM |
 | `DATAPULSE_FECHAS_CENTINELA` | vacía | Fechas centinela separadas por comas (`1900-01-01,9999-12-31`) que se **marcan** (nunca se imputan) |
 | `DATAPULSE_API_MAX_MB` | `100` | Tamaño máximo por archivo en la API (413 si se supera) |
+
+> En Colab, las claves de API, `GROQ_MODEL`, `CLAUDE_MODEL`, `DATAPULSE_LLM`,
+> `DATAPULSE_CLAUDE_EFFORT`, `GITHUB_USERNAME` y `GITHUB_REPO` pueden ser Secrets de Colab (tienen
+> prioridad sobre las variables de entorno). Las demás opciones `DATAPULSE_*` son solo variables de
+> entorno (`os.environ[...]` en una celda antes de importar). Ninguna clave se guarda en el repositorio
+> ni se imprime: al importar, DataPulse solo muestra de dónde salió cada valor.
 
 ### Privacidad de los Datos
 
@@ -483,8 +500,9 @@ secreto de Colab y luego la variable de entorno —, así que un secreto que fal
 
 | Secreto | Para qué |
 |---|---|
-| `GROQ_API_KEY` | Siempre (diagnóstico, planificación y, en modo local, generación del código) |
-| `OPENHANDS_API_KEY` | Modo OpenHands. Sin él se usa el **modo local** |
+| `ANTHROPIC_API_KEY` | Claude Sonnet 5.5: diagnóstico, planificación, brief para OpenHands y, en modo local, generación del código |
+| `GROQ_API_KEY` | Solo si no tienes clave de Anthropic (o defines `DATAPULSE_LLM=groq`) |
+| `OPENHANDS_API_KEY` | Modo OpenHands (OpenHands usa su propio modelo, configurado en tu cuenta de OpenHands). Sin él se usa el **modo local** |
 | `GITHUB_TOKEN`, `GITHUB_USERNAME`, `GITHUB_REPO` | Publicar los resultados en una rama de GitHub (y el modo OpenHands). Sin ellos, los resultados quedan en `outputs/` |
 | `GROQ_MODEL` | Opcional, para cambiar el modelo de Groq |
 
@@ -524,7 +542,8 @@ secreto de Colab y luego la variable de entorno —, así que un secreto que fal
 2. Configura las variables de entorno obligatorias:
    * En Linux/macOS:
      ```bash
-     export GROQ_API_KEY="tu_key_groq"
+     export ANTHROPIC_API_KEY="tu_key_anthropic"   # Claude Sonnet 5.5 (LLM por defecto)
+     export GROQ_API_KEY="tu_key_groq"             # respaldo opcional
      export GROQ_MODEL="openai/gpt-oss-120b"   # opcional, sobrescribe el modelo por defecto
      export OPENHANDS_API_KEY="tu_key_openhands"
      export GITHUB_TOKEN="tu_token_github"
@@ -533,7 +552,8 @@ secreto de Colab y luego la variable de entorno —, así que un secreto que fal
      ```
    * En Windows (PowerShell):
      ```powershell
-     $env:GROQ_API_KEY="tu_key_groq"
+     $env:ANTHROPIC_API_KEY="tu_key_anthropic"   # Claude Sonnet 5.5 (LLM por defecto)
+     $env:GROQ_API_KEY="tu_key_groq"             # respaldo opcional
      $env:GROQ_MODEL="openai/gpt-oss-120b"   # opcional, sobrescribe el modelo por defecto
      $env:OPENHANDS_API_KEY="tu_key_openhands"
      $env:GITHUB_TOKEN="tu_token_github"

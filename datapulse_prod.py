@@ -137,22 +137,70 @@ GITHUB_DATA_BRANCH = "main"      # rama donde vive el archivo (normalmente "main
 GROQ_API_KEY       = _leer_config("GROQ_API_KEY")
 GITHUB_TOKEN       = _leer_config("GITHUB_TOKEN")
 OPENHANDS_API_KEY  = _leer_config("OPENHANDS_API_KEY")
+# La clave de Anthropic se pasa directamente al cliente y NO se copia a
+# os.environ, para que ningún proceso hijo pueda heredarla.
+ANTHROPIC_API_KEY  = _leer_config("ANTHROPIC_API_KEY")
 
 # Configuración de variables de entorno para LangChain/Groq
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+
+# ── LLM que diagnostica, planifica (brief para OpenHands) y, en modo local,
+# genera el script. OpenHands usa su propio modelo, configurado en su cuenta.
+# Claude Sonnet 5.5 por defecto cuando hay ANTHROPIC_API_KEY; Groq si no.
+CLAUDE_MODEL       = _leer_config("CLAUDE_MODEL", "claude-sonnet-5-5")
+_EFFORTS_VALIDOS   = ("low", "medium", "high", "xhigh", "max")
+
+
+def _resolver_effort() -> str:
+    """Nivel de esfuerzo de Claude (DATAPULSE_CLAUDE_EFFORT, por defecto medium)."""
+    effort = _leer_config("DATAPULSE_CLAUDE_EFFORT", "medium").lower()
+    if effort not in _EFFORTS_VALIDOS:
+        print(f"⚠️ DATAPULSE_CLAUDE_EFFORT={effort!r} no es válido "
+              f"({', '.join(_EFFORTS_VALIDOS)}); se usa 'medium'.")
+        return "medium"
+    return effort
+
+
+def _resolver_proveedor() -> str:
+    """
+    DATAPULSE_LLM = claude | groq. Sin valor (o con uno desconocido): Claude si
+    hay ANTHROPIC_API_KEY, Groq si no.
+    """
+    pedido = _leer_config("DATAPULSE_LLM").lower()
+    if pedido in ("claude", "anthropic"):
+        return "claude"
+    if pedido == "groq":
+        return "groq"
+    if pedido:
+        print(f"⚠️ DATAPULSE_LLM={pedido!r} no es válido (claude | groq); se elige automáticamente.")
+    return "claude" if ANTHROPIC_API_KEY else "groq"
+
+
+CLAUDE_EFFORT      = _resolver_effort()
+LLM_PROVEEDOR      = _resolver_proveedor()
+
+
+def describir_llm() -> str:
+    """Nombre legible del LLM en uso, para mensajes y resúmenes."""
+    if LLM_PROVEEDOR == "claude":
+        return f"Claude ({CLAUDE_MODEL}, effort {CLAUDE_EFFORT})"
+    return f"Groq ({GROQ_MODEL})"
 
 
 def resumen_configuracion() -> str:
     """Describe de dónde salió cada valor y el modo resultante (sin mostrar claves)."""
     lineas = ["🔑 Configuración:"]
-    for nombre in ("GROQ_API_KEY", "OPENHANDS_API_KEY", "GITHUB_TOKEN",
-                   "GITHUB_USERNAME", "GITHUB_REPO", "GROQ_MODEL"):
+    for nombre in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENHANDS_API_KEY", "GITHUB_TOKEN",
+                   "GITHUB_USERNAME", "GITHUB_REPO"):
         lineas.append(f"   - {nombre}: {ORIGEN_CONFIG.get(nombre, 'no definido')}")
-    if not GROQ_API_KEY:
-        lineas.append("   ⚠️ Falta GROQ_API_KEY: el diagnóstico y la planificación no funcionarán.")
+    lineas.append(f"   - LLM (diagnóstico, plan y brief): {describir_llm()}")
+    clave_llm = "ANTHROPIC_API_KEY" if LLM_PROVEEDOR == "claude" else "GROQ_API_KEY"
+    if not (ANTHROPIC_API_KEY if LLM_PROVEEDOR == "claude" else GROQ_API_KEY):
+        lineas.append(f"   ⚠️ Falta {clave_llm}: el diagnóstico y la planificación no funcionarán.")
     lineas.append(
         "   - Ejecución: "
-        + ("OpenHands" if OPENHANDS_API_KEY else "modo local (script generado con Groq)")
+        + ("OpenHands (con su propio modelo)" if OPENHANDS_API_KEY
+           else f"modo local (script generado con {describir_llm()})")
     )
     publica = GITHUB_TOKEN and GITHUB_USERNAME and GITHUB_REPO
     lineas.append(
@@ -2039,6 +2087,82 @@ def get_groq_llm():
     return ChatGroq(**kwargs)
 
 
+class _RespuestaLLM:
+    """Respuesta mínima con la misma forma que la de LangChain (``.content``)."""
+
+    def __init__(self, content: str):
+        self.content = content
+
+
+class ClaudeLLM:
+    """
+    Adaptador de Claude con la interfaz que usan los nodos: ``invoke(mensajes)``
+    devuelve un objeto con ``.content`` (texto). Usa el SDK oficial ``anthropic``.
+
+    - Pensamiento adaptativo (en Sonnet 5.5 no se puede desactivar); la
+      profundidad se controla con ``effort``. Sin temperature: el modelo la rechaza.
+    - Streaming con max_tokens amplio: el pensamiento también consume tokens.
+    - Fallback del servidor ante rechazos (``fallbacks="default"``).
+    """
+
+    MAX_TOKENS = 64000
+    BETA_FALLBACK = "server-side-fallback-2026-07-01"
+
+    def __init__(self, client, model: str, effort: str):
+        self.client = client
+        self.model = model
+        self.effort = effort
+
+    def invoke(self, mensajes) -> _RespuestaLLM:
+        texto_usuario = "\n\n".join(getattr(m, "content", str(m)) for m in mensajes)
+        with self.client.beta.messages.stream(
+            model=self.model,
+            max_tokens=self.MAX_TOKENS,
+            output_config={"effort": self.effort},
+            betas=[self.BETA_FALLBACK],
+            fallbacks="default",
+            messages=[{"role": "user", "content": texto_usuario}],
+        ) as stream:
+            mensaje = stream.get_final_message()
+
+        # Comprobar el motivo de parada antes de leer el contenido
+        if mensaje.stop_reason == "refusal":
+            detalles = getattr(mensaje, "stop_details", None)
+            categoria = getattr(detalles, "category", None)
+            raise RuntimeError(f"Claude declinó la petición (categoría: {categoria}).")
+        if mensaje.stop_reason == "max_tokens":
+            print(f"   ⚠️ La respuesta de Claude llegó al límite de {self.MAX_TOKENS} tokens; "
+                  "se intentará rescatar el JSON parcial.")
+        if getattr(mensaje, "model", self.model) != self.model:
+            print(f"   ℹ️ Respondió {mensaje.model} (fallback del servidor).")
+
+        # Solo los bloques de texto: los de pensamiento no forman parte de la respuesta
+        texto = "".join(b.text for b in mensaje.content if getattr(b, "type", "") == "text")
+        return _RespuestaLLM(texto)
+
+
+def get_claude_llm() -> ClaudeLLM:
+    """Crea el cliente de Anthropic con la clave leída (nunca desde el código)."""
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError(
+            "Falta ANTHROPIC_API_KEY: agrégala como secreto de Colab o variable de entorno, "
+            "o usa Groq con DATAPULSE_LLM=groq."
+        )
+    try:
+        import anthropic
+    except ImportError as exc:
+        raise RuntimeError(
+            "Falta el paquete 'anthropic': instala las dependencias con "
+            "pip install -r requirements.txt"
+        ) from exc
+    return ClaudeLLM(anthropic.Anthropic(api_key=ANTHROPIC_API_KEY), CLAUDE_MODEL, CLAUDE_EFFORT)
+
+
+def get_llm():
+    """LLM configurado: Claude (por defecto con ANTHROPIC_API_KEY) o Groq."""
+    return get_claude_llm() if LLM_PROVEEDOR == "claude" else get_groq_llm()
+
+
 def _strip_markdown_fences(text: str) -> str:
     """Quita una valla ```lang ... ``` que envuelva toda la respuesta."""
     match = re.match(r"^```[a-zA-Z0-9_-]*\s*\n?(.*?)\n?```\s*$", text.strip(), re.DOTALL)
@@ -2335,7 +2459,7 @@ def construir_prompt_diagnostico(metadata: dict) -> str:
 
 
 def node_diagnosticar(state: DataPulseState) -> DataPulseState:
-    llm = get_groq_llm()
+    llm = get_llm()
     prompt = construir_prompt_diagnostico(state["metadata"])
     response = llm.invoke([HumanMessage(content=prompt)])
     diagnostico = extract_json_from_markdown(response.content)
@@ -2530,7 +2654,7 @@ Análisis del grafo (multi-problema):
 Responde SOLO con el JSON. Sin markdown."""
 
 def node_planificar(state: DataPulseState) -> DataPulseState:
-    llm = get_groq_llm()
+    llm = get_llm()
     prompt = PLANIFICAR_PROMPT.format(
         acciones_json=json.dumps(state["acciones_grafo"], ensure_ascii=False, indent=2)
     )
@@ -2609,14 +2733,13 @@ def _entorno_minimo_subproceso() -> Dict[str, str]:
 
 def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     """
-    Fallback sin OPENHANDS_API_KEY: usa ChatGroq para generar el pipeline,
-    lo ejecuta localmente con subprocess y lee los reportes reales generados.
-    Permite probar el flujo completo solo con GROQ_API_KEY.
+    Fallback sin OPENHANDS_API_KEY: usa el LLM configurado (Claude o Groq)
+    para generar el pipeline, lo ejecuta localmente con subprocess y lee los
+    reportes reales generados. Permite probar el flujo completo sin OpenHands.
     """
     run_dir = os.path.join("outputs", datetime.now().strftime("%Y%m%d-%H%M%S") + "-local")
     os.makedirs(run_dir, exist_ok=True)
 
-    llm = get_groq_llm()
     prompt = LOCAL_GENERATION_PROMPT.format(
         brief=state.get("brief_tecnico", ""),
         filename=state.get("filename", os.path.basename(state["filename_path"])),
@@ -2626,9 +2749,11 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         errores_previos=_seccion_errores_previos(state),
     )
     try:
+        llm = get_llm()
         response = llm.invoke([HumanMessage(content=prompt)])
     except Exception as exc:
-        msg = f"Groq no pudo generar el pipeline: {type(exc).__name__}: {str(exc)[:300]}"
+        msg = (f"{describir_llm()} no pudo generar el pipeline: "
+               f"{type(exc).__name__}: {str(exc)[:300]}")
         print(f"   ❌ {msg}")
         return {
             "intentos": state.get("intentos", 0) + 1,
@@ -2822,10 +2947,10 @@ def _leer_salidas_rama(repo, rama: str, run_dir: str, nombres) -> tuple:
 def node_ejecutar(state: DataPulseState) -> DataPulseState:
     """
     OpenHands Cloud API — sube archivo a GitHub + flujo real de 5 pasos.
-    Sin OPENHANDS_API_KEY, genera y ejecuta el pipeline localmente con Groq.
+    Sin OPENHANDS_API_KEY, genera y ejecuta el pipeline localmente con el LLM configurado.
     """
     if not OPENHANDS_API_KEY:
-        print("   ℹ️ OPENHANDS_API_KEY vacío — generando pipeline local con Groq...")
+        print(f"   ℹ️ OPENHANDS_API_KEY vacío — generando pipeline local con {describir_llm()}...")
         return _run_local_groq_pipeline(state)
 
     falta = _falta_repo_github()

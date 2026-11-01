@@ -19,6 +19,9 @@ PyGithub==2.10.0
 langgraph==1.2.18
 langchain-core==1.7.0
 langchain-groq==1.1.3
+# SDK oficial de Anthropic: Claude Sonnet 5.5 para diagnóstico, planificación y
+# el brief de OpenHands (la clave se lee de un secreto, nunca del código)
+anthropic==2.3.0
 
 # ── Ingesta .xlsx (motor por defecto de pandas para xlsx) ───────────────────
 openpyxl==3.1.5

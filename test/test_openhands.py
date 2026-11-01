@@ -357,7 +357,8 @@ def test_descarga_fuera_de_colab_no_hace_nada(monkeypatch):
 
 def test_subprocess_recibe_env_sin_claves(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    for clave in ("GROQ_API_KEY", "GITHUB_TOKEN", "OPENHANDS_API_KEY", "AWS_SECRET_ACCESS_KEY"):
+    for clave in ("GROQ_API_KEY", "GITHUB_TOKEN", "OPENHANDS_API_KEY", "ANTHROPIC_API_KEY",
+                  "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.setenv(clave, "secreto-" + clave)
     datos = tmp_path / "d.csv"
     datos.write_text("a\n1\n", encoding="utf-8")

@@ -16,8 +16,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import datapulse_prod as dp  # noqa: E402
 
 RUTA_MODULO = os.path.join(os.path.dirname(__file__), "..", "datapulse_prod.py")
-NOMBRES = ("GROQ_API_KEY", "GITHUB_TOKEN", "OPENHANDS_API_KEY",
-           "GITHUB_USERNAME", "GITHUB_REPO", "GROQ_MODEL")
+NOMBRES = ("GROQ_API_KEY", "GITHUB_TOKEN", "OPENHANDS_API_KEY", "ANTHROPIC_API_KEY",
+           "GITHUB_USERNAME", "GITHUB_REPO", "GROQ_MODEL", "CLAUDE_MODEL",
+           "DATAPULSE_LLM", "DATAPULSE_CLAUDE_EFFORT")
 
 
 class SecretNotFoundError(Exception):
@@ -117,7 +118,36 @@ def test_fuera_de_colab_y_valores_por_defecto(entorno_limpio):
     assert dp._leer_config("GITHUB_TOKEN") == "ghp_entorno"
 
 
-def test_aviso_si_falta_groq(entorno_limpio, monkeypatch):
+def test_con_secreto_de_anthropic_se_usa_claude_sin_exponer_la_clave(entorno_limpio, capsys):
+    """Caso de Colab: todos los secretos, OpenHands con su modelo y Claude para el brief."""
+    _colab_falso(entorno_limpio, {
+        "ANTHROPIC_API_KEY": "sk-ant-falsa", "GROQ_API_KEY": "gsk_falsa",
+        "OPENHANDS_API_KEY": "oh_falsa", "GITHUB_TOKEN": "ghp_falso",
+    })
+    mod = _cargar_modulo()
+    assert mod.LLM_PROVEEDOR == "claude" and mod.CLAUDE_MODEL == "claude-sonnet-5-5"
+    assert "ANTHROPIC_API_KEY" not in os.environ
+    salida = capsys.readouterr().out
+    assert "ANTHROPIC_API_KEY: secreto de Colab" in salida
+    assert "LLM (diagnóstico, plan y brief): Claude (claude-sonnet-5-5, effort medium)" in salida
+    assert "OpenHands (con su propio modelo)" in salida
+    for clave in ("sk-ant-falsa", "gsk_falsa", "oh_falsa", "ghp_falso"):
+        assert clave not in salida
+
+
+def test_groq_a_pedido_aunque_haya_clave_de_anthropic(entorno_limpio):
+    _colab_falso(entorno_limpio, {"ANTHROPIC_API_KEY": "sk-ant-falsa", "DATAPULSE_LLM": "groq"})
+    mod = _cargar_modulo()
+    assert mod.LLM_PROVEEDOR == "groq"
+
+
+def test_aviso_si_falta_la_clave_del_llm(entorno_limpio, monkeypatch):
+    monkeypatch.setattr(dp, "LLM_PROVEEDOR", "claude")
+    monkeypatch.setattr(dp, "ANTHROPIC_API_KEY", "")
+    assert "Falta ANTHROPIC_API_KEY" in dp.resumen_configuracion()
+    monkeypatch.setattr(dp, "ANTHROPIC_API_KEY", "x")
+    assert "Falta" not in dp.resumen_configuracion()
+    monkeypatch.setattr(dp, "LLM_PROVEEDOR", "groq")
     monkeypatch.setattr(dp, "GROQ_API_KEY", "")
     assert "Falta GROQ_API_KEY" in dp.resumen_configuracion()
     monkeypatch.setattr(dp, "GROQ_API_KEY", "x")
