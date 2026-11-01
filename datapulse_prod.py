@@ -44,16 +44,49 @@ from src.quality_checker import (  # noqa: E402
 # ════════════════════════════════════════════════
 # CONFIGURACIÓN DEL PROYECTO
 # ════════════════════════════════════════════════
-# Usuario y repositorio de GitHub: siempre desde variables de entorno, sin
-# valor por defecto (antes apuntaban al repo del autor). Si faltan, el modo
-# OpenHands no arranca y node_commit guarda las salidas en local.
-GITHUB_USERNAME   = os.environ.get("GITHUB_USERNAME", "").strip()
-GITHUB_REPO       = os.environ.get("GITHUB_REPO", "").strip()
+# El código no contiene claves: cada valor se lee POR SEPARADO de los Secrets
+# de Colab y, si no está ahí, de una variable de entorno. Así un secreto que
+# falte (p. ej. OPENHANDS_API_KEY para usar el modo local) no anula a los demás.
+ORIGEN_CONFIG: Dict[str, str] = {}
+
+
+def _leer_config(nombre: str, defecto: str = "") -> str:
+    """
+    Lee ``nombre`` del secreto de Colab; si no existe (o no hay acceso), de la
+    variable de entorno; si tampoco, ``defecto``. Anota el origen en
+    ORIGEN_CONFIG (nunca el valor).
+    """
+    try:
+        from google.colab import userdata  # solo existe dentro de Colab
+    except Exception:
+        userdata = None
+    if userdata is not None:
+        try:
+            valor = userdata.get(nombre)
+        except Exception:
+            # SecretNotFoundError, NotebookAccessError o ejecución con !python
+            valor = None
+        if valor:
+            ORIGEN_CONFIG[nombre] = "secreto de Colab"
+            return str(valor).strip()
+    valor = os.environ.get(nombre, "").strip()
+    if valor:
+        ORIGEN_CONFIG[nombre] = "variable de entorno"
+        return valor
+    ORIGEN_CONFIG[nombre] = "valor por defecto" if defecto else "no definido"
+    return defecto
+
+
+# Usuario y repositorio de GitHub: sin valor por defecto (antes apuntaban al
+# repo del autor). Si faltan, el modo OpenHands no arranca y node_commit
+# guarda las salidas en local.
+GITHUB_USERNAME   = _leer_config("GITHUB_USERNAME")
+GITHUB_REPO       = _leer_config("GITHUB_REPO")
 # Modelo de Groq: configurable por el usuario. Anteriormente se usaba
 # "llama-3.3-70b-versatile", que Groq deprecó el 16/08/2026 (pasó a Enterprise);
-# su reemplazo recomendado es "openai/gpt-oss-120b". Puedes cambiarlo con la
-# variable de entorno GROQ_MODEL según los modelos disponibles en tu cuenta.
-GROQ_MODEL        = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+# su reemplazo recomendado es "openai/gpt-oss-120b". Puedes cambiarlo con
+# GROQ_MODEL (secreto de Colab o variable de entorno).
+GROQ_MODEL        = _leer_config("GROQ_MODEL", "openai/gpt-oss-120b")
 OH_TIMEOUT_SEG    = 900    # ventana de ejecución remota en OpenHands (~15 min)
 OH_STARTUP_TIMEOUT_SEG = 600  # espera máxima a que el sandbox quede READY
 # Política de intentos. Ambos valores son el NÚMERO TOTAL de intentos (el
@@ -100,19 +133,36 @@ MIN_SCORE_PASS    = _entero_env("DATAPULSE_MIN_SCORE_PASS", 70)
 GITHUB_DATA_FILE   = ""          # ← ESCRIBE AQUÍ EL NOMBRE DE TU ARCHIVO
 GITHUB_DATA_BRANCH = "main"      # rama donde vive el archivo (normalmente "main")
 
-# Carga de Secrets en Colab
-try:
-    from google.colab import userdata
-    GROQ_API_KEY       = userdata.get('GROQ_API_KEY')
-    GITHUB_TOKEN       = userdata.get('GITHUB_TOKEN')
-    OPENHANDS_API_KEY  = userdata.get('OPENHANDS_API_KEY')
-except Exception:
-    GROQ_API_KEY       = os.environ.get('GROQ_API_KEY', '')
-    GITHUB_TOKEN       = os.environ.get('GITHUB_TOKEN', '')
-    OPENHANDS_API_KEY  = os.environ.get('OPENHANDS_API_KEY', '')
+# Claves: cada una por separado (secreto de Colab → variable de entorno → vacía)
+GROQ_API_KEY       = _leer_config("GROQ_API_KEY")
+GITHUB_TOKEN       = _leer_config("GITHUB_TOKEN")
+OPENHANDS_API_KEY  = _leer_config("OPENHANDS_API_KEY")
 
 # Configuración de variables de entorno para LangChain/Groq
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+
+
+def resumen_configuracion() -> str:
+    """Describe de dónde salió cada valor y el modo resultante (sin mostrar claves)."""
+    lineas = ["🔑 Configuración:"]
+    for nombre in ("GROQ_API_KEY", "OPENHANDS_API_KEY", "GITHUB_TOKEN",
+                   "GITHUB_USERNAME", "GITHUB_REPO", "GROQ_MODEL"):
+        lineas.append(f"   - {nombre}: {ORIGEN_CONFIG.get(nombre, 'no definido')}")
+    if not GROQ_API_KEY:
+        lineas.append("   ⚠️ Falta GROQ_API_KEY: el diagnóstico y la planificación no funcionarán.")
+    lineas.append(
+        "   - Ejecución: "
+        + ("OpenHands" if OPENHANDS_API_KEY else "modo local (script generado con Groq)")
+    )
+    publica = GITHUB_TOKEN and GITHUB_USERNAME and GITHUB_REPO
+    lineas.append(
+        "   - Resultados: "
+        + (f"GitHub ({GITHUB_USERNAME}/{GITHUB_REPO})" if publica else "carpeta local outputs/")
+    )
+    return "\n".join(lineas)
+
+
+print(resumen_configuracion())
 
 # DataPulseState — canonical definition later in file (uses Annotated + Optional)
 # Mapeos base — sacar de _map_tipo_problema a nivel global

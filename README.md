@@ -163,6 +163,10 @@ Attempt limits are **total attempts**, the first one included:
 | `OPENHANDS_API_KEY` | empty | Empty → **local mode** (the script is generated with Groq and run on your machine) |
 | `GITHUB_TOKEN` | empty | Empty → outputs are saved in `outputs/` |
 | `GITHUB_USERNAME`, `GITHUB_REPO` | **no default** | Target repo. If missing, OpenHands mode does not start and outputs are saved locally |
+
+> In Colab, `GROQ_API_KEY`, `GROQ_MODEL`, `OPENHANDS_API_KEY`, `GITHUB_TOKEN`, `GITHUB_USERNAME` and
+> `GITHUB_REPO` can be Colab Secrets (they take priority over environment variables). The
+> `DATAPULSE_*` options are environment variables only (`os.environ[...]` in a cell before importing).
 | `DATAPULSE_MIN_SCORE_PASS` | `70` | Minimum independent score to commit |
 | `DATAPULSE_PERMITIR_SUBIDA_DATOS` | unset | `1` allows uploading data files to GitHub (only if the repo is private) |
 | `DATAPULSE_ENMASCARAR` | `1` | `0` disables masking of the samples sent to the LLM |
@@ -190,26 +194,38 @@ Attempt limits are **total attempts**, the first one included:
 ### Quick Start
 
 #### Option A: Google Colab (Recommended for GUI)
-1. Open the notebook in Google Colab
-2. **Clone the full repository** in the first cell — `datapulse_prod.py` imports the data
-   loader from `src/`, so uploading the script alone is not enough:
+The repository holds **no API keys**: you add them yourself as Colab Secrets (🔑 icon in the left
+sidebar) and enable notebook access for each one. Each value is read separately — Colab Secret
+first, then environment variable — so a missing secret does not disable the others.
+
+| Secret | Needed for |
+|---|---|
+| `GROQ_API_KEY` | Always (diagnosis, planning and, in local mode, code generation) |
+| `OPENHANDS_API_KEY` | OpenHands mode. Leave it out to use **local mode** |
+| `GITHUB_TOKEN`, `GITHUB_USERNAME`, `GITHUB_REPO` | Publishing results to a GitHub branch (and OpenHands mode). Without them, results stay in `outputs/` |
+| `GROQ_MODEL` | Optional, to change the Groq model |
+
+1. **Clone the full repository** — `datapulse_prod.py` imports the data loader from `src/`, so
+   uploading the script alone is not enough:
    ```python
    !git clone https://github.com/<your_user>/datapulse.git
    %cd datapulse
-   !pip install -r requirements.txt
+   !pip install -q -r requirements.txt
    ```
-3. Configure the API keys in Colab Secrets (`GROQ_API_KEY`, `GITHUB_TOKEN`, `OPENHANDS_API_KEY`) and
-   set the target repo as environment variables (they have no default):
+   If pip upgrades pandas/numpy, restart the session when Colab asks and run `%cd datapulse` again.
+2. Run DataPulse **by importing it in the notebook** (not with `!python datapulse_prod.py`: Colab
+   Secrets are not available in a separate process). On import it prints where each value came
+   from and which mode will be used, without showing any key:
    ```python
-   import os
-   os.environ["GITHUB_USERNAME"] = "<your_user>"
-   os.environ["GITHUB_REPO"] = "datapulse"
+   import datapulse_prod as dp
+   estado = dp.run_datapulse("data/ventas_prueba.csv")
+   dp._print_results(estado)
    ```
-4. Run all cells in order
-5. Upload your dataset when prompted
-6. Wait 3-5 minutes
-7. Download `processed_data.csv` — your clean dataset (DataPulse downloads it from the real
-   run output folder)
+3. The clean dataset is at `estado["ruta_processed"]`; to download it:
+   ```python
+   from google.colab import files
+   files.download(estado["ruta_processed"])
+   ```
 
 #### Option B: Local Execution (Standard Python Environment)
 1. Clone the repository and install the dependencies:
@@ -429,6 +445,10 @@ Los límites son **intentos totales**, incluido el primero:
 | `OPENHANDS_API_KEY` | vacía | Vacía → **modo local** (el script se genera con Groq y se ejecuta en tu máquina) |
 | `GITHUB_TOKEN` | vacía | Vacía → las salidas se guardan en `outputs/` |
 | `GITHUB_USERNAME`, `GITHUB_REPO` | **sin valor por defecto** | Repo destino. Si faltan, el modo OpenHands no arranca y las salidas se guardan en local |
+
+> En Colab, `GROQ_API_KEY`, `GROQ_MODEL`, `OPENHANDS_API_KEY`, `GITHUB_TOKEN`, `GITHUB_USERNAME` y
+> `GITHUB_REPO` pueden ser Secrets de Colab (tienen prioridad sobre las variables de entorno). Las
+> opciones `DATAPULSE_*` son solo variables de entorno (`os.environ[...]` en una celda antes de importar).
 | `DATAPULSE_MIN_SCORE_PASS` | `70` | Score independiente mínimo para hacer commit |
 | `DATAPULSE_PERMITIR_SUBIDA_DATOS` | sin definir | `1` permite subir archivos de datos a GitHub (solo si el repo es privado) |
 | `DATAPULSE_ENMASCARAR` | `1` | `0` desactiva el enmascarado de las muestras que se envían al LLM |
@@ -457,26 +477,38 @@ Los límites son **intentos totales**, incluido el primero:
 ### Inicio Rápido
 
 #### Opción A: Google Colab (Recomendado para Interfaz Gráfica)
-1. Abrir el notebook en Google Colab
-2. **Clonar el repositorio completo** en la primera celda — `datapulse_prod.py` importa el
-   cargador de datos desde `src/`, así que no basta con subir solo el script:
+El repositorio **no contiene claves**: las agregas tú como Secrets de Colab (icono 🔑 en la barra
+lateral) y activas el acceso del notebook a cada una. Cada valor se lee por separado — primero el
+secreto de Colab y luego la variable de entorno —, así que un secreto que falte no anula los demás.
+
+| Secreto | Para qué |
+|---|---|
+| `GROQ_API_KEY` | Siempre (diagnóstico, planificación y, en modo local, generación del código) |
+| `OPENHANDS_API_KEY` | Modo OpenHands. Sin él se usa el **modo local** |
+| `GITHUB_TOKEN`, `GITHUB_USERNAME`, `GITHUB_REPO` | Publicar los resultados en una rama de GitHub (y el modo OpenHands). Sin ellos, los resultados quedan en `outputs/` |
+| `GROQ_MODEL` | Opcional, para cambiar el modelo de Groq |
+
+1. **Clonar el repositorio completo** — `datapulse_prod.py` importa el cargador de datos desde
+   `src/`, así que no basta con subir solo el script:
    ```python
    !git clone https://github.com/<tu_usuario>/datapulse.git
    %cd datapulse
-   !pip install -r requirements.txt
+   !pip install -q -r requirements.txt
    ```
-3. Configurar las API keys en Colab Secrets (`GROQ_API_KEY`, `GITHUB_TOKEN`, `OPENHANDS_API_KEY`) y
-   definir el repo destino como variables de entorno (no tienen valor por defecto):
+   Si pip actualiza pandas/numpy, reinicia la sesión cuando Colab lo pida y vuelve a `%cd datapulse`.
+2. Ejecutar DataPulse **importándolo en el notebook** (no con `!python datapulse_prod.py`: los
+   Secrets de Colab no están disponibles en un proceso aparte). Al importarlo muestra de dónde salió
+   cada valor y qué modo se usará, sin mostrar ninguna clave:
    ```python
-   import os
-   os.environ["GITHUB_USERNAME"] = "<tu_usuario>"
-   os.environ["GITHUB_REPO"] = "datapulse"
+   import datapulse_prod as dp
+   estado = dp.run_datapulse("data/ventas_prueba.csv")
+   dp._print_results(estado)
    ```
-4. Ejecutar todas las celdas en orden
-5. Subir tu dataset cuando se solicite
-6. Esperar 3-5 minutos
-7. Descargar `processed_data.csv` — tu dataset limpio (DataPulse lo descarga desde la
-   carpeta real de salida de la ejecución)
+3. El dataset limpio queda en `estado["ruta_processed"]`; para descargarlo:
+   ```python
+   from google.colab import files
+   files.download(estado["ruta_processed"])
+   ```
 
 #### Opción B: Ejecución Local (Entorno Python Estándar)
 1. Clona el repositorio e instala las dependencias:
