@@ -156,7 +156,7 @@ PROBLEMA_MAP = {
     "outlier_severo":                  "Outlier_Severo",
     "outlier_extremo":                 "Outlier_Severo",
     "tipo_incorrecto":                 "Formato_No_Estandar",
-    "nulos_disfrazados":              "Nulos_Criticos",
+    "nulos_disfrazados":               "Valores_Centinela",
     "duplicados":                      "Duplicados_Registros",
     "inconsistencia_formato":          "Formato_No_Estandar",
     "escala_diferente":                "Escalas_Diferentes",
@@ -971,12 +971,14 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
         justificacion_es="Datos financieros: outliers se MARCAN pero NO eliminan ni capan (pueden ser legítimos).",
         justificacion_en="Financial data: outliers FLAGGED but NOT removed or capped (may be legitimate).")
 
+    # Decisión del autor (fase 1): recortar a 0 inventaría un monto; se marca
+    # con flag y se reemplaza por NaN, como indica el planificador.
     kg.add_edge("Variable_Financiera", "Rango_Invalido",
-        accion="flag_and_clip",
-        parametros={"flag_negative": True, "clip_min": 0},
+        accion="flag_y_nan",
+        parametros={"flag_negative": True, "flag_suffix": "_negativo", "replace_with": "NaN"},
         confianza=0.85,
-        justificacion_es="Montos negativos inesperados: marcar con flag y recortar a 0.",
-        justificacion_en="Unexpected negative amounts: flag and clip to 0.")
+        justificacion_es="Montos negativos inesperados: marcar con flag y reemplazar por NaN (recortar a 0 inventaría un valor).",
+        justificacion_en="Unexpected negative amounts: flag and replace with NaN (clipping to 0 would fabricate a value).")
 
     # ── NULOS EN CONTACTO ─────────────────────────────────────
 
@@ -1045,6 +1047,22 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
         justificacion_es="Valores negativos o imposibles en conteos/edades convertidos a NaN.",
         justificacion_en="Negative or impossible values in counts/ages converted to NaN.")
 
+    # ── VALORES CENTINELA (nulos disfrazados) ─────────────────
+    # -999, 9999, -1… son marcadores de "sin dato", no valores reales ni
+    # outliers: se reemplazan por NaN antes de cualquier imputación.
+    kg.add_node("Valores_Centinela", node_type="problema")
+    for _tipo_centinela in (
+        "Variable_Numerica_Continua",
+        "Variable_Numerica_Discreta",
+        "Variable_Financiera",
+    ):
+        kg.add_edge(_tipo_centinela, "Valores_Centinela",
+            accion="reemplazar_centinela_por_nan",
+            parametros={"centinelas": [-999, -9999, 999, 9999, -1]},
+            confianza=0.92,
+            justificacion_es="Los centinelas (-999, 9999, -1…) codifican nulos: se reemplazan por NaN antes de imputar; nunca se winsorizan ni se imputan como valores reales.",
+            justificacion_en="Sentinels (-999, 9999, -1…) encode missing values: replace them with NaN before imputing; never winsorize or impute them as real values.")
+
     # ═══════════════════════════════════════════════════════════
     # FIN REGLAS NUEVAS
     # ═══════════════════════════════════════════════════════════
@@ -1066,7 +1084,7 @@ Fuentes de evidencia para cada rango/regla documentadas inline.
 
 def agregar_reglas_dominio(kg):
     """
-    Agrega ~120 reglas de dominio a un grafo existente.
+    Agrega 26 reglas de dominio a un grafo existente.
     Llamar después de construir_grafo_conocimiento().
     """
     count_before = kg.number_of_edges()
@@ -2216,16 +2234,49 @@ def _map_tipo_problema(tipo_inferido: str, problema: str) -> tuple:
     return src, tgt
 
 
+UMBRAL_SKEWNESS = 1.0
+
+
+def _ajustar_por_skewness(accion: dict, skewness: Optional[float]) -> dict:
+    """
+    Si la variable está sesgada (|skewness| > 1 según la metadata real, no la
+    etiqueta del LLM) y la acción es fillna_mean, la cambia por fillna_median.
+    """
+    if accion.get("accion") != "fillna_mean" or skewness is None:
+        return accion
+    try:
+        sesgo = float(skewness)
+    except (TypeError, ValueError):
+        return accion
+    if abs(sesgo) <= UMBRAL_SKEWNESS:
+        return accion
+    ajustada = dict(accion)
+    ajustada["accion"] = "fillna_median"
+    ajustada["parametros"] = {**(accion.get("parametros") or {}), "strategy": "median"}
+    ajustada["justificacion_es"] = (
+        f"{accion.get('justificacion_es') or ''} [Ajuste: |skewness| = {abs(sesgo):.2f} > "
+        f"{UMBRAL_SKEWNESS:g} en la metadata; la media está sesgada, se usa la mediana.]"
+    ).strip()
+    ajustada["justificacion_en"] = (
+        f"{accion.get('justificacion_en') or ''} [Adjusted: |skewness| = {abs(sesgo):.2f} > "
+        f"{UMBRAL_SKEWNESS:g} in metadata; the mean is skewed, median is used.]"
+    ).strip()
+    ajustada["ajuste"] = "skewness"
+    return ajustada
+
+
 def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
     global kg
     if kg is None:
         raise RuntimeError("El grafo de conocimiento (kg) no ha sido cargado.")
 
     diagnostico = state["diagnostico"]
+    columnas_info = (state.get("metadata") or {}).get("columnas_info", {})
     acciones = {}
 
     for col_name, diag in diagnostico.items():
         tipo = diag.get("tipo_inferido", "")
+        skewness = (columnas_info.get(col_name) or {}).get("skewness")
 
         # Soportar tanto "problema" (string, formato anterior)
         # como "problemas" (lista, formato nuevo multi-problema)
@@ -2265,7 +2316,7 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
                 fallbacks_col.append(problema)
                 continue
             best = max(edges_data, key=lambda x: x.get("confianza", 0.0))
-            acciones_col.append({
+            accion_col = {
                 "problema": problema,
                 "accion": best.get("accion"),
                 "confianza": best.get("confianza"),
@@ -2273,7 +2324,8 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
                 "justificacion_es": best.get("justificacion_es"),
                 "justificacion_en": best.get("justificacion_en"),
                 "fuente_decision": "knowledge_graph",
-            })
+            }
+            acciones_col.append(_ajustar_por_skewness(accion_col, skewness))
 
         if not acciones_col and not fallbacks_col:
             # No se encontró ningún problema reconocible
