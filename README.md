@@ -22,7 +22,7 @@ DataPulse combines four technologies in a single orchestrated pipeline:
 |---|---|---|
 | **Orchestrator** | LangGraph | State machine with 7 nodes, conditional retry logic |
 | **Reasoning** | Groq-hosted LLM (user-selectable, default `openai/gpt-oss-120b`) | Diagnoses column types, detects problems, builds technical brief |
-| **Decision Rules** | NetworkX (Knowledge Graph) | ~58 base statistical rules + 24 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) — over 100 edges total |
+| **Decision Rules** | NetworkX (Knowledge Graph) | 135 rules: 109 base statistical/structural rules + 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) |
 | **Autonomous Agent** | OpenHands Cloud API | Writes, executes, and validates the cleaning code autonomously |
 
 ### Pipeline Architecture
@@ -57,7 +57,7 @@ Your CSV/XLSX/JSON/Parquet file
 
 ### Knowledge Graph
 
-The Knowledge Graph is a `MultiDiGraph` (NetworkX) with ~58 base statistical rules organized in 6 categories, plus 24 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) — over 100 edges total:
+The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **135 rules (edges)**: 109 base statistical/structural rules organized in 6 categories, plus 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA). The 109 base rules include the 106 original ones plus 3 sentinel rules (`reemplazar_centinela_por_nan`) added in phase 1:
 
 1. **Structural Integrity** — duplicates, empty rows/columns, column name normalization
 2. **String Cleaning** — whitespace, line breaks, case normalization, email/phone validation
@@ -66,7 +66,7 @@ The Knowledge Graph is a `MultiDiGraph` (NetworkX) with ~58 base statistical rul
 5. **Outlier Detection** — winsorization, Isolation Forest, Local Outlier Factor
 6. **Scaling & Encoding** — MinMax, Standard, Robust scaling, OneHot/Ordinal encoding
 
-Each rule contains: action, confidence score (0.78–0.90), parameters, and bilingual justification.
+Each rule contains: action, confidence score (between 0.78 and 1.0), parameters, and bilingual justification.
 
 When the graph has no rule for a specific case, the decision falls back to the LLM with a maximum confidence of 0.70.
 
@@ -76,9 +76,11 @@ When the graph has no rule for a specific case, the decision falls back to the L
 |---|---|
 | `datapulse_pipeline.py` | Executable Python script that reproduces the entire cleaning process |
 | `processed_data.csv` | Clean dataset ready for analysis or modeling (omitted from commit if >50MB) |
-| `quality_report.json` | Quality metrics: null counts, types, statistics, duplicates, and before/after quality scores |
+| `quality_report.json` | Quality metrics written by the generated script (its score is informative only: the real score is recomputed independently) |
 | `cleaning_log.json` | Comprehensive audit log: every single decision taken with its bilingual justification |
-| `eda_report.html` | Visual Exploratory Data Analysis report with distributions, correlations, and summary plots |
+| `audit_log.json` | Run summary: before/after/reported scores and every planned action with its source (graph or LLM) |
+
+> `eda_report.html` is **not implemented** yet: earlier versions of this README listed it, but the pipeline does not generate it.
 
 ### Example Output
 
@@ -127,6 +129,58 @@ requests
 > `reasoning_effort="low"`, so the JSON reply is not truncated. If you pick a model with a
 > very low completion limit, raise `max_tokens` in `get_groq_llm()` accordingly.
 
+### Validation and Retry Policy
+
+The score that decides the commit is **not** the one written by the generated script.
+`node_validar_score` recomputes it with `src/quality_checker.py`:
+
+- `score_antes`: quality of the original dataset.
+- `score_despues`: quality of the real `processed_data.csv` produced by the run.
+- `score_reportado`: what the script wrote in `quality_report.json` (informative only).
+
+If there is no `processed_data.csv` to read, the run ends as `sin_validar` and **nothing is
+committed**. When the score is below `DATAPULSE_MIN_SCORE_PASS`, a summary of the report (score
+and main problems) is added to the error history so the next attempt knows what to fix.
+
+Attempt limits are **total attempts**, the first one included:
+
+| Situation | Status | Total attempts |
+|---|---|---|
+| Infrastructure failure (`error`, `timeout`, `stuck`, `stopped`) or the script crashed | `error`… | 2 (`OH_MAX_INTENTOS_INFRA`) |
+| Score below the threshold, or not validated (`sin_validar`) | `finished` / `sin_validar` | 3 (`OH_MAX_INTENTOS_SCORE`) |
+| Configuration or policy rejection (missing user/repo, data upload not allowed) | `rechazado` | 1 (no retry) |
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GROQ_API_KEY` | — | Groq LLM (required) |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model |
+| `OPENHANDS_API_KEY` | empty | Empty → **local mode** (the script is generated with Groq and run on your machine) |
+| `GITHUB_TOKEN` | empty | Empty → outputs are saved in `outputs/` |
+| `GITHUB_USERNAME`, `GITHUB_REPO` | **no default** | Target repo. If missing, OpenHands mode does not start and outputs are saved locally |
+| `DATAPULSE_MIN_SCORE_PASS` | `70` | Minimum independent score to commit |
+| `DATAPULSE_PERMITIR_SUBIDA_DATOS` | unset | `1` allows uploading data files to GitHub (only if the repo is private) |
+| `DATAPULSE_ENMASCARAR` | `1` | `0` disables masking of the samples sent to the LLM |
+| `DATAPULSE_API_MAX_MB` | `100` | Max upload size per file in the API (413 if exceeded) |
+
+### Data Privacy
+
+- **Data upload policy.** The raw dataset and any data file (`.csv`, `.tsv`, `.xlsx`, `.xls`,
+  `.parquet`, data `.json`) are uploaded to GitHub **only** if `DATAPULSE_PERMITIR_SUBIDA_DATOS=1`
+  **and** the repository is private. Otherwise OpenHands mode does not start for a local file
+  (use local mode instead), and `node_commit` uploads only the script, the reports and
+  `audit_log.json`; data files stay in `outputs/`. A file that is already in GitHub
+  (`github_file=`) does not count as an upload, but without permission the agent is asked not to
+  commit data, so the run ends as `sin_validar`.
+- **Masked samples.** Before sending column samples to the LLM, emails become `u***@domain`,
+  sequences of 6+ digits (IDs, phones, accounts) become `9`s of the same length, and
+  high-cardinality text columns (>50 % unique: names, free text) become a shape pattern
+  (`José Muñoz` → `Aaaa Aaaaa`). Low-cardinality categories are kept as they are.
+- **Generated code environment.** The locally generated script runs with a minimal environment
+  (`PATH`, `HOME`, `LANG`, `PYTHONIOENCODING`) and no API keys. Full isolation (container without
+  network) is planned for phase 2.
+
 ### Quick Start
 
 #### Option A: Google Colab (Recommended for GUI)
@@ -138,7 +192,13 @@ requests
    %cd datapulse
    !pip install -r requirements.txt
    ```
-3. Configure the API keys in Colab Secrets
+3. Configure the API keys in Colab Secrets (`GROQ_API_KEY`, `GITHUB_TOKEN`, `OPENHANDS_API_KEY`) and
+   set the target repo as environment variables (they have no default):
+   ```python
+   import os
+   os.environ["GITHUB_USERNAME"] = "<your_user>"
+   os.environ["GITHUB_REPO"] = "datapulse"
+   ```
 4. Run all cells in order
 5. Upload your dataset when prompted
 6. Wait 3-5 minutes
@@ -221,7 +281,7 @@ DataPulse combina cuatro tecnologías en un pipeline orquestado:
 |---|---|---|
 | **Orquestador** | LangGraph | Máquina de estados con 7 nodos y lógica de retry condicional |
 | **Razonamiento** | LLM alojado en Groq (elegible por el usuario, por defecto `openai/gpt-oss-120b`) | Diagnostica tipos de columnas, detecta problemas, construye brief técnico |
-| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | ~58 reglas estadísticas base + 24 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) — más de 100 aristas totales |
+| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | 135 reglas: 109 reglas estadísticas/estructurales base + 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) |
 | **Agente Autónomo** | OpenHands Cloud API | Escribe, ejecuta y valida el código de limpieza de forma autónoma |
 
 ### Arquitectura del Pipeline
@@ -256,7 +316,7 @@ Tu archivo CSV/XLSX/JSON/Parquet
 
 ### Grafo de Conocimiento
 
-El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con ~58 reglas estadísticas base organizadas en 6 categorías, más 24 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) — superando las 100 aristas totales:
+El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **135 reglas (aristas)**: 109 reglas estadísticas/estructurales base organizadas en 6 categorías, más 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA). Las 109 base son las 106 originales más 3 reglas de centinelas (`reemplazar_centinela_por_nan`) añadidas en la fase 1:
 
 1. **Integridad Estructural** — duplicados, filas/columnas vacías, normalización de nombres
 2. **Limpieza de Texto** — espacios, saltos de línea, normalización de caja, validación email/teléfono
@@ -265,7 +325,7 @@ El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con ~58 reglas estadís
 5. **Detección de Outliers** — winsorización, Isolation Forest, Local Outlier Factor
 6. **Escalado y Encoding** — MinMax, Standard, Robust scaling, OneHot/Ordinal encoding
 
-Cada regla contiene: acción, confianza (0.78–0.90), parámetros y justificación bilingüe.
+Cada regla contiene: acción, confianza (entre 0,78 y 1,0), parámetros y justificación bilingüe.
 
 Cuando el grafo no tiene regla para un caso específico, la decisión cae al LLM con confianza máxima de 0.70.
 
@@ -275,9 +335,11 @@ Cuando el grafo no tiene regla para un caso específico, la decisión cae al LLM
 |---|---|
 | `datapulse_pipeline.py` | Script Python ejecutable que reproduce toda la limpieza |
 | `processed_data.csv` | Dataset limpio listo para análisis o modelado (se omite del commit si >50MB) |
-| `quality_report.json` | Métricas de calidad: nulos, tipos, estadísticas, duplicados y scores antes/después |
+| `quality_report.json` | Métricas de calidad que escribe el script generado (su score es solo informativo: el score real se recalcula de forma independiente) |
 | `cleaning_log.json` | Auditoría completa: cada decisión tomada con su respectiva justificación bilingüe |
-| `eda_report.html` | Reporte visual de análisis exploratorio (EDA) con distribuciones, correlaciones y resumen |
+| `audit_log.json` | Resumen de la ejecución: scores antes/después/reportado y cada acción planificada con su fuente (grafo o LLM) |
+
+> `eda_report.html` **no está implementado** todavía: versiones anteriores de este README lo listaban, pero el pipeline no lo genera.
 
 ### Ejemplo de Ejecución
 
@@ -326,6 +388,60 @@ requests
 > con `reasoning_effort="low"`, para que la respuesta JSON no se trunque. Si eliges un
 > modelo con un límite de salida muy bajo, sube `max_tokens` en `get_groq_llm()`.
 
+### Validación y Política de Intentos
+
+El score que decide el commit **no** es el que escribe el script generado.
+`node_validar_score` lo recalcula con `src/quality_checker.py`:
+
+- `score_antes`: calidad del dataset original.
+- `score_despues`: calidad del `processed_data.csv` real de la ejecución.
+- `score_reportado`: lo que escribió el script en `quality_report.json` (solo informativo).
+
+Si no hay `processed_data.csv` que leer, la ejecución termina como `sin_validar` y **no hay
+commit**. Cuando el score queda bajo `DATAPULSE_MIN_SCORE_PASS`, se agrega al historial de errores
+un resumen del reporte (score y principales problemas) para que el siguiente intento sepa qué
+corregir.
+
+Los límites son **intentos totales**, incluido el primero:
+
+| Situación | Estado | Intentos totales |
+|---|---|---|
+| Fallo de infraestructura (`error`, `timeout`, `stuck`, `stopped`) o el script falló | `error`… | 2 (`OH_MAX_INTENTOS_INFRA`) |
+| Score bajo el umbral, o sin validar (`sin_validar`) | `finished` / `sin_validar` | 3 (`OH_MAX_INTENTOS_SCORE`) |
+| Rechazo por configuración o política (falta usuario/repo, subida de datos no permitida) | `rechazado` | 1 (sin reintento) |
+
+### Variables de Entorno
+
+| Variable | Por defecto | Uso |
+|---|---|---|
+| `GROQ_API_KEY` | — | LLM de Groq (obligatoria) |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Modelo de Groq |
+| `OPENHANDS_API_KEY` | vacía | Vacía → **modo local** (el script se genera con Groq y se ejecuta en tu máquina) |
+| `GITHUB_TOKEN` | vacía | Vacía → las salidas se guardan en `outputs/` |
+| `GITHUB_USERNAME`, `GITHUB_REPO` | **sin valor por defecto** | Repo destino. Si faltan, el modo OpenHands no arranca y las salidas se guardan en local |
+| `DATAPULSE_MIN_SCORE_PASS` | `70` | Score independiente mínimo para hacer commit |
+| `DATAPULSE_PERMITIR_SUBIDA_DATOS` | sin definir | `1` permite subir archivos de datos a GitHub (solo si el repo es privado) |
+| `DATAPULSE_ENMASCARAR` | `1` | `0` desactiva el enmascarado de las muestras que se envían al LLM |
+| `DATAPULSE_API_MAX_MB` | `100` | Tamaño máximo por archivo en la API (413 si se supera) |
+
+### Privacidad de los Datos
+
+- **Política de subida de datos.** El dataset crudo y cualquier archivo de datos (`.csv`, `.tsv`,
+  `.xlsx`, `.xls`, `.parquet`, `.json` de datos) se suben a GitHub **solo** si
+  `DATAPULSE_PERMITIR_SUBIDA_DATOS=1` **y** el repositorio es privado. Si no, el modo OpenHands no
+  arranca con un archivo local (usa el modo local) y `node_commit` sube solo el script, los
+  reportes y `audit_log.json`; los archivos de datos quedan en `outputs/`. Un archivo que ya está
+  en GitHub (`github_file=`) no cuenta como subida, pero sin permiso se pide al agente que no haga
+  commit de datos, así que la ejecución termina como `sin_validar`.
+- **Muestras enmascaradas.** Antes de enviar las muestras de cada columna al LLM, los emails pasan
+  a `u***@dominio`, las secuencias de 6 o más dígitos (cédulas, teléfonos, cuentas) a `9` de la
+  misma longitud y las columnas de texto de alta cardinalidad (>50 % únicos: nombres, texto libre)
+  a un patrón de forma (`José Muñoz` → `Aaaa Aaaaa`). Las categorías de baja cardinalidad se
+  mantienen tal cual.
+- **Entorno del código generado.** El script generado en modo local se ejecuta con un entorno
+  mínimo (`PATH`, `HOME`, `LANG`, `PYTHONIOENCODING`) y sin claves de API. El aislamiento completo
+  (contenedor sin red) queda para la fase 2.
+
 ### Inicio Rápido
 
 #### Opción A: Google Colab (Recomendado para Interfaz Gráfica)
@@ -337,7 +453,13 @@ requests
    %cd datapulse
    !pip install -r requirements.txt
    ```
-3. Configurar las API keys en Colab Secrets
+3. Configurar las API keys en Colab Secrets (`GROQ_API_KEY`, `GITHUB_TOKEN`, `OPENHANDS_API_KEY`) y
+   definir el repo destino como variables de entorno (no tienen valor por defecto):
+   ```python
+   import os
+   os.environ["GITHUB_USERNAME"] = "<tu_usuario>"
+   os.environ["GITHUB_REPO"] = "datapulse"
+   ```
 4. Ejecutar todas las celdas en orden
 5. Subir tu dataset cuando se solicite
 6. Esperar 3-5 minutos
