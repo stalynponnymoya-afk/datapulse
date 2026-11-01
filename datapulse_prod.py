@@ -203,7 +203,41 @@ ESQUEMA_GENERAL_TARGETS = {
 # a grafos de conocimiento y cada estado representa una relacion logica
 # que le permite saber que desicion tomar y como manejar los datos faltantes
 
+# Cadenas que representan un nulo. Fuente única para la regla
+# Texto_General → Cadenas_Vacias_Representan_Nulos y para las aristas de
+# Valores_Centinela desde columnas categóricas y de texto.
+CADENAS_NULAS = ["", " ", "NA", "N/A", "null", "NULL", "None", "n/a", "na"]
+
+# Centinelas numéricos (-999, 9999…) que codifican "sin dato".
+CENTINELAS_NUMERICOS = [-999, -9999, 999, 9999, -1]
+
+
+def _fechas_centinela_config() -> List[str]:
+    """
+    Fechas centinela (p. ej. 1900-01-01, 9999-12-31) configurables con
+    DATAPULSE_FECHAS_CENTINELA, separadas por comas. Vacía por defecto: no hay
+    una fecha que sea centinela en todos los dominios. Las entradas que no son
+    fechas se ignoran con un aviso.
+    """
+    fechas = []
+    for valor in os.environ.get("DATAPULSE_FECHAS_CENTINELA", "").split(","):
+        valor = valor.strip()
+        if not valor:
+            continue
+        try:
+            # Sin pasar por Timestamp: 9999-12-31 está fuera de su rango
+            fechas.append(datetime.strptime(valor, "%Y-%m-%d").date().isoformat())
+        except ValueError:
+            print(f"⚠️ DATAPULSE_FECHAS_CENTINELA: '{valor}' no es una fecha AAAA-MM-DD; se ignora.")
+    return fechas
+
+
 def construir_grafo_conocimiento() -> nx.DiGraph:
+    """
+    Construye el grafo base: 113 reglas estadísticas y estructurales (106
+    originales + 7 de Valores_Centinela añadidas en la fase 1). Las 26 reglas
+    de dominio se agregan después con agregar_reglas_dominio().
+    """
     kg = nx.MultiDiGraph()
 
     # ============================================================
@@ -323,7 +357,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
     kg.add_edge("Texto_General", "Cadenas_Vacias_Representan_Nulos",
                 accion="replace_to_na",
                 confianza=0.99,
-                parametros={"to_replace": ["", " ", "NA", "N/A", "null", "NULL", "None", "n/a", "na"], "value": None},
+                parametros={"to_replace": list(CADENAS_NULAS), "value": None},
                 justificacion_es="Las cadenas vacías y sus variantes textuales ('NA', 'N/A') deben unificarse al tipo nulo nativo del sistema para habilitar funciones estadísticas de omisión y imputación.",
                 justificacion_en="Empty strings and their textual variants ('NA', 'N/A') must be unified to the system's native null type to enable statistical omission and imputation functions.")
 
@@ -1063,10 +1097,38 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
     ):
         kg.add_edge(_tipo_centinela, "Valores_Centinela",
             accion="reemplazar_centinela_por_nan",
-            parametros={"centinelas": [-999, -9999, 999, 9999, -1]},
+            parametros={"centinelas": list(CENTINELAS_NUMERICOS)},
             confianza=0.92,
             justificacion_es="Los centinelas (-999, 9999, -1…) codifican nulos: se reemplazan por NaN antes de imputar; nunca se winsorizan ni se imputan como valores reales.",
             justificacion_en="Sentinels (-999, 9999, -1…) encode missing values: replace them with NaN before imputing; never winsorize or impute them as real values.")
+
+    # Texto y categorías: las cadenas tipo "N/A", "null", "na" son nulos.
+    for _tipo_centinela in (
+        "Variable_Categorica_Nominal",
+        "Variable_Categorica_Ordinal",
+        "Texto_General",
+    ):
+        kg.add_edge(_tipo_centinela, "Valores_Centinela",
+            accion="replace_to_na",
+            parametros={"to_replace": list(CADENAS_NULAS), "value": None},
+            confianza=0.92,
+            justificacion_es="Cadenas centinela ('N/A', 'null', 'na', vacío…) en texto o categorías codifican nulos: se reemplazan por NA antes de imputar o codificar, para que no aparezcan como una categoría más.",
+            justificacion_en="Sentinel strings ('N/A', 'null', 'na', empty…) in text or categories encode missing values: replace them with NA before imputing or encoding, so they do not show up as one more category.")
+
+    # Fechas: no hay una fecha centinela universal (1900-01-01 puede ser real).
+    # La lista es configurable y vacía por defecto; si se usa, SOLO se marca con
+    # un flag: esas fechas nunca se reemplazan ni se imputan.
+    kg.add_edge("Variable_Temporal_Timestamp", "Valores_Centinela",
+        accion="marcar_fecha_centinela",
+        parametros={
+            "fechas_centinela": _fechas_centinela_config(),
+            "configurable_con": "DATAPULSE_FECHAS_CENTINELA",
+            "flag_suffix": "_fecha_centinela",
+            "imputar": False,
+        },
+        confianza=0.85,
+        justificacion_es="Fechas centinela (p. ej. 1900-01-01) configuradas por el usuario: se marcan con un flag y NUNCA se imputan ni se reemplazan, porque inventar una fecha falsea el análisis temporal. Con la lista vacía (por defecto) no se marca nada.",
+        justificacion_en="User-configured sentinel dates (e.g. 1900-01-01): flag them and NEVER impute or replace them, since fabricating a date corrupts temporal analysis. With the list empty (default) nothing is flagged.")
 
     # ═══════════════════════════════════════════════════════════
     # FIN REGLAS NUEVAS
@@ -2188,7 +2250,7 @@ Para cada columna, infiere estos campos:
 - detalle: descripción concreta de cada problema encontrado. Incluir valores específicos si los ves en la muestra.
 
 REGLAS CRÍTICAS DE DIAGNÓSTICO (aplican a CUALQUIER dataset, dominio o idioma):
-1. CENTINELAS NUMÉRICOS: Valores como -999, -1, -9999, 9999, 999, 99, 0 en contextos donde 0 es inválido (edad, ID, presión) → "nulos_disfrazados", NO "outlier_severo". Detectar por: min/max extremos que no tienen sentido en el contexto de la columna.
+1. CENTINELAS: Valores como -999, -1, -9999, 9999, 999, 99, 0 en contextos donde 0 es inválido (edad, ID, presión) → "nulos_disfrazados", NO "outlier_severo". Detectar por: min/max extremos que no tienen sentido en el contexto de la columna. En texto y categorías, cadenas como "N/A", "null", "na", "None" o vacías también son "nulos_disfrazados". En fechas, una fecha marcador repetida (p. ej. 1900-01-01) → "nulos_disfrazados".
 2. FORMATO TEXTO: Si la muestra contiene strings que no cumplen el patrón esperado del dominio (emails sin @, teléfonos con letras, fechas con formato mixto, códigos con longitud incorrecta) → "inconsistencia_formato".
 3. IDENTIFICADORES: Columnas con nombres que contengan id, cod, code, num, key, clave, folio, ticket, cedula, rut, dni, ssn, nit, rfc → tipo "identificador". Si unique_count < total filas → añadir "duplicados".
 4. NEGATIVOS INESPERADOS: Valores negativos en columnas cuyo nombre contenga alguna de estas palabras: {lista_no_negativos} → "valores_negativos_inesperados". EXCEPCIÓN: si el nombre contiene {lista_negativos_permitidos}, los negativos SÍ son válidos (saldos y márgenes pueden ser negativos), aunque también contenga una palabra de la lista anterior. En cualquier otra columna (longitud geográfica, beneficio, variación, temperatura…) un negativo no es un error por sí mismo.
@@ -2250,6 +2312,19 @@ def _map_tipo_problema(tipo_inferido: str, problema: str) -> tuple:
 
 
 UMBRAL_SKEWNESS = 1.0
+
+
+def _aplicar_fechas_centinela(accion: dict) -> dict:
+    """Inyecta la lista vigente de DATAPULSE_FECHAS_CENTINELA en marcar_fecha_centinela."""
+    if accion.get("accion") != "marcar_fecha_centinela":
+        return accion
+    ajustada = dict(accion)
+    ajustada["parametros"] = {
+        **(accion.get("parametros") or {}),
+        "fechas_centinela": _fechas_centinela_config(),
+        "imputar": False,
+    }
+    return ajustada
 
 
 def _ajustar_por_skewness(accion: dict, skewness: Optional[float]) -> dict:
@@ -2340,7 +2415,8 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
                 "justificacion_en": best.get("justificacion_en"),
                 "fuente_decision": "knowledge_graph",
             }
-            acciones_col.append(_ajustar_por_skewness(accion_col, skewness))
+            accion_col = _ajustar_por_skewness(accion_col, skewness)
+            acciones_col.append(_aplicar_fechas_centinela(accion_col))
 
         if not acciones_col and not fallbacks_col:
             # No se encontró ningún problema reconocible
@@ -2366,7 +2442,7 @@ PLANIFICAR_PROMPT = """Eres el planificador técnico de DataPulse. Recibes el an
 Tu trabajo:
 A) Cada columna puede tener MÚLTIPLES acciones (una por problema). Incluye TODAS en el plan, no solo la primera.
 B) Para problemas_fallback (sin regla en el grafo), decide la acción más apropiada. Máx. confianza: 0.70. fuente_decision: "llm_fallback".
-C) Trata centinelas correctamente: si ves nulos_disfrazados con valores como -999, la acción es REEMPLAZAR ese valor por NaN (no winsorizar).
+C) Trata centinelas correctamente: si ves nulos_disfrazados con valores como -999 (o cadenas como "N/A" en texto), la acción es REEMPLAZAR ese valor por NaN (no winsorizar). EXCEPCIÓN — fechas: las fechas centinela (marcar_fecha_centinela) SOLO se marcan con un flag; NUNCA se reemplazan ni se imputan.
 D) Trata negativos correctamente: si ves valores_negativos_inesperados en edad/precio/cantidad, la acción es FLAG + reemplazar por NaN (no recortar a 0 sin revisar).
 E) Ordena las acciones por prioridad:
    1. drop_duplicates (primero siempre)

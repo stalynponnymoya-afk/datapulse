@@ -22,7 +22,7 @@ DataPulse combines four technologies in a single orchestrated pipeline:
 |---|---|---|
 | **Orchestrator** | LangGraph | State machine with 7 nodes, conditional retry logic |
 | **Reasoning** | Groq-hosted LLM (user-selectable, default `openai/gpt-oss-120b`) | Diagnoses column types, detects problems, builds technical brief |
-| **Decision Rules** | NetworkX (Knowledge Graph) | 135 rules: 109 base statistical/structural rules + 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) |
+| **Decision Rules** | NetworkX (Knowledge Graph) | 139 rules: 113 base statistical/structural rules + 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) |
 | **Autonomous Agent** | OpenHands Cloud API | Writes, executes, and validates the cleaning code autonomously |
 
 ### Pipeline Architecture
@@ -57,7 +57,7 @@ Your CSV/XLSX/JSON/Parquet file
 
 ### Knowledge Graph
 
-The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **135 rules (edges)**: 109 base statistical/structural rules organized in 6 categories, plus 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA). The 109 base rules include the 106 original ones plus 3 sentinel rules (`reemplazar_centinela_por_nan`) added in phase 1:
+The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **139 rules (edges)**: 113 base statistical/structural rules organized in 6 categories, plus 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA). The 113 base rules are the 106 original ones plus 7 `Valores_Centinela` rules added in phase 1: `reemplazar_centinela_por_nan` for numeric/financial columns, `replace_to_na` for categorical and text columns (same string list as the empty-string rule), and `marcar_fecha_centinela` for dates, which only **flags** the sentinel dates listed in `DATAPULSE_FECHAS_CENTINELA` (empty by default) and never imputes them:
 
 1. **Structural Integrity** — duplicates, empty rows/columns, column name normalization
 2. **String Cleaning** — whitespace, line breaks, case normalization, email/phone validation
@@ -166,6 +166,7 @@ Attempt limits are **total attempts**, the first one included:
 | `DATAPULSE_MIN_SCORE_PASS` | `70` | Minimum independent score to commit |
 | `DATAPULSE_PERMITIR_SUBIDA_DATOS` | unset | `1` allows uploading data files to GitHub (only if the repo is private) |
 | `DATAPULSE_ENMASCARAR` | `1` | `0` disables masking of the samples sent to the LLM |
+| `DATAPULSE_FECHAS_CENTINELA` | empty | Comma-separated sentinel dates (`1900-01-01,9999-12-31`) to **flag** (never impute) |
 | `DATAPULSE_API_MAX_MB` | `100` | Max upload size per file in the API (413 if exceeded) |
 
 ### Data Privacy
@@ -286,7 +287,7 @@ DataPulse combina cuatro tecnologías en un pipeline orquestado:
 |---|---|---|
 | **Orquestador** | LangGraph | Máquina de estados con 7 nodos y lógica de retry condicional |
 | **Razonamiento** | LLM alojado en Groq (elegible por el usuario, por defecto `openai/gpt-oss-120b`) | Diagnostica tipos de columnas, detecta problemas, construye brief técnico |
-| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | 135 reglas: 109 reglas estadísticas/estructurales base + 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) |
+| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | 139 reglas: 113 reglas estadísticas/estructurales base + 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) |
 | **Agente Autónomo** | OpenHands Cloud API | Escribe, ejecuta y valida el código de limpieza de forma autónoma |
 
 ### Arquitectura del Pipeline
@@ -321,7 +322,7 @@ Tu archivo CSV/XLSX/JSON/Parquet
 
 ### Grafo de Conocimiento
 
-El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **135 reglas (aristas)**: 109 reglas estadísticas/estructurales base organizadas en 6 categorías, más 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA). Las 109 base son las 106 originales más 3 reglas de centinelas (`reemplazar_centinela_por_nan`) añadidas en la fase 1:
+El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **139 reglas (aristas)**: 113 reglas estadísticas/estructurales base organizadas en 6 categorías, más 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA). Las 113 base son las 106 originales más 7 reglas de `Valores_Centinela` añadidas en la fase 1: `reemplazar_centinela_por_nan` en columnas numéricas y financieras, `replace_to_na` en categóricas y texto (con la misma lista de cadenas que la regla de cadenas vacías) y `marcar_fecha_centinela` en fechas, que solo **marca con un flag** las fechas centinela definidas en `DATAPULSE_FECHAS_CENTINELA` (vacía por defecto) y nunca las imputa:
 
 1. **Integridad Estructural** — duplicados, filas/columnas vacías, normalización de nombres
 2. **Limpieza de Texto** — espacios, saltos de línea, normalización de caja, validación email/teléfono
@@ -431,6 +432,7 @@ Los límites son **intentos totales**, incluido el primero:
 | `DATAPULSE_MIN_SCORE_PASS` | `70` | Score independiente mínimo para hacer commit |
 | `DATAPULSE_PERMITIR_SUBIDA_DATOS` | sin definir | `1` permite subir archivos de datos a GitHub (solo si el repo es privado) |
 | `DATAPULSE_ENMASCARAR` | `1` | `0` desactiva el enmascarado de las muestras que se envían al LLM |
+| `DATAPULSE_FECHAS_CENTINELA` | vacía | Fechas centinela separadas por comas (`1900-01-01,9999-12-31`) que se **marcan** (nunca se imputan) |
 | `DATAPULSE_API_MAX_MB` | `100` | Tamaño máximo por archivo en la API (413 si se supera) |
 
 ### Privacidad de los Datos
