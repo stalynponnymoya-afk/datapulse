@@ -335,3 +335,213 @@ def test_descarga_colab_usa_la_ruta_real(monkeypatch, tmp_path, capsys):
 def test_descarga_fuera_de_colab_no_hace_nada(monkeypatch):
     monkeypatch.setitem(sys.modules, "google.colab", None)
     dp._descargar_en_colab({"ruta_processed": "/x.csv"})
+
+
+# ── Bloque F: seguridad y privacidad ────────────────────────────────────────
+
+def test_subprocess_recibe_env_sin_claves(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for clave in ("GROQ_API_KEY", "GITHUB_TOKEN", "OPENHANDS_API_KEY", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(clave, "secreto-" + clave)
+    datos = tmp_path / "d.csv"
+    datos.write_text("a\n1\n", encoding="utf-8")
+    capturado = {}
+
+    def _run(cmd, **kwargs):
+        capturado.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(dp, "get_groq_llm",
+                        lambda: SimpleNamespace(invoke=lambda m: SimpleNamespace(content="x=1")))
+    monkeypatch.setattr(dp.subprocess, "run", _run)
+    dp._run_local_groq_pipeline({
+        "filename": "d.csv", "filename_path": str(datos), "file_ext": "csv",
+        "metadata": {}, "brief_tecnico": "", "intentos": 0, "error_history": [],
+    })
+    env = capturado["env"]
+    assert set(env) == {"PATH", "HOME", "LANG", "PYTHONIOENCODING"}
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert not any("secreto" in v for v in env.values())
+
+
+def test_script_generado_no_ve_las_claves(tmp_path, monkeypatch):
+    """Ejecución real del subproceso: el script no puede leer GROQ_API_KEY."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GROQ_API_KEY", "secreto")
+    datos = tmp_path / "d.csv"
+    datos.write_text("a\n1\n", encoding="utf-8")
+    codigo = (
+        "import os, sys\n"
+        "import pandas as pd\n"
+        "assert 'GROQ_API_KEY' not in os.environ\n"
+        "pd.read_csv(sys.argv[1]).to_csv('processed_data.csv', index=False)\n"
+    )
+    monkeypatch.setattr(dp, "get_groq_llm",
+                        lambda: SimpleNamespace(invoke=lambda m: SimpleNamespace(content=codigo)))
+    res = dp._run_local_groq_pipeline({
+        "filename": "d.csv", "filename_path": str(datos), "file_ext": "csv",
+        "metadata": {}, "brief_tecnico": "", "intentos": 0, "error_history": [],
+    })
+    assert res["openhands_status"] == "finished", res
+    assert res["ruta_processed"]
+
+
+def test_rechazo_subida_a_repo_publico(entorno):
+    estado, configurar = entorno
+    repo = RepoFalso(private=False)
+    oh = OpenHandsFalso()
+    configurar(repo, oh)
+
+    res = dp.node_ejecutar(estado)
+    assert res["openhands_status"] == "rechazado"
+    msg = res["error_history"][0]
+    assert "no es privado" in msg and "modo local" in msg
+    # No se creó rama, no se subió nada y OpenHands no arrancó
+    assert repo.refs == [] and repo.creados == []
+    assert oh.conversaciones == []
+    assert dp.router_validar_score({**res}) == "end_no_commit"
+
+
+def test_rechazo_subida_sin_variable_de_permiso(entorno, monkeypatch):
+    estado, configurar = entorno
+    monkeypatch.delenv("DATAPULSE_PERMITIR_SUBIDA_DATOS")
+    repo = RepoFalso(private=True)
+    configurar(repo, OpenHandsFalso())
+    res = dp.node_ejecutar(estado)
+    assert res["openhands_status"] == "rechazado"
+    assert "DATAPULSE_PERMITIR_SUBIDA_DATOS" in res["error_history"][0]
+    assert repo.creados == []
+
+
+def test_subida_permitida_en_repo_privado(entorno):
+    estado, configurar = entorno
+    repo = RepoFalso(private=True)
+    oh = OpenHandsFalso(eventos=[EVENTO_FIN])
+    configurar(repo, oh)
+    dp.node_ejecutar(estado)
+    assert [p for p, _ in repo.creados] == ["data/ventas.csv"]
+    assert "processed_data.csv" in oh.mensajes[0]
+
+
+def test_github_file_en_repo_publico_no_sube_datos(entorno):
+    """Un archivo ya en GitHub no cuenta como subida, pero no se piden ni leen datos."""
+    estado, configurar = entorno
+    estado = {**estado, "github_source_branch": "main", "github_source_path": "data/x.csv"}
+    salidas = {"processed_data.csv": _limpio_csv(), "quality_report.json": b'{"score": 90}'}
+    repo = RepoFalso(private=False, salidas=salidas)
+    oh = OpenHandsFalso(eventos=[EVENTO_FIN])
+    configurar(repo, oh)
+
+    res = dp.node_ejecutar(estado)
+    assert res["openhands_status"] == "finished"
+    assert repo.creados == []
+    brief = oh.mensajes[0]
+    assert "NO hagas commit de archivos de datos" in brief
+    assert "processed_data.csv" not in brief.split("Haz commit y push")[1].split("\n")[1]
+    # Solo se leyó el reporte, no processed_data.csv → sin_validar
+    assert res["ruta_processed"] is None
+    assert res["score_reportado"] == 90
+    assert dp.node_validar_score({**estado, **res})["openhands_status"] == "sin_validar"
+
+
+def test_sin_usuario_o_repo_openhands_falla_claro(entorno, monkeypatch):
+    estado, configurar = entorno
+    configurar(RepoFalso(), OpenHandsFalso())
+    monkeypatch.setattr(dp, "GITHUB_USERNAME", "")
+    res = dp.node_ejecutar(estado)
+    assert res["openhands_status"] == "rechazado"
+    assert "GITHUB_USERNAME" in res["error_history"][0]
+    assert GithubFalso.pedidos == []
+
+    with pytest.raises(ValueError, match="GITHUB_USERNAME"):
+        dp._download_github_file("data/x.csv", "main", "/tmp/no_se_usa.csv")
+
+
+def test_usuario_y_repo_sin_valor_por_defecto(monkeypatch):
+    import importlib.util
+
+    monkeypatch.delenv("GITHUB_USERNAME", raising=False)
+    monkeypatch.delenv("GITHUB_REPO", raising=False)
+    ruta = os.path.join(os.path.dirname(__file__), "..", "datapulse_prod.py")
+    spec = importlib.util.spec_from_file_location("dp_sin_env", ruta)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.GITHUB_USERNAME == "" and mod.GITHUB_REPO == ""
+    assert "GITHUB_USERNAME" in mod._falta_repo_github()
+
+
+def _estado_commit():
+    return {
+        "filename": "ventas.csv",
+        "score_despues": 88,
+        "plan_acciones": [{"fuente_decision": "knowledge_graph"}],
+        "archivos_generados": {
+            "datapulse_pipeline.py": "print(1)",
+            "quality_report.json": '{"score": 88}',
+            "cleaning_log.json": "[]",
+            "processed_data.csv": "a\n1\n",
+            "/workspace/extra/clientes.json": '[{"a": 1}]',
+            "/workspace/extra/hoja.xlsx": "xx",
+        },
+    }
+
+
+def test_commit_en_repo_publico_sube_solo_script_y_reportes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dp, "GITHUB_TOKEN", "gh-falso")
+    monkeypatch.setattr(dp, "GITHUB_USERNAME", "usuario")
+    monkeypatch.setattr(dp, "GITHUB_REPO", "repo")
+    monkeypatch.setattr(dp, "Github", GithubFalso)
+    monkeypatch.setenv("DATAPULSE_PERMITIR_SUBIDA_DATOS", "1")
+    repo = RepoFalso(private=False)
+    GithubFalso.repo = repo
+
+    out = dp.node_commit(_estado_commit())
+    subidos = sorted(os.path.basename(p) for p, _ in repo.creados)
+    assert subidos == ["audit_log.json", "cleaning_log.json", "datapulse_pipeline.py",
+                       "quality_report.json"]
+    assert out["github_url"].startswith("https://github.com/usuario/repo/tree/")
+    # Los datos no se pierden: quedan en local
+    locales = os.listdir(next((tmp_path / "outputs").iterdir()))
+    assert {"processed_data.csv", "clientes.json", "hoja.xlsx"} <= set(locales)
+
+
+def test_commit_en_repo_privado_con_permiso_sube_datos(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dp, "GITHUB_TOKEN", "gh-falso")
+    monkeypatch.setattr(dp, "GITHUB_USERNAME", "usuario")
+    monkeypatch.setattr(dp, "GITHUB_REPO", "repo")
+    monkeypatch.setattr(dp, "Github", GithubFalso)
+    monkeypatch.setenv("DATAPULSE_PERMITIR_SUBIDA_DATOS", "1")
+    repo = RepoFalso(private=True)
+    GithubFalso.repo = repo
+    dp.node_commit(_estado_commit())
+    subidos = {os.path.basename(p) for p, _ in repo.creados}
+    assert {"processed_data.csv", "clientes.json", "hoja.xlsx"} <= subidos
+
+
+def test_commit_sin_usuario_guarda_en_local(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dp, "GITHUB_TOKEN", "gh-falso")
+    monkeypatch.setattr(dp, "GITHUB_REPO", "")
+    GithubFalso.pedidos = []
+    monkeypatch.setattr(dp, "Github", GithubFalso)
+    out = dp.node_commit(_estado_commit())
+    assert out["github_url"].startswith("local://outputs/")
+    assert GithubFalso.pedidos == []
+
+
+def test_commit_sin_token_guarda_en_local(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dp, "GITHUB_TOKEN", "")
+    out = dp.node_commit(_estado_commit())
+    assert out["github_url"].startswith("local://outputs/")
+
+
+def test_es_archivo_datos():
+    assert dp._es_archivo_datos("processed_data.csv")
+    assert dp._es_archivo_datos("/w/x.parquet")
+    assert dp._es_archivo_datos("datos.json")
+    assert not dp._es_archivo_datos("outputs/ts/audit_log.json")
+    assert not dp._es_archivo_datos("quality_report.json")
+    assert not dp._es_archivo_datos("datapulse_pipeline.py")

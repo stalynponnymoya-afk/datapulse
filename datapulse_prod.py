@@ -39,8 +39,11 @@ from src.quality_checker import generate_report_df, load_dataset  # noqa: E402
 # ════════════════════════════════════════════════
 # CONFIGURACIÓN DEL PROYECTO
 # ════════════════════════════════════════════════
-GITHUB_USERNAME   = "stalynponnymoya-afk"
-GITHUB_REPO       = "datapulse"
+# Usuario y repositorio de GitHub: siempre desde variables de entorno, sin
+# valor por defecto (antes apuntaban al repo del autor). Si faltan, el modo
+# OpenHands no arranca y node_commit guarda las salidas en local.
+GITHUB_USERNAME   = os.environ.get("GITHUB_USERNAME", "").strip()
+GITHUB_REPO       = os.environ.get("GITHUB_REPO", "").strip()
 # Modelo de Groq: configurable por el usuario. Anteriormente se usaba
 # "llama-3.3-70b-versatile", que Groq deprecó el 16/08/2026 (pasó a Enterprise);
 # su reemplazo recomendado es "openai/gpt-oss-120b". Puedes cambiarlo con la
@@ -1834,6 +1837,54 @@ def _is_reasoning_model(model_name: str) -> bool:
     return any(hint in model_name.lower() for hint in _REASONING_MODEL_HINTS)
 
 
+def _falta_repo_github() -> Optional[str]:
+    """Devuelve un mensaje de error si GITHUB_USERNAME o GITHUB_REPO no están definidos."""
+    faltan = [n for n, v in (("GITHUB_USERNAME", GITHUB_USERNAME), ("GITHUB_REPO", GITHUB_REPO)) if not v]
+    if not faltan:
+        return None
+    return (
+        f"Faltan las variables de entorno {', '.join(faltan)}: defínelas con el "
+        "usuario y el repositorio de GitHub donde trabajar (no hay valor por defecto)."
+    )
+
+
+def _get_github_repo():
+    """Abre el repositorio configurado con PyGithub."""
+    try:
+        from github import Auth as GithubAuth
+        g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
+    except ImportError:
+        g = Github(GITHUB_TOKEN)  # fallback para PyGitHub < 1.58
+    return g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+
+
+def _subida_datos_permitida(repo) -> tuple:
+    """
+    Política de subida de datos a GitHub. Solo se permite subir datasets o
+    archivos de datos si DATAPULSE_PERMITIR_SUBIDA_DATOS=1 Y el repo es privado.
+    Devuelve (permitido: bool, motivo: str).
+    """
+    if os.environ.get("DATAPULSE_PERMITIR_SUBIDA_DATOS", "").strip() != "1":
+        return False, "DATAPULSE_PERMITIR_SUBIDA_DATOS no vale 1"
+    if getattr(repo, "private", False) is not True:
+        nombre = getattr(repo, "full_name", None) or f"{GITHUB_USERNAME}/{GITHUB_REPO}"
+        return False, f"el repositorio {nombre} no es privado"
+    return True, "permitido (DATAPULSE_PERMITIR_SUBIDA_DATOS=1 y repo privado)"
+
+
+EXTENSIONES_DATOS = (".csv", ".tsv", ".xlsx", ".xls", ".parquet", ".pq")
+# JSON que son reportes y no datos: se pueden subir siempre
+JSON_REPORTES = ("quality_report.json", "cleaning_log.json", "audit_log.json")
+
+
+def _es_archivo_datos(path: str) -> bool:
+    """True si el archivo contiene datos (no un script ni un reporte)."""
+    nombre = os.path.basename(path).lower()
+    if nombre.endswith(EXTENSIONES_DATOS):
+        return True
+    return nombre.endswith(".json") and nombre not in JSON_REPORTES
+
+
 def get_groq_llm():
     kwargs = dict(
         groq_api_key=GROQ_API_KEY,
@@ -1992,17 +2043,64 @@ def extract_json_from_markdown(text: str) -> dict:
         f"Inicio de la respuesta: {cleaned[:300]!r}"
     )
 
+_RE_EMAIL = re.compile(r"([A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]*@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
+_RE_DIGITOS_LARGOS = re.compile(r"\d{6,}")
+
+
+def _patron_forma(valor: str) -> str:
+    """Reduce un texto a su forma: letras → a/A, dígitos → 9, resto igual."""
+    return "".join(
+        ("A" if c.isupper() else "a") if c.isalpha() else ("9" if c.isdigit() else c)
+        for c in valor
+    )
+
+
+def _enmascarar_valor(valor: str) -> str:
+    """Enmascara emails (u***@dominio) y secuencias de 6+ dígitos (→ 9…9)."""
+    valor = _RE_EMAIL.sub(lambda m: f"{m.group(1)}***@{m.group(2)}", valor)
+    return _RE_DIGITOS_LARGOS.sub(lambda m: "9" * len(m.group(0)), valor)
+
+
+def _enmascarar_muestra(serie: pd.Series, muestra: List[str]) -> List[str]:
+    """
+    Enmascara la muestra de una columna antes de enviarla al LLM.
+
+    - Texto de cardinalidad > 50 % (nombres, texto libre) → patrón de forma.
+    - Resto → emails como u***@dominio y secuencias de 6+ dígitos con 9.
+    - Las categorías de baja cardinalidad quedan tal cual.
+    """
+    no_nulos = serie.dropna()
+    es_texto = not pd.api.types.is_numeric_dtype(serie) and not pd.api.types.is_bool_dtype(serie)
+    if es_texto and len(no_nulos) > 0 and no_nulos.nunique() / len(no_nulos) > 0.5:
+        return [_patron_forma(v) for v in muestra]
+    return [_enmascarar_valor(v) for v in muestra]
+
+
+def _enmascarado_activo() -> bool:
+    """El enmascarado está activo salvo DATAPULSE_ENMASCARAR=0."""
+    return os.environ.get("DATAPULSE_ENMASCARAR", "1").strip() != "0"
+
+
 def serialize_metadata(df: pd.DataFrame, filename: str) -> dict:
-    """Produce la metadata estructurada exacta del documento del proyecto."""
+    """
+    Produce la metadata estructurada exacta del documento del proyecto.
+
+    La muestra de cada columna se enmascara antes de enviarse al LLM
+    (desactivable con DATAPULSE_ENMASCARAR=0).
+    """
+    enmascarar = _enmascarado_activo()
     cols_info = {}
     for col in df.columns:
         s = df[col]
+        muestra = s.dropna().head(3).astype(str).tolist()
+        if enmascarar:
+            muestra = _enmascarar_muestra(s, muestra)
         info = {
             "dtype_pandas": str(s.dtype),
             "null_count": int(s.isna().sum()),
             "null_pct": round(s.isna().mean() * 100, 2),
             "unique_count": int(s.nunique(dropna=False)),
-            "muestra": s.dropna().head(3).astype(str).tolist()
+            "muestra": muestra,
         }
         if pd.api.types.is_numeric_dtype(s):
             info["min"] = float(s.min()) if not pd.isna(s.min()) else None
@@ -2306,6 +2404,16 @@ def _leer_score_reportado(contenido: str) -> Optional[int]:
     return None
 
 
+def _entorno_minimo_subproceso() -> Dict[str, str]:
+    """Variables de entorno mínimas para ejecutar código generado (sin secretos)."""
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": os.environ.get("HOME", os.path.expanduser("~")),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "PYTHONIOENCODING": "utf-8",
+    }
+
+
 def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     """
     Fallback sin OPENHANDS_API_KEY: usa ChatGroq para generar el pipeline,
@@ -2356,9 +2464,13 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     try:
         # El script recibe la ruta del dataset como argumento: así es
         # reproducible en otra máquina sin editar rutas.
+        # El código generado por el LLM corre con un entorno mínimo, SIN claves
+        # (GROQ_API_KEY, GITHUB_TOKEN, OPENHANDS_API_KEY). El aislamiento
+        # completo (contenedor sin red ni acceso al disco) queda para la fase 2.
         proc = subprocess.run(
             [sys.executable, "datapulse_pipeline.py", os.path.abspath(state["filename_path"])],
             cwd=run_dir, capture_output=True, text=True, timeout=OH_TIMEOUT_SEG,
+            env=_entorno_minimo_subproceso(),
         )
         stdout = proc.stdout or ""
         if proc.returncode != 0:
@@ -2413,6 +2525,18 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     return resultado
 
 
+def _rechazo_openhands(state: DataPulseState, msg: str) -> dict:
+    """Resultado de node_ejecutar cuando la configuración o la política impiden arrancar."""
+    return {
+        "intentos": state.get("intentos", 0) + 1,
+        "openhands_status": "rechazado",
+        "error_history": [msg],
+        "score_reportado": None,
+        "ruta_processed": None,
+        "archivos_generados": {},
+    }
+
+
 # Salidas que el agente debe dejar commiteadas en la rama de trabajo
 SALIDAS_OPENHANDS = (
     "datapulse_pipeline.py",
@@ -2426,7 +2550,7 @@ def _construir_brief_openhands(
     state: DataPulseState, data_path: str, rama: str, subir_datos: bool
 ) -> str:
     """Arma el mensaje para OpenHands con la ruta real del dataset y los entregables."""
-    salidas = [s for s in SALIDAS_OPENHANDS if subir_datos or not s.endswith(".csv")]
+    salidas = [s for s in SALIDAS_OPENHANDS if subir_datos or not _es_archivo_datos(s)]
     mensaje = state["brief_tecnico"]
     mensaje += (
         f"\n\n## ARCHIVO DE DATOS"
@@ -2504,6 +2628,12 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         print("   ℹ️ OPENHANDS_API_KEY vacío — generando pipeline local con Groq...")
         return _run_local_groq_pipeline(state)
 
+    falta = _falta_repo_github()
+    if falta:
+        msg = f"Modo OpenHands no disponible. {falta}"
+        print(f"   ❌ {msg}")
+        return _rechazo_openhands(state, msg)
+
     headers = {
         "Authorization": f"Bearer {OPENHANDS_API_KEY}",
         "Content-Type": "application/json"
@@ -2511,12 +2641,23 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
     base = "https://app.all-hands.dev/api/v1"
 
     try:
-        try:
-            from github import Auth as GithubAuth
-            g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
-        except ImportError:
-            g = Github(GITHUB_TOKEN)
-        repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+        repo = _get_github_repo()
+
+        # ── Política de subida de datos ─────────────────────────
+        subir_datos, motivo = _subida_datos_permitida(repo)
+        archivo_en_github = bool(
+            state.get("github_source_branch") and state.get("github_source_path")
+        )
+        if not archivo_en_github and not subir_datos:
+            msg = (
+                "Modo OpenHands no arranca: habría que subir el dataset a GitHub y "
+                f"la subida de datos no está permitida ({motivo}). Usa el modo local "
+                "(deja OPENHANDS_API_KEY vacío) o, si el repo es privado y aceptas "
+                "subir los datos, define DATAPULSE_PERMITIR_SUBIDA_DATOS=1."
+            )
+            print(f"   ❌ {msg}")
+            return _rechazo_openhands(state, msg)
+        print(f"   🔐 Subida de datos: {'sí' if subir_datos else 'no'} ({motivo})")
 
         # ── PASO 0: Preparar rama de trabajo con el archivo de datos ──
         # Siempre se crea una rama nueva: el agente hace commit de sus salidas
@@ -2600,7 +2741,7 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         print(f"   ✅ READY: {conv_id[:16]}...")
 
         # ── PASO 3: Enviar brief con referencia al archivo ──────
-        mensaje = _construir_brief_openhands(state, data_path, rama, subir_datos=True)
+        mensaje = _construir_brief_openhands(state, data_path, rama, subir_datos=subir_datos)
 
         r = requests.post(
             f"{base}/app-conversations/{conv_id}/send-message",
@@ -2757,7 +2898,9 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         # script escribe al ejecutarse (processed_data.csv, reportes) se lee
         # del commit que el agente hizo en la rama.
         run_dir = os.path.join("outputs", fecha + "-openhands")
-        leidos = _leer_salidas_rama(repo, rama, run_dir, SALIDAS_OPENHANDS)
+        # Sin permiso de subida no se pidió processed_data.csv → sin_validar.
+        nombres = [n for n in SALIDAS_OPENHANDS if subir_datos or not _es_archivo_datos(n)]
+        leidos = _leer_salidas_rama(repo, rama, run_dir, nombres)
         for nombre, contenido in leidos.items():
             archivos.setdefault(nombre, contenido.decode("utf-8", errors="replace"))
         if "datapulse_pipeline.py" in leidos and not py_files:
@@ -3010,13 +3153,29 @@ def node_commit(state: DataPulseState) -> DataPulseState:
         _save_outputs_locally(files_to_commit, ts)
         return {"github_url": f"local://outputs/{ts}"}
 
+    falta = _falta_repo_github()
+    if falta:
+        print(f"   ⚠️ {falta}")
+        print("   ℹ️ Guardando salidas localmente en outputs/.")
+        _save_outputs_locally(files_to_commit, ts)
+        return {"github_url": f"local://outputs/{ts}"}
+
     try:
-        try:
-            from github import Auth as GithubAuth
-            g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
-        except ImportError:
-            g = Github(GITHUB_TOKEN)  # fallback para PyGitHub < 1.58
-        repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+        repo = _get_github_repo()
+
+        # Política de datos: sin permiso solo se suben el script, los reportes
+        # y audit_log.json. Todo se conserva igualmente en local.
+        subir_datos, motivo = _subida_datos_permitida(repo)
+        if not subir_datos:
+            omitidos = [p for p, _ in files_to_commit if _es_archivo_datos(p)]
+            if omitidos:
+                print(f"   🔐 Subida de datos no permitida ({motivo}); se guardan solo en local:")
+                for p in omitidos:
+                    print(f"      - {p}")
+                _save_outputs_locally(
+                    [(p, c) for p, c in files_to_commit if _es_archivo_datos(p)], ts
+                )
+            files_to_commit = [(p, c) for p, c in files_to_commit if not _es_archivo_datos(p)]
 
         try:
             base = repo.get_branch("main")
@@ -3113,12 +3272,10 @@ def build_datapulse_graph():
 
 def _download_github_file(repo_path: str, branch: str, local_dest: str) -> None:
     """Descarga un archivo del repo de GitHub a una ruta local temporal."""
-    try:
-        from github import Auth as GithubAuth
-        g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
-    except ImportError:
-        g = Github(GITHUB_TOKEN)
-    repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+    falta = _falta_repo_github()
+    if falta:
+        raise ValueError(f"No se puede leer '{repo_path}' de GitHub. {falta}")
+    repo = _get_github_repo()
     contents = repo.get_contents(repo_path, ref=branch)
     with open(local_dest, "wb") as f:
         f.write(contents.decoded_content)
