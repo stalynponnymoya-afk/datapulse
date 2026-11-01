@@ -48,9 +48,17 @@ GITHUB_REPO       = "datapulse"
 GROQ_MODEL        = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 OH_TIMEOUT_SEG    = 900    # ventana de ejecución remota en OpenHands (~15 min)
 OH_STARTUP_TIMEOUT_SEG = 600  # espera máxima a que el sandbox quede READY
-OH_MAX_RETRIES    = 1      # reintentos ante fallo de infraestructura (no re-lanzar sandboxes)
+# Política de intentos. Ambos valores son el NÚMERO TOTAL de intentos (el
+# primero incluido), no el número de reintentos:
+#   - OH_MAX_INTENTOS_INFRA = 2 → ante un fallo de infraestructura o del script
+#     se reintenta una vez (2 intentos en total).
+#   - OH_MAX_INTENTOS_SCORE = 3 → ante un score bajo o un resultado sin validar
+#     se reintenta hasta dos veces (3 intentos en total) con los errores previos.
+OH_MAX_INTENTOS_INFRA  = 2
 OH_RETRY_ON_LOW_SCORE  = True   # reintentar cuando el score queda bajo el umbral
-OH_MAX_SCORE_RETRIES   = 2      # presupuesto de intentos por score bajo (autocorrección)
+OH_MAX_INTENTOS_SCORE  = 3
+# Estados terminales de OpenHands que indican fallo de infraestructura
+OH_ESTADOS_INFRA = ("error", "timeout", "stuck", "stopped")
 
 
 
@@ -2703,20 +2711,30 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
 # ═══════════════════════════════════════════════════════════════
 
 def router_validar_score(state: DataPulseState) -> str:
-    score = state.get("score_despues", 0)
-    intentos = state.get("intentos", 0)
+    """
+    Decide la transición tras validar. ``intentos`` es el número de intentos
+    YA realizados (node_ejecutar lo incrementa), y los límites son totales:
+    se reintenta mientras ``intentos < límite``.
+    """
+    score = state.get("score_despues") or 0
+    intentos = state.get("intentos") or 0
     status = state.get("openhands_status", "")
 
+    # Rechazo por configuración o política (sin usuario/repo, subida de datos
+    # no permitida): reintentar no cambia nada.
+    if status == "rechazado":
+        return "end_no_commit"
+
     # Fallo de infraestructura: presupuesto corto para no re-lanzar sandboxes.
-    if status == "error":
-        return "retry" if intentos < OH_MAX_RETRIES else "end_no_commit"
+    if status in OH_ESTADOS_INFRA:
+        return "retry" if intentos < OH_MAX_INTENTOS_INFRA else "end_no_commit"
 
     if status != "sin_validar" and score >= MIN_SCORE_PASS:
         return "commit"
 
-    # Autocorrección: un score bajo con ejecución correcta sí merece reintento,
-    # con su propio presupuesto para no entrar en bucle.
-    if OH_RETRY_ON_LOW_SCORE and intentos < OH_MAX_SCORE_RETRIES:
+    # Autocorrección: un score bajo (o un resultado sin validar) con ejecución
+    # correcta sí merece reintento, con su propio presupuesto.
+    if OH_RETRY_ON_LOW_SCORE and intentos < OH_MAX_INTENTOS_SCORE:
         return "retry"
     return "end_no_commit"
 

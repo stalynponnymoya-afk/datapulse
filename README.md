@@ -46,11 +46,11 @@ Your CSV/XLSX/JSON/Parquet file
 [5] node_ejecutar ─────────── OpenHands receives brief, writes code, executes, validates
          │
          ▼
-[6] node_validar_score ────── Checks quality score >= threshold
+[6] node_validar_score ────── Recomputes the score on the real processed_data.csv
          │
     ┌────┴─────┐
-    ok         fail → retry (max 3 attempts)
-    │
+    ok         fail → retry (infra failure: 2 attempts total;
+    │                       low score / not validated: 3 attempts total)
     ▼
 [7] node_commit ───────────── Pushes validated code to GitHub feature branch
 ```
@@ -245,11 +245,11 @@ Tu archivo CSV/XLSX/JSON/Parquet
 [5] node_ejecutar ─────────── OpenHands recibe brief, escribe código, ejecuta, valida
          │
          ▼
-[6] node_validar_score ────── Verifica score de calidad >= umbral
+[6] node_validar_score ────── Recalcula el score sobre el processed_data.csv real
          │
     ┌────┴─────┐
-    ok         falla → retry (máx 3 intentos)
-    │
+    ok         falla → retry (fallo de infraestructura: 2 intentos en total;
+    │                         score bajo / sin validar: 3 intentos en total)
     ▼
 [7] node_commit ───────────── Push del código validado a rama feature en GitHub
 ```

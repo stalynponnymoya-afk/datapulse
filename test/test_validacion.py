@@ -118,11 +118,11 @@ def test_sin_processed_es_sin_validar_y_no_hay_commit(tmp_path):
         assert out["score_despues"] == 0
         assert "processed_data.csv" in out["error_history"][0]
 
-        for intentos in range(1, dp.OH_MAX_SCORE_RETRIES + 2):
+        for intentos in range(1, dp.OH_MAX_INTENTOS_SCORE + 2):
             decision = dp.router_validar_score({**state, **out, "intentos": intentos})
             assert decision != "commit"
         assert dp.router_validar_score(
-            {**state, **out, "intentos": dp.OH_MAX_SCORE_RETRIES}
+            {**state, **out, "intentos": dp.OH_MAX_INTENTOS_SCORE}
         ) == "end_no_commit"
 
 

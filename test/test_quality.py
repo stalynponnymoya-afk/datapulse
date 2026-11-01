@@ -206,15 +206,20 @@ def test_all_map_combinations_resolve():
 
 def test_router_retry_policy():
     """
-    Infra failures must not re-launch sandboxes (short budget), while a low
-    score from a successful run must still get an autocorrection retry.
+    Los límites son el número TOTAL de intentos: un fallo de infraestructura
+    se reintenta hasta OH_MAX_INTENTOS_INFRA intentos y un score bajo hasta
+    OH_MAX_INTENTOS_SCORE, nunca con commit si no se aprueba.
     """
     from datapulse_prod import (
         router_validar_score,
-        OH_MAX_RETRIES,
-        OH_MAX_SCORE_RETRIES,
+        OH_MAX_INTENTOS_INFRA,
+        OH_MAX_INTENTOS_SCORE,
         OH_RETRY_ON_LOW_SCORE,
+        MIN_SCORE_PASS,
     )
+
+    assert OH_MAX_INTENTOS_INFRA == 2
+    assert OH_MAX_INTENTOS_SCORE == 3
 
     def walk(status, score):
         intentos, path = 0, []
@@ -227,25 +232,33 @@ def test_router_retry_policy():
             if decision != "retry":
                 return path
 
-    # Error de infraestructura: presupuesto corto, nunca commit.
-    infra = walk("error", 0)
-    assert infra[-1] == "end_no_commit", infra
-    assert "commit" not in infra, infra
+    # Error de infraestructura: 2 intentos en total (1 reintento), nunca commit.
+    for estado in ("error", "timeout", "stuck", "stopped"):
+        infra = walk(estado, 0)
+        assert infra == ["retry"] * (OH_MAX_INTENTOS_INFRA - 1) + ["end_no_commit"], infra
+    # Aunque el score fuera alto, un fallo de infraestructura no hace commit.
+    assert "commit" not in walk("error", 100)
 
-    # Score bajo con ejecución OK: se agota el presupuesto de autocorrección.
-    # OH_MAX_SCORE_RETRIES es el total de intentos, así que los reintentos son uno menos.
+    # Score bajo con ejecución OK: 3 intentos en total (2 reintentos).
     assert OH_RETRY_ON_LOW_SCORE, "Autocorrection should be enabled by default"
     low = walk("finished", 40)
-    assert low.count("retry") == OH_MAX_SCORE_RETRIES - 1, low
-    assert len(low) <= OH_MAX_SCORE_RETRIES, low
-    assert low[-1] == "end_no_commit", low
+    assert low == ["retry"] * (OH_MAX_INTENTOS_SCORE - 1) + ["end_no_commit"], low
 
-    # Score suficiente: commit directo.
+    # Sin validar: mismo presupuesto que el score bajo, nunca commit.
+    assert walk("sin_validar", 100) == low
+
+    # Rechazo por configuración/política: fin inmediato.
+    assert walk("rechazado", 100) == ["end_no_commit"]
+
+    # Score suficiente: commit directo; justo en el umbral también aprueba.
     assert walk("finished", 85) == ["commit"]
-    print(
-        f"✅ Router: infra={infra} | low_score={low} "
-        f"(OH_MAX_RETRIES={OH_MAX_RETRIES}, OH_MAX_SCORE_RETRIES={OH_MAX_SCORE_RETRIES})"
-    )
+    assert walk("finished", MIN_SCORE_PASS) == ["commit"]
+    assert walk("finished", MIN_SCORE_PASS - 1)[-1] == "end_no_commit"
+
+    # Estado incompleto: no explota y no hace commit.
+    assert router_validar_score({}) == "retry"
+    print(f"✅ Router: infra={infra} | low_score={low}")
+
 
 def test_extract_json_robust():
     """
