@@ -34,7 +34,7 @@ from github import Github
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from src.quality_checker import load_dataset  # noqa: E402
+from src.quality_checker import generate_report_df, load_dataset  # noqa: E402
 
 # ════════════════════════════════════════════════
 # CONFIGURACIÓN DEL PROYECTO
@@ -51,7 +51,23 @@ OH_STARTUP_TIMEOUT_SEG = 600  # espera máxima a que el sandbox quede READY
 OH_MAX_RETRIES    = 1      # reintentos ante fallo de infraestructura (no re-lanzar sandboxes)
 OH_RETRY_ON_LOW_SCORE  = True   # reintentar cuando el score queda bajo el umbral
 OH_MAX_SCORE_RETRIES   = 2      # presupuesto de intentos por score bajo (autocorrección)
-MIN_SCORE_PASS    = 70
+
+
+
+def _entero_env(nombre: str, defecto: int) -> int:
+    """Lee un entero de una variable de entorno; si no es válido usa el defecto."""
+    valor = os.environ.get(nombre, "").strip()
+    if not valor:
+        return defecto
+    try:
+        return int(valor)
+    except ValueError:
+        print(f"⚠️ {nombre}={valor!r} no es un entero; se usa {defecto}.")
+        return defecto
+
+
+# Umbral de aprobación del score independiente (configurable por entorno)
+MIN_SCORE_PASS    = _entero_env("DATAPULSE_MIN_SCORE_PASS", 70)
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  DATASET A LIMPIAR — EDITAR ESTA LÍNEA ANTES DE EJECUTAR   ║
@@ -1772,8 +1788,14 @@ class DataPulseState(TypedDict):
     codigo: str
     intentos: int
     error_history: Annotated[List[str], add]  # LangGraph maneja la reducción
-    score_despues: int
     archivos_generados: Dict[str, str]
+
+    # Validación independiente (node_validar_score recalcula con quality_checker)
+    score_antes: Optional[int]       # score del dataset original
+    score_despues: int               # score real de processed_data.csv
+    score_reportado: Optional[int]   # lo que dijo el script generado (informativo)
+    ruta_processed: Optional[str]    # ruta local de processed_data.csv del intento
+    directorio_salida: Optional[str] # carpeta local con las salidas del intento
 
     # Fuente del archivo (None = archivo local subido; str = path en repo)
     github_source_branch: Optional[str]
@@ -2244,8 +2266,34 @@ LOCAL_GENERATION_PROMPT = """Eres un ingeniero de datos senior. Escribe el scrip
    - cleaning_log.json con la lista de decisiones aplicadas (columna, accion, justificacion)
    - processed_data.csv con el dataset limpio
 3. Debe imprimir al final: print('"score":', score_after)
-
+{errores_previos}
 Devuelve ÚNICAMENTE el código Python, sin markdown ni explicaciones."""
+
+
+def _seccion_errores_previos(state: DataPulseState, max_errores: int = 2) -> str:
+    """Bloque de texto con los últimos errores para que el reintento los corrija."""
+    prev_errs = (state.get("error_history") or [])[-max_errores:]
+    if not prev_errs:
+        return ""
+    texto = "\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
+    for e in prev_errs:
+        texto += f"- {e[:500]}\n"
+    return texto
+
+
+def _leer_score_reportado(contenido: str) -> Optional[int]:
+    """Extrae el score que declara el propio script en quality_report.json."""
+    try:
+        qr = json.loads(contenido)
+    except Exception:
+        return None
+    if not isinstance(qr, dict):
+        return None
+    for clave in ("score", "score_after", "score_despues"):
+        s = qr.get(clave)
+        if isinstance(s, (int, float)) and not isinstance(s, bool):
+            return int(s)
+    return None
 
 
 def _run_local_groq_pipeline(state: DataPulseState) -> dict:
@@ -2264,6 +2312,7 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         file_ext=state.get("file_ext", ""),
         filas=state["metadata"].get("filas", "?"),
         columnas=state["metadata"].get("columnas", "?"),
+        errores_previos=_seccion_errores_previos(state),
     )
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
@@ -2274,7 +2323,9 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": "error",
             "error_history": [msg],
-            "score_despues": 0,
+            "score_reportado": None,
+            "ruta_processed": None,
+            "directorio_salida": run_dir,
             "codigo": "",
             "archivos_generados": {},
         }
@@ -2290,6 +2341,7 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
 
     archivos_generados = {"datapulse_pipeline.py": codigo}
     status = "finished"
+    stderr_tail = ""
 
     try:
         proc = subprocess.run(
@@ -2299,8 +2351,9 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         stdout = proc.stdout or ""
         if proc.returncode != 0:
             status = "error"
+            stderr_tail = (proc.stderr or "")[-500:]
             print(f"   ⚠️ Pipeline local terminó con código {proc.returncode}")
-            print((proc.stderr or "")[-500:])
+            print(stderr_tail)
     except subprocess.TimeoutExpired:
         status = "error"
         stdout = ""
@@ -2314,34 +2367,38 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
                 archivos_generados[fname] = f.read()
 
     if status == "finished" and not any(
-        name in archivos_generados for name in ("quality_report.json", "cleaning_log.json")
+        name in archivos_generados
+        for name in ("processed_data.csv", "quality_report.json", "cleaning_log.json")
     ):
         status = "error"
-        print("   ⚠️ El pipeline local no generó quality_report.json ni cleaning_log.json")
+        stderr_tail = "El script no generó processed_data.csv ni reportes."
+        print("   ⚠️ El pipeline local no generó processed_data.csv ni reportes")
 
-    score = 0
+    # Score declarado por el script: solo informativo. El score que decide el
+    # commit lo recalcula node_validar_score sobre processed_data.csv.
+    score_reportado = None
     if "quality_report.json" in archivos_generados:
-        try:
-            qr = json.loads(archivos_generados["quality_report.json"])
-            s = qr.get("score") or qr.get("score_after") or qr.get("score_despues")
-            if isinstance(s, (int, float)):
-                score = int(s)
-        except Exception:
-            pass
-    if score == 0:
+        score_reportado = _leer_score_reportado(archivos_generados["quality_report.json"])
+    if score_reportado is None:
         m = re.search(r'"score"\s*[:\s]+(\d+)', stdout)
         if m:
-            score = int(m.group(1))
+            score_reportado = int(m.group(1))
 
-    print(f"   📈 Score (local Groq): {score}")
+    print(f"   📝 Score reportado por el script (informativo): {score_reportado}")
 
-    return {
+    ruta_processed = os.path.join(run_dir, "processed_data.csv")
+    resultado = {
         "intentos": state.get("intentos", 0) + 1,
         "openhands_status": status,
-        "score_despues": score,
+        "score_reportado": score_reportado,
+        "ruta_processed": os.path.abspath(ruta_processed) if os.path.exists(ruta_processed) else None,
+        "directorio_salida": os.path.abspath(run_dir),
         "codigo": codigo,
         "archivos_generados": archivos_generados,
     }
+    if status == "error" and stderr_tail:
+        resultado["error_history"] = [f"El script falló: {stderr_tail}"]
+    return resultado
 
 
 def node_ejecutar(state: DataPulseState) -> DataPulseState:
@@ -2598,42 +2655,32 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         for p in archivos:
             print(f"      - {p.split('/')[-1]} ({len(archivos[p])} chars)")
 
-        # Buscar score
-        score = 0
+        # Score declarado por el agente: solo informativo (sin fallback fijo).
+        # El score real lo calcula node_validar_score sobre processed_data.csv.
+        score_reportado = None
         for path, content in archivos.items():
             if "quality" in path.lower() and path.endswith(".json"):
-                try:
-                    qr = json.loads(content)
-                    s = qr.get("score") or qr.get("score_despues")
-                    if isinstance(s, (int, float)):
-                        score = int(s)
-                        break
-                except Exception:
-                    pass
+                score_reportado = _leer_score_reportado(content)
+                if score_reportado is not None:
+                    break
 
-        if score == 0:
+        if score_reportado is None:
             for out in terminal_outputs:
                 m = re.search(r'"score"\s*[:\s]+(\d+)', out)
                 if m:
-                    score = int(m.group(1))
+                    score_reportado = int(m.group(1))
                     break
-
-        # Fallback: si OpenHands terminó con éxito y generó al menos un .py,
-        # el pipeline funcionó — asignar score de paso mínimo.
-        # Esto evita el loop infinito de reintentos cuando OpenHands no escribe
-        # quality_report.json pero sí ejecutó el trabajo correctamente.
-        if score == 0 and final_status == "finished" and py_files:
-            score = MIN_SCORE_PASS + 5  # 75 — por encima del umbral de 70
-            print(f"   ⚡ Score fallback: OpenHands finalizó OK + {len(py_files)} script(s) → {score}")
 
         if finish_msg:
             print(f"   💬 {finish_msg[:150]}")
-        print(f"   📈 Score: {score}")
+        print(f"   📝 Score reportado por OpenHands (informativo): {score_reportado}")
 
         return {
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": final_status,
-            "score_despues": score,
+            "score_reportado": score_reportado,
+            "ruta_processed": None,
+            "directorio_salida": None,
             "codigo": codigo if codigo else "# OpenHands no generó .py",
             "archivos_generados": archivos,
         }
@@ -2645,6 +2692,8 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": "error",
             "error_history": [err_msg],
+            "score_reportado": None,
+            "ruta_processed": None,
             "archivos_generados": {},
         }
 
@@ -2662,7 +2711,7 @@ def router_validar_score(state: DataPulseState) -> str:
     if status == "error":
         return "retry" if intentos < OH_MAX_RETRIES else "end_no_commit"
 
-    if score >= MIN_SCORE_PASS:
+    if status != "sin_validar" and score >= MIN_SCORE_PASS:
         return "commit"
 
     # Autocorrección: un score bajo con ejecución correcta sí merece reintento,
@@ -2671,10 +2720,107 @@ def router_validar_score(state: DataPulseState) -> str:
         return "retry"
     return "end_no_commit"
 
+def _resumir_reporte(reporte: dict, max_items: int = 8) -> str:
+    """Resume los principales problemas de un reporte de calidad en una línea."""
+    problemas = []
+    nulos = reporte.get("null_analysis", {})
+    for col, pct in sorted(nulos.items(), key=lambda kv: -kv[1])[:3]:
+        problemas.append(f"nulos en {col} ({pct}%)")
+    dup = reporte.get("duplicate_analysis", {})
+    if dup.get("count"):
+        problemas.append(f"{dup['count']} filas duplicadas")
+    for col, info in reporte.get("negative_values", {}).items():
+        if info.get("penalizado"):
+            problemas.append(f"negativos en {col} ({info['count']})")
+    for col in reporte.get("outlier_analysis", {}):
+        problemas.append(f"outliers en {col}")
+    for col in reporte.get("text_inconsistencies", {}):
+        problemas.append(f"texto inconsistente en {col}")
+    for col in reporte.get("invalid_dates", {}):
+        problemas.append(f"fechas inválidas en {col}")
+    rel = reporte.get("column_relationships", {})
+    for r in rel.get("product_relationships", []):
+        problemas.append(f"relación rota {r['expected']}")
+    for col in rel.get("percentage_out_of_range", {}):
+        problemas.append(f"porcentaje fuera de 0-100 en {col}")
+    if not problemas:
+        return "sin problemas detectados"
+    extra = len(problemas) - max_items
+    texto = "; ".join(problemas[:max_items])
+    return texto + (f"; y {extra} más" if extra > 0 else "")
+
+
 def node_validar_score(state: DataPulseState) -> DataPulseState:
-    # Nodo passthrough: el router lee el estado para decidir la transición.
-    # No modifica ninguna clave, por eso retorna un diccionario vacío.
-    return {}
+    """
+    Validación independiente: recalcula el score con quality_checker en vez de
+    confiar en el quality_report.json que escribe el propio script generado.
+
+    - score_antes: sobre el dataset original (se calcula una sola vez).
+    - score_despues: sobre el processed_data.csv real del intento.
+    - Sin processed_data.csv → openhands_status = "sin_validar" (no hay commit).
+    - Score bajo el umbral → resumen del reporte en error_history para que el
+      reintento sepa qué corregir.
+    """
+    salida: Dict[str, Any] = {}
+
+    if state.get("score_antes") is None and state.get("filename_path"):
+        try:
+            df_original = load_dataset(state["filename_path"])
+            salida["score_antes"] = generate_report_df(
+                df_original, state.get("filename", "original")
+            )["quality_score"]
+            print(f"   📏 Score antes (dataset original): {salida['score_antes']}")
+        except Exception as exc:
+            print(f"   ⚠️ No se pudo calcular el score del original: {type(exc).__name__}: {exc}")
+
+    status = state.get("openhands_status", "")
+    if status == "error":
+        # Fallo de infraestructura o del script: el router decide el reintento.
+        salida["score_despues"] = 0
+        return salida
+
+    ruta = state.get("ruta_processed")
+    if not ruta or not os.path.exists(ruta):
+        msg = (
+            "Validación independiente imposible: no hay processed_data.csv disponible. "
+            "El script debe escribir processed_data.csv con el dataset limpio."
+        )
+        print(f"   ⚠️ {msg}")
+        salida.update({
+            "openhands_status": "sin_validar",
+            "score_despues": 0,
+            "error_history": [msg],
+        })
+        return salida
+
+    try:
+        reporte = generate_report_df(load_dataset(ruta), "processed_data.csv")
+    except Exception as exc:
+        msg = (
+            "Validación independiente imposible: processed_data.csv no se pudo "
+            f"analizar ({type(exc).__name__}: {str(exc)[:200]})."
+        )
+        print(f"   ⚠️ {msg}")
+        salida.update({
+            "openhands_status": "sin_validar",
+            "score_despues": 0,
+            "error_history": [msg],
+        })
+        return salida
+
+    score = reporte["quality_score"]
+    salida["score_despues"] = score
+    print(
+        f"   📈 Score independiente: {score} "
+        f"(reportado por el script: {state.get('score_reportado')})"
+    )
+
+    if score < MIN_SCORE_PASS:
+        salida["error_history"] = [
+            f"Validación independiente: score {score}/100 (< {MIN_SCORE_PASS}). "
+            f"Principales problemas en processed_data.csv: {_resumir_reporte(reporte)}"
+        ]
+    return salida
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2689,7 +2835,9 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
     audit = {
         "timestamp": ts,
         "filename_original": state["filename"],
-        "score_despues": state["score_despues"],
+        "score_antes": state.get("score_antes"),
+        "score_despues": state.get("score_despues"),
+        "score_reportado": state.get("score_reportado"),
         "decisiones_knowledge_graph": sum(
             1 for a in state.get("plan_acciones", [])
             if a.get("fuente_decision") == "knowledge_graph"
@@ -2938,7 +3086,11 @@ def run_datapulse(
         "error_history":        [],
         "github_source_branch": source_branch,
         "github_source_path":   source_path,
+        "score_antes":        None,
         "score_despues":      0,
+        "score_reportado":    None,
+        "ruta_processed":     None,
+        "directorio_salida":  None,
         "archivos_generados": {},
         "openhands_status":   "",
         "github_url":         None,
@@ -2954,7 +3106,9 @@ def _print_results(final_state: dict) -> None:
     print("📊 RESULTADO FINAL DATAPULSE")
     print("=" * 60)
     print(f"Status OpenHands : {final_state['openhands_status']}")
-    print(f"Score calidad    : {final_state['score_despues']}/100")
+    print(f"Score antes      : {final_state.get('score_antes')}/100")
+    print(f"Score calidad    : {final_state['score_despues']}/100 (validación independiente)")
+    print(f"Score reportado  : {final_state.get('score_reportado')} (informativo)")
     print(f"Intentos usados  : {final_state['intentos']}")
     print(f"GitHub URL       : {final_state.get('github_url', 'N/A')}")
 
