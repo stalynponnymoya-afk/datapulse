@@ -131,11 +131,19 @@ requests
 
 #### Option A: Google Colab (Recommended for GUI)
 1. Open the notebook in Google Colab
-2. Configure the 3 API keys in Colab Secrets
-3. Run all cells in order
-4. Upload your dataset when prompted
-5. Wait 3-5 minutes
-6. Download `processed_data.csv` — your clean dataset
+2. **Clone the full repository** in the first cell — `datapulse_prod.py` imports the data
+   loader from `src/`, so uploading the script alone is not enough:
+   ```python
+   !git clone https://github.com/<your_user>/datapulse.git
+   %cd datapulse
+   !pip install -r requirements.txt
+   ```
+3. Configure the API keys in Colab Secrets
+4. Run all cells in order
+5. Upload your dataset when prompted
+6. Wait 3-5 minutes
+7. Download `processed_data.csv` — your clean dataset (DataPulse downloads it from the real
+   run output folder)
 
 #### Option B: Local Execution (Standard Python Environment)
 1. Clone the repository and install the dependencies:
@@ -322,11 +330,19 @@ requests
 
 #### Opción A: Google Colab (Recomendado para Interfaz Gráfica)
 1. Abrir el notebook en Google Colab
-2. Configurar las 3 API keys en Colab Secrets
-3. Ejecutar todas las celdas en orden
-4. Subir tu dataset cuando se solicite
-5. Esperar 3-5 minutos
-6. Descargar `processed_data.csv` — tu dataset limpio
+2. **Clonar el repositorio completo** en la primera celda — `datapulse_prod.py` importa el
+   cargador de datos desde `src/`, así que no basta con subir solo el script:
+   ```python
+   !git clone https://github.com/<tu_usuario>/datapulse.git
+   %cd datapulse
+   !pip install -r requirements.txt
+   ```
+3. Configurar las API keys en Colab Secrets
+4. Ejecutar todas las celdas en orden
+5. Subir tu dataset cuando se solicite
+6. Esperar 3-5 minutos
+7. Descargar `processed_data.csv` — tu dataset limpio (DataPulse lo descarga desde la
+   carpeta real de salida de la ejecución)
 
 #### Opción B: Ejecución Local (Entorno Python Estándar)
 1. Clona el repositorio e instala las dependencias:

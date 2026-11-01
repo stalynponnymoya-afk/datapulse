@@ -37,43 +37,118 @@ Detecta:
 Formatos soportados: CSV, Excel, JSON, Parquet
 """
 
-import pandas as pd
-import numpy as np
+import csv
+import codecs
+import os
 import re
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+
+import numpy as np
+import pandas as pd
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CARGA DE DATOS (CSV, Excel, JSON, Parquet)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_dataset(filepath):
+EXTENSIONES_TEXTO = (".csv", ".tsv", ".txt")
+EXTENSIONES_SOPORTADAS = EXTENSIONES_TEXTO + (".xlsx", ".xls", ".json", ".parquet", ".pq")
+
+# Orden de prueba de encodings: UTF-8 (con o sin BOM) primero; cp1252 cubre el
+# CSV típico de Excel en español; latin-1 nunca falla y queda como último recurso.
+_ENCODINGS_CANDIDATOS = ("utf-8-sig", "cp1252", "latin-1")
+_SEPARADORES_CANDIDATOS = ",;\t|"
+_TAM_MUESTRA = 64 * 1024
+
+
+def _detectar_encoding(filepath: str) -> str:
+    """Devuelve el primer encoding candidato que decodifica el archivo completo."""
+    for encoding in _ENCODINGS_CANDIDATOS:
+        decoder = codecs.getincrementaldecoder(encoding)()
+        try:
+            with open(filepath, "rb") as f:
+                while True:
+                    bloque = f.read(1024 * 1024)
+                    if not bloque:
+                        decoder.decode(b"", final=True)
+                        break
+                    decoder.decode(bloque)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    return "latin-1"
+
+
+def _detectar_separador(filepath: str, encoding: str) -> str:
+    """
+    Detecta el separador con csv.Sniffer sobre una muestra del archivo.
+    Si el sniffer no decide, usa el candidato más frecuente en la cabecera.
+    """
+    with open(filepath, "r", encoding=encoding, newline="") as f:
+        muestra = f.read(_TAM_MUESTRA)
+    # Cortar en el último salto de línea para no analizar una fila a medias
+    if len(muestra) == _TAM_MUESTRA and "\n" in muestra:
+        muestra = muestra[: muestra.rfind("\n")]
+    if not muestra.strip():
+        return ","
+    cabecera = muestra.splitlines()[0]
+    conteos = {sep: cabecera.count(sep) for sep in _SEPARADORES_CANDIDATOS}
+    try:
+        sep = csv.Sniffer().sniff(muestra, delimiters=_SEPARADORES_CANDIDATOS).delimiter
+        # Sanidad: el separador elegido debe aparecer en la cabecera
+        if conteos.get(sep, 0) > 0:
+            return sep
+    except csv.Error:
+        pass
+    mejor = max(conteos, key=conteos.get)
+    return mejor if conteos[mejor] > 0 else ","
+
+
+def load_dataset(filepath) -> pd.DataFrame:
     """
     Carga un dataset automáticamente según su extensión.
-    Soporta: .csv, .xlsx, .xls, .json, .parquet, .pq
+    Soporta: .csv, .tsv, .txt, .xlsx, .xls, .json, .parquet, .pq
+
+    Para archivos de texto detecta el encoding (utf-8-sig → cp1252 → latin-1)
+    y el separador (``,`` ``;`` tabulador ``|``) con csv.Sniffer.
+
+    Lanza ValueError si la extensión no está soportada.
 
     Ejemplo:
         df = load_dataset("data/ventas.csv")
         df = load_dataset("data/ventas.json")
         df = load_dataset("data/ventas.parquet")
     """
-    filepath_lower = filepath.lower()
+    filepath = os.fspath(filepath)
+    ext = os.path.splitext(filepath)[1].lower()
 
-    if filepath_lower.endswith((".xlsx", ".xls")):
-        return pd.read_excel(filepath)
-    elif filepath_lower.endswith(".json"):
-        return pd.read_json(filepath)
-    elif filepath_lower.endswith((".parquet", ".pq")):
+    if ext not in EXTENSIONES_SOPORTADAS:
+        raise ValueError(
+            f"Formato no soportado: '{ext or filepath}'. "
+            f"Extensiones válidas: {', '.join(EXTENSIONES_SOPORTADAS)}"
+        )
+
+    if ext in (".xlsx", ".xls"):
+        try:
+            return pd.read_excel(filepath)
+        except ImportError as exc:
+            motor = "xlrd" if ext == ".xls" else "openpyxl"
+            raise ValueError(
+                f"Leer '{ext}' requiere el paquete '{motor}' "
+                "(ver requirements-optional.txt)."
+            ) from exc
+    if ext == ".json":
+        try:
+            return pd.read_json(filepath)
+        except ValueError:
+            # JSON Lines: un objeto por línea
+            return pd.read_json(filepath, lines=True)
+    if ext in (".parquet", ".pq"):
         return pd.read_parquet(filepath)
-    elif filepath_lower.endswith((".csv", ".tsv", ".txt")):
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            first_line = f.readline()
-        if "\t" in first_line:
-            return pd.read_csv(filepath, sep="\t")
-        elif ";" in first_line:
-            return pd.read_csv(filepath, sep=";", encoding="latin-1")
-        else:
-            return pd.read_csv(filepath, encoding="latin-1")
+
+    encoding = _detectar_encoding(filepath)
+    sep = _detectar_separador(filepath, encoding)
+    return pd.read_csv(filepath, sep=sep, encoding=encoding, low_memory=False)
 
 # =====================================================
 # CHECK 1: NULOS

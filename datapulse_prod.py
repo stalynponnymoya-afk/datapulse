@@ -29,6 +29,13 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from github import Github
 
+# El cargador de datos vive en src/: en Colab hay que clonar el repo completo
+# (no basta con subir este archivo) para que este import funcione.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from src.quality_checker import load_dataset  # noqa: E402
+
 # ════════════════════════════════════════════════
 # CONFIGURACIÓN DEL PROYECTO
 # ════════════════════════════════════════════════
@@ -1992,19 +1999,9 @@ def serialize_metadata(df: pd.DataFrame, filename: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def node_ingestar(state: DataPulseState) -> DataPulseState:
-    path = state["filename_path"]
-    ext = state["file_ext"].lower()
-
-    if ext == "csv":
-        df = pd.read_csv(path, encoding="utf-8", low_memory=False)
-    elif ext in ("xlsx", "xls"):
-        df = pd.read_excel(path)
-    elif ext == "json":
-        df = pd.read_json(path)
-    elif ext in ("parquet", "pq"):
-        df = pd.read_parquet(path)
-    else:
-        raise ValueError(f"Formato no soportado: {ext}")
+    # Cargador único (src/quality_checker.py): detecta encoding y separador
+    # y lanza ValueError ante extensiones no soportadas.
+    df = load_dataset(state["filename_path"])
 
     metadata = serialize_metadata(df, state["filename"])
     return {"metadata": metadata}
