@@ -34,7 +34,12 @@ from github import Github
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from src.quality_checker import generate_report_df, load_dataset  # noqa: E402
+from src.quality_checker import (  # noqa: E402
+    PALABRAS_NEGATIVOS_PERMITIDOS,
+    PALABRAS_NO_NEGATIVAS,
+    generate_report_df,
+    load_dataset,
+)
 
 # ════════════════════════════════════════════════
 # CONFIGURACIÓN DEL PROYECTO
@@ -2172,7 +2177,7 @@ Para cada columna, infiere estos campos:
     escala_diferente,
     cardinalidad_baja, cardinalidad_media, cardinalidad_excesiva,
     colinealidad_alta,
-    valores_negativos_inesperados, ← negativos en columnas que deberían ser ≥0 (edad, precio, cantidad)
+    valores_negativos_inesperados, ← negativos en columnas que deberían ser ≥0 (ver regla 4)
     rango_clinico_invalido, codigo_medico_invalido, fecha_clinica_inconsistente,
     rango_financiero_invalido, consistencia_contable, rango_economico_invalido,
     rango_ocupacional_invalido, exposicion_limite_excedido,
@@ -2185,7 +2190,7 @@ REGLAS CRÍTICAS DE DIAGNÓSTICO (aplican a CUALQUIER dataset, dominio o idioma)
 1. CENTINELAS NUMÉRICOS: Valores como -999, -1, -9999, 9999, 999, 99, 0 en contextos donde 0 es inválido (edad, ID, presión) → "nulos_disfrazados", NO "outlier_severo". Detectar por: min/max extremos que no tienen sentido en el contexto de la columna.
 2. FORMATO TEXTO: Si la muestra contiene strings que no cumplen el patrón esperado del dominio (emails sin @, teléfonos con letras, fechas con formato mixto, códigos con longitud incorrecta) → "inconsistencia_formato".
 3. IDENTIFICADORES: Columnas con nombres que contengan id, cod, code, num, key, clave, folio, ticket, cedula, rut, dni, ssn, nit, rfc → tipo "identificador". Si unique_count < total filas → añadir "duplicados".
-4. NEGATIVOS INESPERADOS: Valores negativos en columnas de monto, precio, costo, edad, peso, altura, cantidad, stock, distancia, duración → "valores_negativos_inesperados". OJO: saldos bancarios y márgenes SÍ pueden ser negativos.
+4. NEGATIVOS INESPERADOS: Valores negativos en columnas cuyo nombre contenga alguna de estas palabras: {lista_no_negativos} → "valores_negativos_inesperados". EXCEPCIÓN: si el nombre contiene {lista_negativos_permitidos}, los negativos SÍ son válidos (saldos y márgenes pueden ser negativos), aunque también contenga una palabra de la lista anterior. En cualquier otra columna (longitud geográfica, beneficio, variación, temperatura…) un negativo no es un error por sí mismo.
 5. MÚLTIPLES PROBLEMAS: Cada columna debe listar TODOS sus problemas. Ejemplos genéricos:
    - Columna numérica con nulo + negativo → ["nulos_bajos", "valores_negativos_inesperados"]
    - Columna de texto con espacios + casing mixto → ["espacios_extra", "inconsistencia_formato"]
@@ -2207,9 +2212,18 @@ Metadata:
 
 Responde SOLO con el JSON. No incluyas ```json ni ```."""
 
+def construir_prompt_diagnostico(metadata: dict) -> str:
+    """Rellena DIAGNOSTIC_PROMPT; la regla 4 sale de las constantes de quality_checker."""
+    return DIAGNOSTIC_PROMPT.format(
+        metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2),
+        lista_no_negativos=", ".join(PALABRAS_NO_NEGATIVAS),
+        lista_negativos_permitidos=", ".join(PALABRAS_NEGATIVOS_PERMITIDOS),
+    )
+
+
 def node_diagnosticar(state: DataPulseState) -> DataPulseState:
     llm = get_groq_llm()
-    prompt = DIAGNOSTIC_PROMPT.format(metadata_json=json.dumps(state["metadata"], ensure_ascii=False, indent=2))
+    prompt = construir_prompt_diagnostico(state["metadata"])
     response = llm.invoke([HumanMessage(content=prompt)])
     diagnostico = extract_json_from_markdown(response.content)
     return {"diagnostico": diagnostico}

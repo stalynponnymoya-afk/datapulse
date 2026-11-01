@@ -149,6 +149,48 @@ def test_longitude_y_profit_no_penalizan_edad_si():
     assert neg["Unit Price"]["penalizado"] is True
 
 
+@pytest.mark.parametrize("nombre", [
+    "monto_transaccion", "Billing Amount", "importe", "Shipping Cost", "costo_envio",
+    "peso_kg", "altura", "Order Quantity", "qty", "unidades", "units_sold", "conteo",
+    "item_count", "stock", "distancia_km", "duración", "duration_min", "edades", "prices",
+])
+def test_no_negativos_penalizan(nombre):
+    df = pd.DataFrame({nombre: [1.0, -2.0, 3.0]})
+    assert check_negative_values(df)[nombre]["penalizado"] is True, nombre
+
+
+@pytest.mark.parametrize("nombre", [
+    "saldo", "saldo_monto", "balance_amount", "Account Balance", "margen_precio",
+    "Product Base Margin", "profit_margin", "Profit", "longitude", "variacion", "temperatura",
+])
+def test_excepciones_y_otras_columnas_no_penalizan(nombre):
+    df = pd.DataFrame({nombre: [1.0, -2.0, 3.0]})
+    assert check_negative_values(df)[nombre]["penalizado"] is False, nombre
+
+
+def test_lista_unica_en_checker_y_prompt():
+    import datapulse_prod as dp
+    from src import quality_checker as qc
+
+    # datapulse_prod usa exactamente las mismas constantes (no una copia)
+    assert dp.PALABRAS_NO_NEGATIVAS is qc.PALABRAS_NO_NEGATIVAS
+    assert dp.PALABRAS_NEGATIVOS_PERMITIDOS is qc.PALABRAS_NEGATIVOS_PERMITIDOS
+
+    prompt = dp.construir_prompt_diagnostico({"filas": 1})
+    regla4 = next(l for l in prompt.splitlines() if l.startswith("4. NEGATIVOS INESPERADOS"))
+    for palabra in qc.PALABRAS_NO_NEGATIVAS + qc.PALABRAS_NEGATIVOS_PERMITIDOS:
+        assert palabra in regla4, palabra
+    assert '"filas": 1' in prompt
+    # La lista base pedida, con equivalentes en inglés y los añadidos
+    esperadas = {
+        "monto", "amount", "importe", "precio", "price", "costo", "cost", "edad", "age",
+        "peso", "weight", "altura", "height", "cantidad", "quantity", "stock", "distancia",
+        "distance", "duración", "duration", "unidades", "units", "conteo", "count",
+    }
+    assert esperadas <= set(qc.PALABRAS_NO_NEGATIVAS)
+    assert set(qc.PALABRAS_NEGATIVOS_PERMITIDOS) == {"saldo", "balance", "margen", "margin"}
+
+
 def test_score_penaliza_solo_negativos_marcados():
     base = pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0]})
     score_base = generate_report_df(base)["quality_score"]
@@ -163,6 +205,8 @@ def test_datasets_reales_no_penalizan_longitude_ni_profit():
     assert rep["negative_values"]["longitude"]["penalizado"] is False
     rep = generate_report(os.path.join(DATA, "superstore_sales.csv"))
     assert rep["negative_values"]["Profit"]["penalizado"] is False
+    rep = generate_report(os.path.join(DATA, "healthcare_dataset.csv"))
+    assert rep["negative_values"]["Billing Amount"]["penalizado"] is True
 
 
 # ── Reporte ──────────────────────────────────────────────────────────────────

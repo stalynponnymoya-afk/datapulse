@@ -177,12 +177,25 @@ def _tokens_nombre(nombre) -> List[str]:
     return [t for t in re.split(r"[\s_\-\.]+", texto.lower()) if t]
 
 
+def _normalizar_palabra(palabra: str) -> str:
+    """Minúsculas y sin tildes, igual que los tokens de ``_tokens_nombre``."""
+    texto = unicodedata.normalize("NFKD", str(palabra).lower())
+    return "".join(c for c in texto if not unicodedata.combining(c))
+
+
 def _nombre_contiene(nombre, palabras) -> bool:
-    """True si algún token del nombre (o su singular simple) está en ``palabras``."""
+    """
+    True si algún token del nombre (o su singular simple: -s, -es) está en
+    ``palabras``. Las palabras se comparan sin tildes ni mayúsculas.
+    """
+    claves = {_normalizar_palabra(p) for p in palabras}
     for token in _tokens_nombre(nombre):
-        if token in palabras:
-            return True
-        if len(token) > 3 and token.endswith("s") and token[:-1] in palabras:
+        candidatos = {token}
+        if len(token) > 3 and token.endswith("s"):
+            candidatos.add(token[:-1])
+        if len(token) > 4 and token.endswith("es"):
+            candidatos.add(token[:-2])
+        if candidatos & claves:
             return True
     return False
 
@@ -244,20 +257,37 @@ def check_outliers(df, factor=1.5):
 # CHECK 4: VALORES NEGATIVOS
 # =====================================================
 
-# Columnas cuyo nombre sugiere que no admiten negativos. Solo estas penalizan
-# el score: longitudes geográficas, beneficios o saldos pueden ser negativos.
-PALABRAS_NO_NEGATIVAS = {
-    "edad", "edades", "age",
+# FUENTE ÚNICA de las columnas que no admiten negativos. La usan
+# check_negative_values (qué negativos penalizan el score) y la regla 4 de
+# DIAGNOSTIC_PROMPT en datapulse_prod.py (qué negativos ve el LLM como error).
+# Se comparan como tokens del nombre, sin tildes y admitiendo plurales.
+PALABRAS_NO_NEGATIVAS = (
+    "monto", "amount",
+    "importe",
     "precio", "price",
-    "cantidad", "qty", "quantity",
-    "unidad", "unidades", "unit",
-    "conteo", "count",
+    "costo", "cost",
+    "edad", "age",
     "peso", "weight",
     "altura", "height",
+    "cantidad", "quantity", "qty",
+    "unidades", "units",
+    "conteo", "count",
     "stock",
-    "duracion", "duration",
     "distancia", "distance",
-}
+    "duración", "duration",
+)
+
+# Excepciones: si el nombre contiene alguna de estas palabras, los negativos
+# son válidos aunque también contenga una de PALABRAS_NO_NEGATIVAS
+# (p. ej. "saldo_monto", "balance_amount", "margin_price").
+PALABRAS_NEGATIVOS_PERMITIDOS = ("saldo", "balance", "margen", "margin")
+
+
+def admite_negativos(nombre) -> bool:
+    """False si el nombre sugiere una magnitud ≥ 0 (y no es una excepción)."""
+    if _nombre_contiene(nombre, PALABRAS_NEGATIVOS_PERMITIDOS):
+        return True
+    return not _nombre_contiene(nombre, PALABRAS_NO_NEGATIVAS)
 
 
 def check_negative_values(df):
@@ -266,7 +296,8 @@ def check_negative_values(df):
 
     Reporta todas las columnas con negativos, pero marca ``penalizado=True``
     solo en las que, por su nombre, no deberían tener negativos
-    (ver ``PALABRAS_NO_NEGATIVAS``). Solo esas restan puntos en el score.
+    (``PALABRAS_NO_NEGATIVAS`` salvo ``PALABRAS_NEGATIVOS_PERMITIDOS``).
+    Solo esas restan puntos en el score.
     """
     negatives = {}
     for col in df.select_dtypes(include=[np.number]).columns:
@@ -277,7 +308,7 @@ def check_negative_values(df):
             negatives[col] = {
                 "count": int(neg_count),
                 "pct": round(neg_count / len(df) * 100, 2),
-                "penalizado": _nombre_contiene(col, PALABRAS_NO_NEGATIVAS),
+                "penalizado": not admite_negativos(col),
             }
     return negatives
 
