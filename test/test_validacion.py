@@ -13,6 +13,7 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import datapulse_prod as dp  # noqa: E402
+from src.quality_checker import generate_report  # noqa: E402
 
 
 def _csv(tmp_path, nombre, df):
@@ -214,6 +215,33 @@ def test_pipeline_local_incluye_errores_previos_en_el_prompt(tmp_path, monkeypat
     llm.prompts.clear()
     dp._run_local_groq_pipeline(_estado_local(tmp_path))
     assert "ERRORES INTENTOS PREVIOS" not in llm.prompts[0]
+
+
+def test_pipeline_local_end_to_end_con_validacion(tmp_path, monkeypatch):
+    """Script real (generado por un LLM falso) → processed_data.csv → score independiente."""
+    monkeypatch.chdir(tmp_path)
+    codigo = (
+        "import sys, json\n"
+        "import pandas as pd\n"
+        "df = pd.read_csv(sys.argv[1])\n"
+        "df = df.dropna()\n"
+        "df = df[df['edad'] >= 0]\n"
+        "df = df[df['precio'] >= 0]\n"
+        "df['ciudad'] = df['ciudad'].str.strip().str.lower()\n"
+        "df.to_csv('processed_data.csv', index=False)\n"
+        "json.dump({'score': 100}, open('quality_report.json', 'w'))\n"
+        "print('\"score\":', 100)\n"
+    )
+    monkeypatch.setattr(dp, "get_groq_llm", lambda: _LLMFalso(codigo))
+    estado = _estado_local(tmp_path)
+    res = dp._run_local_groq_pipeline(estado)
+    assert res["openhands_status"] == "finished", res
+    assert res["score_reportado"] == 100
+    assert res["ruta_processed"] and os.path.exists(res["ruta_processed"])
+    assert res["directorio_salida"] == os.path.dirname(res["ruta_processed"])
+
+    val = dp.node_validar_score({**estado, **res})
+    assert val["score_despues"] == generate_report(res["ruta_processed"])["quality_score"]
 
 
 def test_pipeline_local_script_que_falla(tmp_path, monkeypatch):

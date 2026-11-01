@@ -2261,7 +2261,9 @@ LOCAL_GENERATION_PROMPT = """Eres un ingeniero de datos senior. Escribe el scrip
 {brief}
 
 ## ARCHIVO DE DATOS
-- Ruta: {data_path}
+- La ruta del dataset NO es fija: el script DEBE leerla de sys.argv[1]
+  (por ejemplo: data_path = sys.argv[1]). No escribas rutas absolutas en el código.
+- Nombre original: {filename}
 - Formato: {file_ext}
 - Filas: {filas}
 - Columnas: {columnas}
@@ -2316,7 +2318,7 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     llm = get_groq_llm()
     prompt = LOCAL_GENERATION_PROMPT.format(
         brief=state.get("brief_tecnico", ""),
-        data_path=os.path.abspath(state["filename_path"]),
+        filename=state.get("filename", os.path.basename(state["filename_path"])),
         file_ext=state.get("file_ext", ""),
         filas=state["metadata"].get("filas", "?"),
         columnas=state["metadata"].get("columnas", "?"),
@@ -2352,8 +2354,10 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     stderr_tail = ""
 
     try:
+        # El script recibe la ruta del dataset como argumento: así es
+        # reproducible en otra máquina sin editar rutas.
         proc = subprocess.run(
-            [sys.executable, "datapulse_pipeline.py"],
+            [sys.executable, "datapulse_pipeline.py", os.path.abspath(state["filename_path"])],
             cwd=run_dir, capture_output=True, text=True, timeout=OH_TIMEOUT_SEG,
         )
         stdout = proc.stdout or ""
@@ -2409,6 +2413,88 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     return resultado
 
 
+# Salidas que el agente debe dejar commiteadas en la rama de trabajo
+SALIDAS_OPENHANDS = (
+    "datapulse_pipeline.py",
+    "quality_report.json",
+    "cleaning_log.json",
+    "processed_data.csv",
+)
+
+
+def _construir_brief_openhands(
+    state: DataPulseState, data_path: str, rama: str, subir_datos: bool
+) -> str:
+    """Arma el mensaje para OpenHands con la ruta real del dataset y los entregables."""
+    salidas = [s for s in SALIDAS_OPENHANDS if subir_datos or not s.endswith(".csv")]
+    mensaje = state["brief_tecnico"]
+    mensaje += (
+        f"\n\n## ARCHIVO DE DATOS"
+        f"\n- Ruta en el repo: {data_path}"
+        f"\n- Formato: {state['file_ext'].upper()}"
+        f"\n- Filas: {state['metadata'].get('filas', '?')}"
+        f"\n- Columnas: {state['metadata'].get('columnas', '?')}"
+        f"\n\n## ENTREGABLES OBLIGATORIOS (todos en la raíz del repo)"
+        f"\n1. datapulse_pipeline.py — script ejecutable de limpieza. Debe leer la ruta"
+        f"\n   del dataset de sys.argv[1]; ejecútalo así: python datapulse_pipeline.py {data_path}"
+        f"\n2. Al ejecutarse debe escribir processed_data.csv (dataset limpio),"
+        f"\n   cleaning_log.json y quality_report.json con EXACTAMENTE este formato:"
+        f'\n   {{"score_before": <int 0-100>, "score_after": <int 0-100>, "score": <mismo que score_after>}}'
+        f"\n3. Ejecuta datapulse_pipeline.py al finalizar para validar que corre sin errores."
+        f"\n4. Al final del script, imprime en consola: print('\"score\":', score_after)"
+        f"\n5. Haz commit y push en la rama `{rama}` (no en otra) de estos archivos:"
+        f"\n   {', '.join(salidas)}."
+    )
+    if not subir_datos:
+        mensaje += (
+            "\n6. NO hagas commit de archivos de datos (.csv, .xlsx, .parquet, .json de"
+            "\n   datos): la política de privacidad de este repo no lo permite."
+        )
+
+    prev_errs = (state.get("error_history") or [])[-2:]
+    if prev_errs:
+        mensaje += "\n\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
+        for e in prev_errs:
+            mensaje += f"- {e[:300]}\n"
+    return mensaje
+
+
+def _leer_contenido_github(repo, path: str, ref: str) -> bytes:
+    """Lee un archivo de una rama; usa la API de blobs si supera 1 MB."""
+    contents = repo.get_contents(path, ref=ref)
+    if isinstance(contents, list):
+        raise IsADirectoryError(path)
+    data = b""
+    try:
+        data = contents.decoded_content or b""
+    except Exception:
+        data = b""
+    if not data and getattr(contents, "size", 0):
+        blob = repo.get_git_blob(contents.sha)
+        data = base64.b64decode(blob.content)
+    return data
+
+
+def _leer_salidas_rama(repo, rama: str, run_dir: str, nombres) -> Dict[str, bytes]:
+    """
+    Descarga de la rama de trabajo las salidas indicadas y las guarda en
+    ``run_dir``. Devuelve {nombre: bytes} solo con las que se pudieron leer.
+    """
+    leidos: Dict[str, bytes] = {}
+    for nombre in nombres:
+        try:
+            data = _leer_contenido_github(repo, nombre, rama)
+        except Exception as exc:
+            print(f"   ⚠️ {nombre} no está en la rama {rama} ({type(exc).__name__})")
+            continue
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, nombre), "wb") as f:
+            f.write(data)
+        leidos[nombre] = data
+        print(f"   📥 {nombre} leído de {rama} ({len(data):,} bytes)")
+    return leidos
+
+
 def node_ejecutar(state: DataPulseState) -> DataPulseState:
     """
     OpenHands Cloud API — sube archivo a GitHub + flujo real de 5 pasos.
@@ -2432,17 +2518,20 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
             g = Github(GITHUB_TOKEN)
         repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
 
-        # ── PASO 0: Preparar rama con el archivo de datos ──────
+        # ── PASO 0: Preparar rama de trabajo con el archivo de datos ──
+        # Siempre se crea una rama nueva: el agente hace commit de sus salidas
+        # ahí y nunca directamente en main ni en la rama de origen.
+        fecha = datetime.now().strftime("%Y%m%d-%H%M%S")
+        rama  = f"data/datapulse-{fecha}"
         if state.get("github_source_branch") and state.get("github_source_path"):
-            # El archivo YA está en GitHub — usar la rama/path indicados, sin subir nada
-            rama      = state["github_source_branch"]
+            # El archivo YA está en GitHub — se ramifica desde su rama, sin subir nada
+            base_sha  = repo.get_branch(state["github_source_branch"]).commit.sha
             data_path = state["github_source_path"]
-            print(f"   ✅ Usando archivo del repo: {data_path} (branch: {rama})")
+            repo.create_git_ref(ref=f"refs/heads/{rama}", sha=base_sha)
+            print(f"   ✅ Usando archivo del repo: {data_path} (rama de trabajo: {rama})")
         else:
             # Archivo local — crear rama temporal y subir
             print(f"   📤 Subiendo {state['filename']} a GitHub...")
-            fecha = datetime.now().strftime("%Y%m%d-%H%M%S")
-            rama  = f"data/datapulse-{fecha}"
             try:
                 base_sha = repo.get_branch("main").commit.sha
             except Exception:
@@ -2511,27 +2600,7 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         print(f"   ✅ READY: {conv_id[:16]}...")
 
         # ── PASO 3: Enviar brief con referencia al archivo ──────
-        mensaje = state["brief_tecnico"]
-        mensaje += (
-            f"\n\n## ARCHIVO DE DATOS"
-            f"\n- Ruta en el repo: data/{state['filename']}"
-            f"\n- Formato: {state['file_ext'].upper()}"
-            f"\n- Filas: {state['metadata'].get('filas', '?')}"
-            f"\n- Columnas: {state['metadata'].get('columnas', '?')}"
-            f"\n\n## ENTREGABLES OBLIGATORIOS (todos en la raíz del repo)"
-            f"\n1. datapulse_pipeline.py — script ejecutable de limpieza"
-            f"\n2. quality_report.json — con EXACTAMENTE este formato:"
-            f'\n   {{"score_before": <int 0-100>, "score_after": <int 0-100>, "score": <mismo que score_after>}}'
-            f"\n   El score_after debe reflejar la calidad real del dataset limpio (0=sin limpiar, 100=perfecto)."
-            f"\n3. Ejecuta datapulse_pipeline.py al finalizar para validar que corre sin errores."
-            f"\n4. Al final del script, imprime en consola: print('\"score\":', score_after)"
-        )
-
-        prev_errs = state.get("error_history", [])[-2:]
-        if prev_errs:
-            mensaje += "\n\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
-            for e in prev_errs:
-                mensaje += f"- {e[:300]}\n"
+        mensaje = _construir_brief_openhands(state, data_path, rama, subir_datos=True)
 
         r = requests.post(
             f"{base}/app-conversations/{conv_id}/send-message",
@@ -2683,12 +2752,26 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
             print(f"   💬 {finish_msg[:150]}")
         print(f"   📝 Score reportado por OpenHands (informativo): {score_reportado}")
 
+        # ── PASO 6: Leer de la rama de trabajo lo que escribió el script ──
+        # Los eventos solo traen lo editado con FileEditorAction; lo que el
+        # script escribe al ejecutarse (processed_data.csv, reportes) se lee
+        # del commit que el agente hizo en la rama.
+        run_dir = os.path.join("outputs", fecha + "-openhands")
+        leidos = _leer_salidas_rama(repo, rama, run_dir, SALIDAS_OPENHANDS)
+        for nombre, contenido in leidos.items():
+            archivos.setdefault(nombre, contenido.decode("utf-8", errors="replace"))
+        if "datapulse_pipeline.py" in leidos and not py_files:
+            codigo = archivos["datapulse_pipeline.py"]
+        if score_reportado is None and "quality_report.json" in archivos:
+            score_reportado = _leer_score_reportado(archivos["quality_report.json"])
+
+        ruta_processed = os.path.join(run_dir, "processed_data.csv")
         return {
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": final_status,
             "score_reportado": score_reportado,
-            "ruta_processed": None,
-            "directorio_salida": None,
+            "ruta_processed": os.path.abspath(ruta_processed) if "processed_data.csv" in leidos else None,
+            "directorio_salida": os.path.abspath(run_dir) if leidos else None,
             "codigo": codigo if codigo else "# OpenHands no generó .py",
             "archivos_generados": archivos,
         }
@@ -3192,12 +3275,23 @@ def main() -> None:
     _print_results(final_state)
 
     # ── Descarga en Colab ─────────────────────────────────────────
+    _descargar_en_colab(final_state)
+
+
+def _descargar_en_colab(final_state: dict) -> None:
+    """Descarga processed_data.csv desde la ruta real del intento (solo en Colab)."""
     try:
         from google.colab import files
-        if "processed_data.csv" in final_state.get("archivos_generados", {}):
-            files.download("/content/processed_data.csv")
     except ImportError:
-        pass
+        return
+    ruta = final_state.get("ruta_processed")
+    if not ruta:
+        print("ℹ️ No hay processed_data.csv que descargar.")
+        return
+    try:
+        files.download(ruta)
+    except FileNotFoundError:
+        print(f"⚠️ No se encontró {ruta}; no se pudo descargar.")
 
 
 if __name__ == "__main__":
