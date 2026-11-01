@@ -41,6 +41,8 @@ import csv
 import codecs
 import os
 import re
+import unicodedata
+import warnings
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -150,6 +152,41 @@ def load_dataset(filepath) -> pd.DataFrame:
     sep = _detectar_separador(filepath, encoding)
     return pd.read_csv(filepath, sep=sep, encoding=encoding, low_memory=False)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# UTILIDADES DE NOMBRES DE COLUMNA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _tokens_nombre(nombre) -> List[str]:
+    """
+    Divide un nombre de columna en tokens en minúsculas y sin tildes.
+
+    Separa por ``_``, espacios, guiones, puntos y camelCase, de modo que
+    las palabras clave se comparan como tokens completos y no como subcadenas
+    (``width`` ya no coincide con ``dt``).
+
+    Ejemplos:
+        "orderDate"        → ["order", "date"]
+        "Fecha_Nacimiento" → ["fecha", "nacimiento"]
+        "HTTPStatus-Code"  → ["http", "status", "code"]
+    """
+    texto = str(nombre)
+    texto = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", texto)
+    texto = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", texto)
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return [t for t in re.split(r"[\s_\-\.]+", texto.lower()) if t]
+
+
+def _nombre_contiene(nombre, palabras) -> bool:
+    """True si algún token del nombre (o su singular simple) está en ``palabras``."""
+    for token in _tokens_nombre(nombre):
+        if token in palabras:
+            return True
+        if len(token) > 3 and token.endswith("s") and token[:-1] in palabras:
+            return True
+    return False
+
+
 # =====================================================
 # CHECK 1: NULOS
 # =====================================================
@@ -207,15 +244,40 @@ def check_outliers(df, factor=1.5):
 # CHECK 4: VALORES NEGATIVOS
 # =====================================================
 
+# Columnas cuyo nombre sugiere que no admiten negativos. Solo estas penalizan
+# el score: longitudes geográficas, beneficios o saldos pueden ser negativos.
+PALABRAS_NO_NEGATIVAS = {
+    "edad", "edades", "age",
+    "precio", "price",
+    "cantidad", "qty", "quantity",
+    "unidad", "unidades", "unit",
+    "conteo", "count",
+    "peso", "weight",
+    "altura", "height",
+    "stock",
+    "duracion", "duration",
+    "distancia", "distance",
+}
+
+
 def check_negative_values(df):
-    """Detecta valores negativos en columnas numéricas."""
+    """
+    Detecta valores negativos en columnas numéricas.
+
+    Reporta todas las columnas con negativos, pero marca ``penalizado=True``
+    solo en las que, por su nombre, no deberían tener negativos
+    (ver ``PALABRAS_NO_NEGATIVAS``). Solo esas restan puntos en el score.
+    """
     negatives = {}
     for col in df.select_dtypes(include=[np.number]).columns:
+        if pd.api.types.is_bool_dtype(df[col]):
+            continue
         neg_count = (df[col] < 0).sum()
         if neg_count > 0:
             negatives[col] = {
                 "count": int(neg_count),
                 "pct": round(neg_count / len(df) * 100, 2),
+                "penalizado": _nombre_contiene(col, PALABRAS_NO_NEGATIVAS),
             }
     return negatives
 
@@ -312,52 +374,78 @@ def check_text_inconsistencies(df):
 # CHECK 6: FECHAS INVÁLIDAS (NUEVO)
 # =====================================================
 
+PALABRAS_FECHA = {
+    "date", "fecha", "time", "dt", "timestamp", "datetime",
+    "created", "updated",
+}
+_PATRON_FECHA = r"\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4}"
+
+
+def _parsear_fechas(values: pd.Series) -> pd.Series:
+    """
+    Parsea fechas probando mes-primero y día-primero; devuelve el resultado
+    con menos fallos (así «13/01/2024» no se marca como inválida).
+    """
+    mejor = None
+    for dayfirst in (False, True):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parsed = pd.to_datetime(values, errors="coerce", dayfirst=dayfirst)
+        if mejor is None or parsed.isna().sum() < mejor.isna().sum():
+            mejor = parsed
+    return mejor
+
+
 def check_invalid_dates(df):
     """
     Detecta columnas que parecen contener fechas y verifica si hay
     fechas inválidas o no parseables.
 
     Cómo funciona:
-    1. Busca columnas con "date", "fecha", "time", "dt" en el nombre
+    1. Busca columnas cuyo nombre contenga como TOKEN (separando por ``_``,
+       espacios, guiones y camelCase) "date", "fecha", "time", "dt", ...
     2. También busca columnas de texto que parezcan fechas por su contenido
-    3. Intenta parsear cada valor como fecha
-    4. Reporta los que no se pudieron parsear
+    3. Las columnas numéricas nunca se evalúan como fecha
+    4. Parsea con mes-primero y día-primero y se queda con el que menos falla
+    5. Reporta los que no se pudieron parsear y las fechas fuera de rango
+       (antes de 1900 o más de 5 años en el futuro)
 
     Ejemplo: "31/02/2024" es inválido (febrero no tiene 31 días)
     """
     issues = {}
-
-    # Patrones comunes de nombres de columnas con fechas
-    date_keywords = ["date", "fecha", "time", "dt", "timestamp", "created", "updated"]
+    limite_superior = pd.Timestamp.now().normalize() + pd.DateOffset(years=5)
+    limite_inferior = pd.Timestamp("1900-01-01")
 
     for col in df.columns:
-        is_date_col = False
-
-        # Verificar si el nombre de la columna sugiere fecha
-        col_lower = col.lower()
-        if any(kw in col_lower for kw in date_keywords):
-            is_date_col = True
+        serie = df[col]
 
         # Si ya es datetime de pandas, no hay problema
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
+        if pd.api.types.is_datetime64_any_dtype(serie):
+            continue
+        # Las columnas numéricas o booleanas no se evalúan como fecha
+        if pd.api.types.is_numeric_dtype(serie) or pd.api.types.is_bool_dtype(serie):
             continue
 
+        # Verificar si el nombre de la columna sugiere fecha
+        is_date_col = _nombre_contiene(col, PALABRAS_FECHA)
+
         # Si no parece fecha por el nombre, verificar por contenido
-        if not is_date_col and df[col].dtype == "object":
-            sample = df[col].dropna().head(20).astype(str)
-            # Patrón básico: algo que contenga números y separadores de fecha
-            date_pattern = r"\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4}"
-            matches = sample.str.match(date_pattern).sum()
-            if matches > len(sample) * 0.5:
+        if not is_date_col:
+            sample = serie.dropna().head(20).astype(str)
+            matches = sample.str.match(_PATRON_FECHA).sum()
+            if len(sample) > 0 and matches > len(sample) * 0.5:
                 is_date_col = True
 
         if not is_date_col:
             continue
 
         # Intentar parsear las fechas
-        values = df[col].dropna().astype(str)
-        parsed = pd.to_datetime(values, errors="coerce")
-        failed_mask = parsed.isna() & values.notna() & (values.str.strip() != "")
+        values = serie.dropna().astype(str).str.strip()
+        values = values[values != ""]
+        if len(values) == 0:
+            continue
+        parsed = _parsear_fechas(values)
+        failed_mask = parsed.isna()
         failed_count = int(failed_mask.sum())
 
         if failed_count > 0:
@@ -368,22 +456,19 @@ def check_invalid_dates(df):
                 "examples": failed_examples,
             }
 
-        # Verificar fechas fuera de rango razonable (antes de 1900 o después de 2030)
+        # Verificar fechas fuera de rango razonable
         valid_dates = parsed.dropna()
         if len(valid_dates) > 0:
-            min_date = valid_dates.min()
-            max_date = valid_dates.max()
             suspicious = (
-                (valid_dates < pd.Timestamp("1900-01-01"))
-                | (valid_dates > pd.Timestamp("2030-12-31"))
+                (valid_dates < limite_inferior) | (valid_dates > limite_superior)
             ).sum()
             if suspicious > 0:
                 if col not in issues:
                     issues[col] = {}
                 issues[col]["out_of_range_count"] = int(suspicious)
                 issues[col]["date_range"] = {
-                    "min": str(min_date.date()),
-                    "max": str(max_date.date()),
+                    "min": str(valid_dates.min().date()),
+                    "max": str(valid_dates.max().date()),
                 }
 
     return issues
@@ -392,6 +477,9 @@ def check_invalid_dates(df):
 # =====================================================
 # CHECK 7: INCONSISTENCIAS ENTRE COLUMNAS (NUEVO)
 # =====================================================
+
+PALABRAS_PORCENTAJE = {"pct", "percent", "percentage", "porcentaje", "porc"}
+
 
 def check_column_relationships(df):
     """
@@ -409,7 +497,8 @@ def check_column_relationships(df):
 
     También verifica:
       - Columnas donde min > max (si existen pares min/max)
-      - Porcentajes fuera de 0-100 (si el nombre sugiere %)
+      - Porcentajes fuera de 0-100 (solo si el nombre tiene un token de
+        ``PALABRAS_PORCENTAJE``)
 
     Ejemplo de output:
         {
@@ -489,11 +578,11 @@ def check_column_relationships(df):
         issues["product_relationships"] = found_relationships
 
     # --- 7b. Porcentajes fuera de rango ---
-    pct_keywords = ["pct", "percent", "ratio", "rate", "porcentaje", "tasa"]
+    # Solo nombres que indican porcentaje explícito. "rate", "tasa" o "ratio"
+    # no implican escala 0-100 (p. ej. heart_rate, tasa de cambio).
     pct_issues = {}
     for col in numeric_cols:
-        col_lower = col.lower()
-        if any(kw in col_lower for kw in pct_keywords):
+        if _nombre_contiene(col, PALABRAS_PORCENTAJE):
             out_of_range = ((df[col] < 0) | (df[col] > 100)).sum()
             if out_of_range > 0:
                 pct_issues[col] = {
@@ -594,20 +683,28 @@ def analyze_variable_types(df):
 # REPORTE PRINCIPAL
 # =====================================================
 
-def generate_report(filepath):
+def generate_report_df(df: pd.DataFrame, nombre: str = "dataset") -> Dict[str, Any]:
     """
-    Genera reporte completo de calidad con score 0-100.
+    Genera el reporte completo de calidad de un DataFrame con score 0-100.
 
     Penalizaciones:
       - Nulos: hasta -30 pts
       - Duplicados: hasta -20 pts
       - Outliers: -5 pts por columna, máx -25
-      - Negativos: -5 pts por columna, máx -15
+      - Negativos: -5 pts por columna penalizada (nombre que sugiere ≥0), máx -15
       - Texto inconsistente: -3 pts por columna, máx -15
       - Fechas inválidas: -5 pts por columna, máx -15
       - Relaciones rotas: -5 pts por relación, máx -15
+
+    Lanza ValueError("dataset vacío") si el DataFrame no tiene filas o columnas.
     """
-    df = load_dataset(filepath)
+    if df is None or df.empty:
+        raise ValueError("dataset vacío")
+
+    # Los checks trabajan con nombres de columna string
+    if not all(isinstance(c, str) for c in df.columns):
+        df = df.copy()
+        df.columns = [str(c) for c in df.columns]
 
     # Ejecutar todos los checks
     nulls = check_nulls(df)
@@ -620,11 +717,13 @@ def generate_report(filepath):
     variable_types = analyze_variable_types(df)
 
     # --- Calcular score ---
+    negativos_penalizados = sum(1 for v in negatives.values() if v.get("penalizado"))
+
     score = 100.0
     score -= min(df.isnull().mean().mean() * 100 * 3, 30)
     score -= min(duplicates["pct"] * 3, 20)
     score -= min(len(outliers) * 5, 25)
-    score -= min(len(negatives) * 5, 15)
+    score -= min(negativos_penalizados * 5, 15)
     score -= min(len(text_issues) * 3, 15)
     score -= min(len(date_issues) * 5, 15)
 
@@ -644,7 +743,7 @@ def generate_report(filepath):
         verdict = "POBRE - no usar sin limpieza"
 
     return {
-        "file": filepath,
+        "file": nombre,
         "shape": {"rows": len(df), "columns": len(df.columns)},
         "data_types": {col: str(dtype) for col, dtype in df.dtypes.items()},
         "variable_analysis": variable_types,
@@ -658,6 +757,12 @@ def generate_report(filepath):
         "quality_score": score,
         "verdict": verdict,
     }
+
+
+def generate_report(filepath) -> Dict[str, Any]:
+    """Carga el archivo con ``load_dataset`` y genera su reporte de calidad."""
+    df = load_dataset(filepath)
+    return generate_report_df(df, os.fspath(filepath))
 
 
 if __name__ == "__main__":

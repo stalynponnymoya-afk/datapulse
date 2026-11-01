@@ -16,6 +16,7 @@ en el Grafo de Conocimiento.
 from .quality_checker import (
     load_dataset,
     generate_report,
+    generate_report_df,
     check_nulls,
     check_duplicates,
     check_outliers,
@@ -28,6 +29,7 @@ from .quality_checker import (
 __all__ = [
     "load_dataset",
     "generate_report",
+    "generate_report_df",
     "check_nulls",
     "check_duplicates",
     "check_outliers",
