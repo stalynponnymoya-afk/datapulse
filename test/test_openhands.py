@@ -321,6 +321,23 @@ def test_subprocess_recibe_la_ruta_como_argumento(tmp_path, monkeypatch):
     assert "sys.argv[1]" in capturado["prompt"]
 
 
+def test_script_que_falla_sin_stderr_queda_en_el_historial(tmp_path, monkeypatch):
+    """sys.exit(1) sin mensaje: el fallo se registra igual (reintento e informe)."""
+    monkeypatch.chdir(tmp_path)
+    datos = tmp_path / "d.csv"
+    datos.write_text("a\n1\n", encoding="utf-8")
+    monkeypatch.setattr(dp, "get_llm", lambda: SimpleNamespace(
+        invoke=lambda m: SimpleNamespace(content="import sys\nprint('paso 1')\nsys.exit(3)")))
+    out = dp._run_local_groq_pipeline({
+        "filename": "d.csv", "filename_path": str(datos), "file_ext": "csv",
+        "metadata": {}, "brief_tecnico": "", "intentos": 1, "error_history": [],
+    })
+    assert out["openhands_status"] == "error"
+    (error,) = out["error_history"]
+    assert error.startswith("[intento 2] El script falló: terminó con código 3")
+    assert "paso 1" in error and "paso 1" in out["mensaje_ejecucion"]
+
+
 def test_descarga_colab_usa_la_ruta_real(monkeypatch, tmp_path, capsys):
     descargas = []
 

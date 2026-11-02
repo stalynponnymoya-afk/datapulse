@@ -3854,7 +3854,11 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         stdout = proc.stdout or ""
         if proc.returncode != 0:
             status = "error"
-            stderr_tail = (proc.stderr or "")[-500:]
+            # Sin stderr (p. ej. sys.exit(1)) el fallo también debe quedar en
+            # error_history: el reintento y el informe necesitan saber qué pasó.
+            stderr_tail = (proc.stderr or "")[-500:] or (
+                f"terminó con código {proc.returncode} sin mensaje de error; última salida: "
+                f"{stdout[-300:].strip() or '(vacía)'}")
             print(f"   ⚠️ Pipeline local terminó con código {proc.returncode}")
             print(stderr_tail)
     except subprocess.TimeoutExpired:
