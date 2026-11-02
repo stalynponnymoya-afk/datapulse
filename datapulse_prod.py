@@ -1131,14 +1131,15 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
         justificacion_es="Datos financieros: outliers se MARCAN pero NO eliminan ni capan (pueden ser legítimos).",
         justificacion_en="Financial data: outliers FLAGGED but NOT removed or capped (may be legitimate).")
 
-    # Decisión del autor (fase 1): recortar a 0 inventaría un monto; se marca
-    # con flag y se reemplaza por NaN, como indica el planificador.
+    # Misma acción que en las variables numéricas: cubre negativos inesperados
+    # y montos fuera de rango lógico (también positivos absurdos). No se
+    # recorta porque recortar inventa un monto.
     kg.add_edge("Variable_Financiera", "Rango_Invalido",
-        accion="flag_y_nan",
-        parametros={"flag_negative": True, "flag_suffix": "_negativo", "replace_with": "NaN"},
+        accion="set_nan_y_flag",
+        parametros={"aplica_a": ["negativos_inesperados", "fuera_de_rango_logico"], "flag_suffix": "_rango_invalido"},
         confianza=0.85,
-        justificacion_es="Montos negativos inesperados: marcar con flag y reemplazar por NaN (recortar a 0 inventaría un valor).",
-        justificacion_en="Unexpected negative amounts: flag and replace with NaN (clipping to 0 would fabricate a value).")
+        justificacion_es="Montos negativos inesperados o fuera de rango lógico (p. ej. -50 en un precio o un importe positivo absurdo): se marcan con un flag y se reemplazan por NaN para tratarlos como nulos. No se recortan, porque recortar inventa un valor.",
+        justificacion_en="Unexpected negative or out-of-logical-range amounts (e.g. -50 in a price or an absurd positive amount): flagged and replaced with NaN so they are treated as missing. They are not clipped, because clipping fabricates a value.")
 
     # ── NULOS EN CONTACTO ─────────────────────────────────────
 
@@ -2876,6 +2877,43 @@ def _resolver_etiqueta(etiqueta, mapa: Dict[str, Any], nodos: List[str]) -> Opti
 UMBRAL_SKEWNESS = 1.0
 
 
+def _ajustar_por_negativos(accion: dict, decision: Optional[str]) -> dict:
+    """
+    Ninguna acción puede modificar negativos que no sean "invalidos". Si la
+    decisión de la columna es "validos" o "incierto":
+    - en acciones con aplica_a (Rango_Invalido → set_nan_y_flag) queda solo
+      "fuera_de_rango_logico";
+    - en reemplazar_centinela_por_nan se quitan los centinelas negativos.
+    Se anota en la justificación.
+    """
+    if decision not in ("validos", "incierto"):
+        return accion
+    parametros = dict(accion.get("parametros") or {})
+    cambio = None
+    aplica_a = parametros.get("aplica_a")
+    if isinstance(aplica_a, list) and "negativos_inesperados" in aplica_a:
+        parametros["aplica_a"] = [a for a in aplica_a if a != "negativos_inesperados"]
+        cambio = "solo se aplica a valores fuera de rango lógico; los negativos no se tocan"
+    centinelas = parametros.get("centinelas")
+    if isinstance(centinelas, list) and any(
+            isinstance(c, (int, float)) and c < 0 for c in centinelas):
+        parametros["centinelas"] = [c for c in centinelas
+                                    if not (isinstance(c, (int, float)) and c < 0)]
+        cambio = "se quitan los centinelas negativos; los negativos no se tocan"
+    if cambio is None:
+        return accion
+    ajustada = dict(accion)
+    ajustada["parametros"] = parametros
+    ajustada["justificacion_es"] = (
+        f"{accion.get('justificacion_es') or ''} [Ajuste: los negativos de esta columna son "
+        f"'{decision}': {cambio}.]").strip()
+    ajustada["justificacion_en"] = (
+        f"{accion.get('justificacion_en') or ''} [Adjusted: negatives in this column are "
+        f"'{decision}', so they are left unchanged.]").strip()
+    ajustada["ajuste"] = "negativos"
+    return ajustada
+
+
 def _aplicar_fechas_centinela(accion: dict) -> dict:
     """Inyecta la lista vigente de DATAPULSE_FECHAS_CENTINELA en marcar_fecha_centinela."""
     if accion.get("accion") != "marcar_fecha_centinela":
@@ -2982,6 +3020,7 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
                 "fuente_decision": "knowledge_graph",
             }
             accion_col = _ajustar_por_skewness(accion_col, skewness)
+            accion_col = _ajustar_por_negativos(accion_col, diag.get("negativos"))
             acciones_col.append(_aplicar_fechas_centinela(accion_col))
 
         if not acciones_col and not fallbacks_col:
@@ -3129,8 +3168,12 @@ def _acciones_fallback(propuestas: Any, sin_regla: List[Dict[str, Any]]) -> List
     return aceptadas
 
 
-def _seccion_obligatoria(plan: List[Dict[str, Any]], sin_regla: List[Dict[str, Any]]) -> str:
-    """Bloque determinista del brief: las acciones exactas del plan y lo que queda sin regla."""
+def _seccion_obligatoria(plan: List[Dict[str, Any]], sin_regla: List[Dict[str, Any]],
+                        decisiones_negativos: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Bloque determinista del brief: las acciones exactas del plan, lo que queda
+    sin regla y qué columnas no pueden ver modificados sus negativos.
+    """
     acciones = [{k: a[k] for k in ("columna", "problema", "accion", "parametros", "fuente_decision")}
                 for a in plan]
     texto = ("\n\n## ACCIONES DEL PLAN (obligatorias, en este orden; las del grafo no se modifican)\n"
@@ -3138,6 +3181,13 @@ def _seccion_obligatoria(plan: List[Dict[str, Any]], sin_regla: List[Dict[str, A
     if sin_regla:
         texto += ("\n\n## PROBLEMAS SIN REGLA NI ACCIÓN (no tratarlos; se informan)\n"
                   + json.dumps(sin_regla, ensure_ascii=False, indent=2))
+    protegidas = {col: d["decision"] for col, d in (decisiones_negativos or {}).items()
+                  if d.get("decision") in ("validos", "incierto")}
+    if protegidas:
+        texto += ("\n\n## NEGATIVOS QUE NO SE MODIFICAN (obligatorio)\n"
+                  "Ninguna acción puede cambiar, recortar, imputar ni eliminar los valores "
+                  "negativos de estas columnas; solo se modifican negativos 'invalidos':\n"
+                  + json.dumps(protegidas, ensure_ascii=False, indent=2))
     return texto
 
 
@@ -3186,7 +3236,8 @@ def node_planificar(state: DataPulseState) -> DataPulseState:
     return {
         "plan_acciones": plan,
         "sin_regla": sin_resolver,
-        "brief_tecnico": brief + _seccion_obligatoria(plan, sin_resolver),
+        "brief_tecnico": brief + _seccion_obligatoria(plan, sin_resolver,
+                                                      state.get("decisiones_negativos")),
     }
 
 

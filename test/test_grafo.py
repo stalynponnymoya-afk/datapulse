@@ -42,10 +42,12 @@ def test_aristas_centinela_en_el_grafo():
     assert "knn" not in res["acciones"][0]["accion"].lower()
 
 
-def test_negativos_financieros_flag_y_nan():
+def test_negativos_financieros_set_nan_y_flag():
+    """Punto 5: la financiera deja flag_y_nan (no cubría montos positivos absurdos)."""
     res = _consultar("financiero", "valores_negativos_inesperados")
     accion = res["acciones"][0]
-    assert accion["accion"] == "flag_y_nan"
+    assert accion["accion"] == "set_nan_y_flag"
+    assert accion["parametros"]["aplica_a"] == ["negativos_inesperados", "fuera_de_rango_logico"]
     assert "clip_min" not in accion["parametros"]
 
 
@@ -149,22 +151,78 @@ def test_rango_invalido_set_nan_y_flag_sin_recorte():
                  "flag_suffix": "_rango_invalido"}
     por_origen = {u: d for u, d in reglas}
     for origen, confianza in (("Variable_Numerica_Continua", 0.83),
-                              ("Variable_Numerica_Discreta", 0.85)):
+                              ("Variable_Numerica_Discreta", 0.85),
+                              ("Variable_Financiera", 0.85)):
         d = por_origen[origen]
         assert d["accion"] == "set_nan_y_flag"
         assert d["parametros"] == esperados
         assert d["confianza"] == confianza
-        assert "NaN" in d["justificacion_es"] and "inventa un valor" in d["justificacion_es"]
-    # Variable_Financiera no cambia
-    assert por_origen["Variable_Financiera"]["accion"] == "flag_y_nan"
+        assert "NaN" in d["justificacion_es"] and "inventa" in d["justificacion_es"]
+    # Ninguna regla de Rango_Invalido conserva flag_y_nan (no cubría montos positivos absurdos)
+    assert all(d["accion"] == "set_nan_y_flag" for _, d in reglas)
     assert dp.kg.number_of_edges() == 142
 
 
 def test_rango_invalido_cubre_negativos_y_fuera_de_rango():
     """Las dos etiquetas que llegan a Rango_Invalido producen la misma acción."""
-    for tipo in ("numerica_continua", "numerica_discreta"):
+    for tipo in ("numerica_continua", "numerica_discreta", "financiero"):
         for etiqueta in ("valores_negativos_inesperados", "rango_invalido"):
             accion = _consultar(tipo, etiqueta)["acciones"][0]
             assert accion["accion"] == "set_nan_y_flag", (tipo, etiqueta)
             assert set(accion["parametros"]["aplica_a"]) == {
                 "negativos_inesperados", "fuera_de_rango_logico"}
+
+
+# ── Punto 5: la decisión de negativos limita las acciones ───────────────────
+
+def _consultar_con_decision(tipo, problemas, decision, col="col"):
+    diag = {col: {"tipo_inferido": tipo, "problemas": problemas, "negativos": decision}}
+    return dp.node_consultar_grafo({"diagnostico": diag})["acciones_grafo"][col]["acciones"]
+
+
+def test_edad_incierto_con_rango_invalido_solo_fuera_de_rango():
+    acciones = _consultar_con_decision("numerica_discreta",
+                                       ["negativos_inciertos", "rango_invalido"], "incierto")
+    rango = next(a for a in acciones if a["problema"] == "rango_invalido")
+    assert rango["accion"] == "set_nan_y_flag"
+    assert rango["parametros"]["aplica_a"] == ["fuera_de_rango_logico"]
+    assert "los negativos de esta columna son 'incierto'" in rango["justificacion_es"]
+    assert rango["ajuste"] == "negativos"
+    inciertos = next(a for a in acciones if a["problema"] == "negativos_inciertos")
+    assert inciertos["accion"] == "flag_sin_modificar"
+
+
+def test_monto_financiero_validos_con_rango_invalido_solo_fuera_de_rango():
+    acciones = _consultar_con_decision("financiero", ["rango_invalido"], "validos")
+    assert acciones[0]["accion"] == "set_nan_y_flag"
+    assert acciones[0]["parametros"]["aplica_a"] == ["fuera_de_rango_logico"]
+    assert "'validos'" in acciones[0]["justificacion_es"]
+
+
+def test_invalidos_mantiene_negativos_y_fuera_de_rango():
+    acciones = _consultar_con_decision("numerica_discreta", ["valores_negativos_inesperados"],
+                                       "invalidos")
+    assert acciones[0]["parametros"]["aplica_a"] == ["negativos_inesperados",
+                                                      "fuera_de_rango_logico"]
+    assert "ajuste" not in acciones[0]
+
+
+def test_centinelas_negativos_no_se_tocan_si_los_negativos_son_validos():
+    acciones = _consultar_con_decision("numerica_continua", ["nulos_disfrazados"], "validos")
+    assert acciones[0]["accion"] == "reemplazar_centinela_por_nan"
+    assert acciones[0]["parametros"]["centinelas"] == [999, 9999]
+    # Con "invalidos" la lista queda completa
+    acciones = _consultar_con_decision("numerica_continua", ["nulos_disfrazados"], "invalidos")
+    assert acciones[0]["parametros"]["centinelas"] == [-999, -9999, 999, 9999, -1]
+    # El grafo no se modifica
+    datos = dp.kg["Variable_Numerica_Continua"]["Valores_Centinela"][0]
+    assert datos["parametros"]["centinelas"] == [-999, -9999, 999, 9999, -1]
+
+
+def test_brief_prohibe_modificar_negativos_no_invalidos():
+    texto = dp._seccion_obligatoria([], [], {
+        "temperatura": {"decision": "validos"}, "x7": {"decision": "incierto"},
+        "edad": {"decision": "invalidos"}})
+    assert "NEGATIVOS QUE NO SE MODIFICAN" in texto
+    assert '"temperatura": "validos"' in texto and '"x7": "incierto"' in texto
+    assert '"edad"' not in texto
