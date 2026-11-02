@@ -190,10 +190,18 @@ Attempt limits are **total attempts**, the first one included:
   to a file that is already in GitHub (`github_file=`): it does not count as an upload, but its
   results would still be unreadable. In local mode, `node_commit` uploads only the script, the
   reports and `audit_log.json`; data files stay in `outputs/`.
-- **Masked samples.** Before sending column samples to the LLM, emails become `u***@domain`,
-  sequences of 6+ digits (IDs, phones, accounts) become `9`s of the same length, and
-  high-cardinality text columns (>50 % unique: names, free text) become a shape pattern
-  (`José Muñoz` → `Aaaa Aaaaa`). Low-cardinality categories are kept as they are.
+- **Masked samples.** Values are masked by type of personal data, not by cardinality: emails
+  become `u***@domain`, sequences of 6+ digits become `9`s of the same length, and person-name
+  columns (`nombre`, `apellido`, `name`… but not `Nombre_Producto`) become a shape pattern
+  (`José Muñoz` → `Aaaa Aaaaa`). Columns read mostly as numbers or dates are never masked, so
+  the LLM sees the real problems (negatives, extremes, impossible dates); the exception is
+  personal identifiers by column name (`cedula`, `telefono`, `cuenta`…), which are masked and
+  sent without statistics. Free text is only masked for emails and long digit sequences.
+- **What the LLM sees.** Besides the first rows, the metadata includes up to 3 anomalous values
+  per column (non-numeric values in numeric columns, IQR extremes, impossible dates), statistics
+  and non-numeric examples for numbers stored as text, negatives and zeros, date formats, and
+  index columns (consecutive unique integers such as `Row`), which are excluded when counting
+  duplicates.
 - **Generated code environment.** The locally generated script runs with a minimal environment
   (`PATH`, `HOME`, `LANG`, `PYTHONIOENCODING`) and no API keys. Full isolation (container without
   network) is planned for phase 2.
@@ -482,11 +490,19 @@ Los límites son **intentos totales**, incluido el primero:
   archivo que ya está en GitHub (`github_file=`): no cuenta como subida, pero sus resultados
   seguirían siendo ilegibles. En modo local, `node_commit` sube solo el script, los reportes y
   `audit_log.json`; los archivos de datos quedan en `outputs/`.
-- **Muestras enmascaradas.** Antes de enviar las muestras de cada columna al LLM, los emails pasan
-  a `u***@dominio`, las secuencias de 6 o más dígitos (cédulas, teléfonos, cuentas) a `9` de la
-  misma longitud y las columnas de texto de alta cardinalidad (>50 % únicos: nombres, texto libre)
-  a un patrón de forma (`José Muñoz` → `Aaaa Aaaaa`). Las categorías de baja cardinalidad se
-  mantienen tal cual.
+- **Muestras enmascaradas.** Se enmascara según el tipo de dato personal, no por cardinalidad: los
+  emails pasan a `u***@dominio`, las secuencias de 6 o más dígitos a `9` de la misma longitud y las
+  columnas de nombres de persona (`nombre`, `apellido`, `name`…, pero no `Nombre_Producto`) a un
+  patrón de forma (`José Muñoz` → `Aaaa Aaaaa`). Las columnas que se leen mayormente como número o
+  fecha nunca se enmascaran, para que el LLM vea los problemas reales (negativos, extremos, fechas
+  imposibles); la excepción son los identificadores personales por nombre de columna (`cedula`,
+  `telefono`, `cuenta`…), que se enmascaran y se envían sin estadísticos. En texto libre solo se
+  enmascaran emails y secuencias largas de dígitos.
+- **Qué ve el LLM.** Además de las primeras filas, la metadata incluye hasta 3 valores anómalos
+  por columna (no numéricos en columnas numéricas, extremos por IQR, fechas imposibles),
+  estadísticos y ejemplos de no numéricos en números guardados como texto, negativos y ceros,
+  formatos de fecha, y las columnas índice (enteros únicos consecutivos como `Row`), que se
+  excluyen al contar duplicados.
 - **Entorno del código generado.** El script generado en modo local se ejecuta con un entorno
   mínimo (`PATH`, `HOME`, `LANG`, `PYTHONIOENCODING`) y sin claves de API. El aislamiento completo
   (contenedor sin red) queda para la fase 2.

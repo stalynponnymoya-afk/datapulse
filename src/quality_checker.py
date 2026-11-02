@@ -214,14 +214,39 @@ def check_nulls(df):
 # CHECK 2: DUPLICADOS
 # =====================================================
 
+def columnas_indice(df) -> List[str]:
+    """
+    Columnas índice: enteros sin nulos, todos distintos y consecutivos
+    (p. ej. ``Row`` = 1..N). No son datos: hacen que cada fila parezca única
+    y esconden los duplicados reales.
+    """
+    indices = []
+    if len(df) < 2:
+        return indices
+    for col in df.columns:
+        serie = df[col]
+        if not pd.api.types.is_integer_dtype(serie) or pd.api.types.is_bool_dtype(serie):
+            continue
+        if serie.isna().any() or not serie.is_unique:
+            continue
+        if int(serie.max()) - int(serie.min()) == len(serie) - 1:
+            indices.append(col)
+    return indices
+
+
 def check_duplicates(df):
-    """Detecta filas completamente duplicadas."""
-    mask = df.duplicated(keep="first")
+    """
+    Detecta filas completamente duplicadas, sin tener en cuenta las columnas
+    índice (que harían que toda fila pareciera única).
+    """
+    ignoradas = columnas_indice(df)
+    datos = df.drop(columns=ignoradas) if 0 < len(ignoradas) < len(df.columns) else df
+    mask = datos.duplicated(keep="first")
     return {
-        "count": 
-        int(mask.sum()),
+        "count": int(mask.sum()),
         "pct": round(mask.sum() / len(df) * 100, 2),
         "first_indices": df[mask].index.tolist()[:10],
+        "columnas_ignoradas": [str(c) for c in ignoradas],
     }
 
 
@@ -425,6 +450,143 @@ def _parsear_fechas(values: pd.Series) -> pd.Series:
         if mejor is None or parsed.isna().sum() < mejor.isna().sum():
             mejor = parsed
     return mejor
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UTILIDADES DE ANÁLISIS POR COLUMNA (las usa la metadata que ve el LLM)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+UMBRAL_MAYORMENTE = 0.8          # fracción de valores para "mayormente numérica/fecha"
+_RE_COMA_DECIMAL = re.compile(r"^-?\d+,\d{1,2}$")
+
+
+def convertir_numerico(serie: pd.Series) -> pd.Series:
+    """
+    Convierte una columna a número valor a valor (NaN si no se puede).
+    Acepta coma decimal simple ("19,99"). Mantiene el índice de la serie.
+    """
+    if pd.api.types.is_numeric_dtype(serie) and not pd.api.types.is_bool_dtype(serie):
+        return serie.astype(float)
+    texto = serie.astype("string").str.strip()
+    texto = texto.where(~texto.str.match(_RE_COMA_DECIMAL, na=False),
+                        texto.str.replace(",", ".", regex=False))
+    return pd.to_numeric(texto, errors="coerce")
+
+
+def es_mayormente_numerica(serie: pd.Series, umbral: float = UMBRAL_MAYORMENTE) -> bool:
+    """Columna de texto/objeto cuyos valores no nulos son números en ≥ umbral."""
+    if pd.api.types.is_bool_dtype(serie) or pd.api.types.is_numeric_dtype(serie):
+        return False
+    no_nulos = serie.dropna()
+    if len(no_nulos) == 0:
+        return False
+    return convertir_numerico(no_nulos).notna().mean() >= umbral
+
+
+def extremos_iqr(numeros: pd.Series, factor: float = 1.5) -> pd.Series:
+    """Valores fuera de [Q1 - f·IQR, Q3 + f·IQR], del más alejado al menos."""
+    numeros = numeros.dropna()
+    if len(numeros) < 4:
+        return numeros.iloc[0:0]
+    q1, q3 = numeros.quantile(0.25), numeros.quantile(0.75)
+    iqr = q3 - q1
+    if iqr == 0:
+        return numeros.iloc[0:0]
+    bajo, alto = q1 - factor * iqr, q3 + factor * iqr
+    fuera = numeros[(numeros < bajo) | (numeros > alto)]
+    distancia = (fuera - bajo).abs().where(fuera < bajo, (fuera - alto).abs())
+    return fuera.loc[distancia.sort_values(ascending=False).index]
+
+
+_RE_FECHA_DMY = re.compile(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.]\d{2,4}$")
+
+
+def _prefiere_dia_primero(valores: pd.Series) -> bool:
+    """
+    Decide el orden día/mes de las fechas ambiguas (dd/mm vs mm/dd) con la
+    evidencia de la propia columna: un primer número > 12 solo puede ser día
+    y un segundo número > 12 solo puede ser día. En empate, día primero.
+    """
+    partes = valores.astype(str).str.extract(_RE_FECHA_DMY).dropna().astype(int)
+    if partes.empty:
+        return True
+    return int((partes[0] > 12).sum()) >= int((partes[1] > 12).sum())
+
+
+_RE_ANIO_PRIMERO = re.compile(r"^\d{4}[/\-.]")
+
+
+def _parsear_grupo(unicos: pd.Series, dia_primero: bool) -> pd.Series:
+    """Parsea valores únicos: inferencia rápida y, para los que fallan, uno a uno."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pref = pd.to_datetime(unicos, errors="coerce", dayfirst=dia_primero)
+        otra = pd.to_datetime(unicos, errors="coerce", dayfirst=not dia_primero)
+        mejor, resto = (otra, pref) if otra.isna().sum() < pref.isna().sum() else (pref, otra)
+        parsed = mejor.fillna(resto)
+        faltan = parsed.isna()
+        for dayfirst in (dia_primero, not dia_primero):
+            if not faltan.any():
+                break
+            parsed = parsed.fillna(pd.to_datetime(unicos[faltan], errors="coerce",
+                                                  format="mixed", dayfirst=dayfirst))
+            faltan = parsed.isna()
+    return parsed
+
+
+def parsear_fechas_flexible(valores: pd.Series) -> pd.Series:
+    """
+    Parsea fechas en formatos mezclados (ISO, dd/mm/aaaa, aaaa/mm/dd...).
+
+    Las fechas que empiezan por el año se leen siempre año-mes-día. En las que
+    empiezan por día o mes, el orden de las ambiguas (10/02) sale de la
+    evidencia de la columna. Trabaja sobre valores únicos: inferencia rápida y
+    solo los que fallan se parsean uno a uno (format="mixed").
+    """
+    texto = valores.astype(str).str.strip()
+    unicos = pd.Series(texto.unique(), dtype=object)
+    anio_primero = unicos.str.match(_RE_ANIO_PRIMERO)
+    parsed = pd.Series(pd.NaT, index=unicos.index, dtype="datetime64[ns]")
+    if anio_primero.any():
+        parsed[anio_primero] = _parsear_grupo(unicos[anio_primero].reset_index(drop=True),
+                                              dia_primero=False).to_numpy()
+    if (~anio_primero).any():
+        resto = unicos[~anio_primero].reset_index(drop=True)
+        parsed[~anio_primero] = _parsear_grupo(resto, _prefiere_dia_primero(resto)).to_numpy()
+    mapa = dict(zip(unicos, parsed))
+    return pd.Series([mapa[v] for v in texto], index=valores.index, dtype="datetime64[ns]")
+
+
+def es_mayormente_fecha(serie: pd.Series, umbral: float = UMBRAL_MAYORMENTE) -> bool:
+    """
+    Columna de texto que parece de fechas (por nombre o porque ≥50 % tiene
+    forma de fecha) y cuyos valores se parsean como fecha en ≥ umbral.
+    """
+    if pd.api.types.is_datetime64_any_dtype(serie):
+        return True
+    if pd.api.types.is_numeric_dtype(serie) or pd.api.types.is_bool_dtype(serie):
+        return False
+    no_nulos = serie.dropna().astype(str)
+    if len(no_nulos) == 0:
+        return False
+    if not _nombre_contiene(serie.name, PALABRAS_FECHA) and \
+            no_nulos.str.match(_PATRON_FECHA).mean() < 0.5:
+        return False
+    return parsear_fechas_flexible(no_nulos).notna().mean() >= umbral
+
+
+def fechas_imposibles(serie: pd.Series) -> pd.Series:
+    """Valores que no son una fecha válida en ningún formato o están fuera de 1900..hoy+5 años."""
+    if pd.api.types.is_datetime64_any_dtype(serie):
+        fechas = serie.dropna()
+        valores = fechas
+    else:
+        valores = serie.dropna().astype(str)
+        valores = valores[valores.str.strip() != ""]
+        fechas = parsear_fechas_flexible(valores)
+    limite = pd.Timestamp.now().normalize() + pd.DateOffset(years=5)
+    malas = fechas.isna() | (fechas < pd.Timestamp("1900-01-01")) | (fechas > limite)
+    return valores[malas]
 
 
 def check_invalid_dates(df):

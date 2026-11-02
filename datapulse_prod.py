@@ -37,8 +37,17 @@ if _REPO_ROOT not in sys.path:
 from src.quality_checker import (  # noqa: E402
     PALABRAS_NEGATIVOS_PERMITIDOS,
     PALABRAS_NO_NEGATIVAS,
+    _nombre_contiene,
+    check_duplicates,
+    columnas_indice,
+    convertir_numerico,
+    es_mayormente_fecha,
+    es_mayormente_numerica,
+    extremos_iqr,
+    fechas_imposibles,
     generate_report_df,
     load_dataset,
+    parsear_fechas_flexible,
 )
 
 # ════════════════════════════════════════════════
@@ -2321,19 +2330,107 @@ def _enmascarar_valor(valor: str) -> str:
     return _RE_DIGITOS_LARGOS.sub(lambda m: "9" * len(m.group(0)), valor)
 
 
-def _enmascarar_muestra(serie: pd.Series, muestra: List[str]) -> List[str]:
-    """
-    Enmascara la muestra de una columna antes de enviarla al LLM.
+# Columnas de nombres de persona (se reducen a su forma: "José Muñoz" → "Aaaa Aaaaa").
+PALABRAS_NOMBRE_PERSONA = (
+    "nombre", "nombres", "name", "names", "apellido", "apellidos",
+    "surname", "lastname", "firstname", "fullname",
+)
+# ...salvo que el nombre sea de otra cosa (producto, ciudad, archivo...)
+PALABRAS_NOMBRE_NO_PERSONA = (
+    "producto", "product", "articulo", "item", "archivo", "file", "empresa", "company",
+    "tienda", "store", "ciudad", "city", "pais", "country", "categoria", "category",
+    "marca", "brand", "calle", "street", "columna", "column", "campo", "field",
+)
+# Identificadores y contactos personales: aunque la columna sea numérica, sus
+# secuencias de 6+ dígitos se enmascaran (cédulas, teléfonos, cuentas...).
+PALABRAS_ID_PERSONAL = (
+    "cedula", "dni", "rut", "nif", "nie", "curp", "rfc", "ssn", "pasaporte", "passport",
+    "documento", "telefono", "phone", "celular", "movil", "mobile", "cuenta", "account",
+    "tarjeta", "card", "iban",
+)
 
-    - Texto de cardinalidad > 50 % (nombres, texto libre) → patrón de forma.
-    - Resto → emails como u***@dominio y secuencias de 6+ dígitos con 9.
-    - Las categorías de baja cardinalidad quedan tal cual.
+MAX_MUESTRA = 3
+MAX_ANOMALOS = 3
+MAX_EJEMPLOS_NO_NUMERICOS = 5
+
+
+def _es_columna_nombre(col) -> bool:
+    return _nombre_contiene(col, PALABRAS_NOMBRE_PERSONA) and \
+        not _nombre_contiene(col, PALABRAS_NOMBRE_NO_PERSONA)
+
+
+def _lectura_columna(serie: pd.Series, indices) -> str:
+    """Cómo se lee la columna: indice, booleana, numerica, mayormente_numerica, fecha o texto."""
+    if serie.name in indices:
+        return "indice"
+    if pd.api.types.is_bool_dtype(serie):
+        return "booleana"
+    if pd.api.types.is_numeric_dtype(serie):
+        return "numerica"
+    if pd.api.types.is_datetime64_any_dtype(serie):
+        return "fecha"
+    if es_mayormente_numerica(serie):
+        return "mayormente_numerica"
+    if es_mayormente_fecha(serie):
+        return "fecha"
+    return "texto"
+
+
+def _enmascarador(col, lectura: str):
     """
-    no_nulos = serie.dropna()
-    es_texto = not pd.api.types.is_numeric_dtype(serie) and not pd.api.types.is_bool_dtype(serie)
-    if es_texto and len(no_nulos) > 0 and no_nulos.nunique() / len(no_nulos) > 0.5:
-        return [_patron_forma(v) for v in muestra]
-    return [_enmascarar_valor(v) for v in muestra]
+    Función de enmascarado según el tipo de dato personal de la columna:
+    - nombres de persona → patrón de forma;
+    - texto → emails (u***@dominio) y secuencias de 6+ dígitos (9…9);
+    - columnas que se leen como número o fecha → NUNCA se enmascaran, salvo
+      identificadores/contactos personales (cédula, teléfono...) → 6+ dígitos.
+    """
+    if lectura in ("numerica", "mayormente_numerica", "fecha", "indice", "booleana"):
+        return _enmascarar_valor if _nombre_contiene(col, PALABRAS_ID_PERSONAL) else (lambda v: v)
+    if _es_columna_nombre(col):
+        return _patron_forma
+    return _enmascarar_valor
+
+
+def _enmascarar_muestra(serie: pd.Series, muestra: List[str]) -> List[str]:
+    """Enmascara valores de una columna según su tipo de dato personal (no por cardinalidad)."""
+    funcion = _enmascarador(serie.name, _lectura_columna(serie, columnas_indice(serie.to_frame())))
+    return [funcion(v) for v in muestra]
+
+
+def _num(valor) -> Optional[float]:
+    """float JSON-serializable (None si es NaN)."""
+    return None if valor is None or pd.isna(valor) else float(valor)
+
+
+def _resumen_numerico(numeros: pd.Series) -> Dict[str, Any]:
+    numeros = numeros.dropna()
+    return {
+        "min": _num(numeros.min()) if len(numeros) else None,
+        "max": _num(numeros.max()) if len(numeros) else None,
+        "mean": _num(numeros.mean()) if len(numeros) else None,
+        "std": _num(numeros.std()) if len(numeros) > 1 else None,
+        "skewness": _num(numeros.skew()) if len(numeros) > 2 else None,
+        "negativos": int((numeros < 0).sum()),
+        "ceros": int((numeros == 0).sum()),
+    }
+
+
+def _formato_valor(v) -> str:
+    """Texto de un valor para la muestra (sin '.0' en enteros guardados como float)."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _unicos(valores, limite: int) -> List[str]:
+    vistos = []
+    for v in valores:
+        texto = _formato_valor(v)
+        if texto not in vistos:
+            vistos.append(texto)
+        if len(vistos) >= limite:
+            break
+    return vistos
 
 
 def _enmascarado_activo() -> bool:
@@ -2343,42 +2440,91 @@ def _enmascarado_activo() -> bool:
 
 def serialize_metadata(df: pd.DataFrame, filename: str) -> dict:
     """
-    Produce la metadata estructurada exacta del documento del proyecto.
+    Metadata estructurada que recibe el LLM para diagnosticar.
 
-    La muestra de cada columna se enmascara antes de enviarse al LLM
-    (desactivable con DATAPULSE_ENMASCARAR=0).
+    Además de nulos, cardinalidad y una muestra de las primeras filas, expone
+    los problemas que una muestra corta no deja ver:
+    - columnas índice (enteros únicos consecutivos), excluidas de duplicados;
+    - en columnas mayormente numéricas guardadas como texto: estadísticos de la
+      parte convertible y conteo/ejemplos de los valores no numéricos;
+    - negativos y ceros en columnas numéricas;
+    - formatos y fechas imposibles en columnas de fecha;
+    - muestra_anomala: hasta 3 valores problemáticos (no numéricos, extremos
+      por IQR, fechas imposibles).
+    Los valores se enmascaran según el tipo de dato personal (desactivable con
+    DATAPULSE_ENMASCARAR=0); las columnas de números y fechas no se enmascaran.
     """
     enmascarar = _enmascarado_activo()
+    indices = columnas_indice(df)
     cols_info = {}
     for col in df.columns:
         s = df[col]
-        muestra = s.dropna().head(3).astype(str).tolist()
-        if enmascarar:
-            muestra = _enmascarar_muestra(s, muestra)
+        no_nulos = s.dropna()
+        lectura = _lectura_columna(s, indices)
+        mascara = _enmascarador(col, lectura) if enmascarar else (lambda v: v)
+
         info = {
             "dtype_pandas": str(s.dtype),
+            "lectura": lectura,
             "null_count": int(s.isna().sum()),
             "null_pct": round(s.isna().mean() * 100, 2),
             "unique_count": int(s.nunique(dropna=False)),
-            "muestra": muestra,
+            "muestra": [mascara(_formato_valor(v)) for v in no_nulos.head(MAX_MUESTRA)],
         }
-        if pd.api.types.is_numeric_dtype(s):
-            info["min"] = float(s.min()) if not pd.isna(s.min()) else None
-            info["max"] = float(s.max()) if not pd.isna(s.max()) else None
-            info["mean"] = float(s.mean()) if not pd.isna(s.mean()) else None
-            info["std"] = float(s.std()) if not pd.isna(s.std()) else None
-            info["skewness"] = float(s.skew()) if not pd.isna(s.skew()) else None
+        anomalos: List[str] = []
+        # Identificadores personales (cédula, teléfono...): ni estadísticos ni
+        # extremos, porque mostrarían los valores reales.
+        id_personal = enmascarar and _nombre_contiene(col, PALABRAS_ID_PERSONAL)
+
+        if lectura in ("numerica", "mayormente_numerica") and id_personal:
+            info["identificador_personal"] = True
+            numeros = convertir_numerico(no_nulos)
+            info["negativos"] = int((numeros < 0).sum())
+            info["ceros"] = int((numeros == 0).sum())
+        elif lectura == "indice":
+            info["es_indice"] = True
+            info.update({"min": _num(s.min()), "max": _num(s.max())})
+        elif lectura == "numerica":
+            info.update(_resumen_numerico(s.astype(float)))
+            anomalos = _unicos(extremos_iqr(s.astype(float)), MAX_ANOMALOS)
+        elif lectura == "mayormente_numerica":
+            numeros = convertir_numerico(no_nulos)
+            no_numericos = no_nulos[numeros.isna()]
+            info["pct_numerico"] = round(numeros.notna().mean() * 100, 2)
+            info.update(_resumen_numerico(numeros))
+            info["no_numericos"] = {
+                "conteo": int(len(no_numericos)),
+                "ejemplos": [mascara(v) for v in _unicos(no_numericos, MAX_EJEMPLOS_NO_NUMERICOS)],
+            }
+            anomalos = _unicos(list(no_numericos.unique()[:2]) + list(extremos_iqr(numeros)),
+                               MAX_ANOMALOS)
+        elif lectura == "fecha":
+            imposibles = fechas_imposibles(s)
+            info["fechas_imposibles"] = int(len(imposibles))
+            if not pd.api.types.is_datetime64_any_dtype(s):
+                formas = no_nulos.astype(str).str.strip().str.replace(r"\d", "9", regex=True)
+                info["formatos_fecha"] = {k: int(v) for k, v in formas.value_counts().head(5).items()}
+                validas = parsear_fechas_flexible(no_nulos).dropna()
+            else:
+                validas = no_nulos
+            if len(validas):
+                info["rango_fechas"] = {"min": str(validas.min().date()), "max": str(validas.max().date())}
+            anomalos = _unicos(imposibles, MAX_ANOMALOS)
+
+        if lectura in ("numerica", "mayormente_numerica", "fecha") and not id_personal:
+            info["muestra_anomala"] = [mascara(v) for v in anomalos]
         cols_info[col] = info
 
-    dupes = int(df.duplicated().sum())
+    duplicados = check_duplicates(df)
     return {
         "filename": filename,
         "formato": filename.split(".")[-1].lower(),
         "filas": len(df),
         "columnas": len(df.columns),
         "columnas_info": cols_info,
-        "duplicados_exactos": dupes,
-        "duplicados_pct": round(dupes / len(df) * 100, 2) if len(df) > 0 else 0.0
+        "columnas_indice": [str(c) for c in indices],
+        "duplicados_exactos": duplicados["count"],
+        "duplicados_pct": float(duplicados["pct"]),
     }
 
 
@@ -2432,8 +2578,8 @@ REGLAS CRÍTICAS DE DIAGNÓSTICO (aplican a CUALQUIER dataset, dominio o idioma)
    - Columna numérica con nulo + negativo → ["nulos_bajos", "valores_negativos_inesperados"]
    - Columna de texto con espacios + casing mixto → ["espacios_extra", "inconsistencia_formato"]
    - Columna ID con duplicados + valores faltantes → ["duplicados", "nulos_bajos"]
-6. DUPLICADOS DE FILAS: Si unique_count del ID principal es menor que el total de filas, hay filas duplicadas. Reportar en la columna ID con "duplicados".
-7. TIPOS MIXTOS: Si dtype es object pero la muestra tiene mezcla de números y texto → "tipos_mixtos".
+6. DUPLICADOS DE FILAS: "duplicados_exactos" cuenta filas idénticas sin tener en cuenta las columnas índice. Si es > 0, o si unique_count del ID principal es menor que el total de filas, reportar "duplicados" en la columna ID.
+7. TIPOS MIXTOS: Si lectura es "mayormente_numerica" (números guardados como texto, con "no_numericos" > 0) o la muestra mezcla números y texto → "tipos_mixtos". Los ejemplos de "no_numericos" muestran qué hay que convertir (p. ej. números escritos en palabras).
 8. CARDINALIDAD: unique_count / total_filas > 80% en texto → "cardinalidad_excesiva". < 10 valores únicos en numérica → puede ser discreta o categórica.
 9. COLUMNAS CONSTANTES: Si unique_count == 1 (o == 2 con nulos) → "valores_constantes".
 10. SKEWNESS: |skewness| > 1 → "numerica_continua_sesgada". |skewness| <= 1 → "numerica_continua_simetrica".
@@ -2443,6 +2589,14 @@ Reglas de severidad:
 - null_pct 5-30% O un problema adicional → media
 - null_pct 30-60% O centinela O negativo inesperado → alta
 - null_pct >= 60% O centinelas absurdos O múltiples problemas críticos → critica
+
+CÓMO LEER LA METADATA:
+- lectura: cómo se lee la columna (indice, numerica, mayormente_numerica, fecha, texto, booleana).
+- muestra: los primeros valores no nulos. muestra_anomala: hasta 3 valores problemáticos (no numéricos en una columna numérica, extremos por IQR, fechas imposibles). Úsala: ahí están los problemas que la muestra no enseña.
+- min, max, mean, std, skewness, negativos, ceros: en columnas numéricas y mayormente numéricas (calculados sobre la parte convertible).
+- fechas_imposibles, formatos_fecha, rango_fechas: en columnas de fecha. Varios formatos_fecha → "inconsistencia_formato"; fechas_imposibles > 0 → también.
+- columnas_indice / es_indice: columnas índice (enteros únicos consecutivos, como "Row"). No son datos: diagnostícalas como "identificador" con problema "ninguno".
+- Enmascarado de datos personales: los emails aparecen como u***@dominio, las secuencias de 6 o más dígitos como 9…9 y las columnas de nombres de persona como su forma ("Aaaa Aaaaa"). Es un efecto del enmascarado, NO un problema del dato: no lo diagnostiques como formato inválido. Las columnas de números y fechas nunca se enmascaran, salvo las de identificadores personales (identificador_personal: true), que llegan sin estadísticos.
 
 FORMATO DE SALIDA (obligatorio):
 Un objeto JSON cuyas claves son EXACTAMENTE los nombres de columna que aparecen en "columnas_info" de la metadata (todas, escritas igual) y cuyo valor es el objeto de diagnóstico de esa columna. No añadas ninguna otra clave: nada de resúmenes, notas generales ni envoltorios como "diagnostico" o "columnas".
