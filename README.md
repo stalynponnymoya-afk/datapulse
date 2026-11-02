@@ -68,7 +68,7 @@ The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **139 rules (edges)**: 1
 
 Each rule contains: action, confidence score (between 0.78 and 1.0), parameters, and bilingual justification.
 
-When the graph has no rule for a specific case, the decision falls back to the LLM with a maximum confidence of 0.70.
+**The graph is the only source of cleaning rules.** The labels the LLM can use in its diagnosis are generated from the graph itself (every node is offered, with its aliases or its own name), so any rule a user adds is reachable without touching code or prompts. The plan contains exactly the graph actions and parameters; the LLM only orders them and writes the brief for OpenHands. Problems without a rule in the graph are not cleaned by the LLM: they are listed as "without rule" and reported at the end.
 
 ### What It Produces
 
@@ -367,7 +367,7 @@ El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **139 reglas (arist
 
 Cada regla contiene: acción, confianza (entre 0,78 y 1,0), parámetros y justificación bilingüe.
 
-Cuando el grafo no tiene regla para un caso específico, la decisión cae al LLM con confianza máxima de 0.70.
+**El grafo es la única fuente de reglas de limpieza.** Las etiquetas que el LLM puede usar en el diagnóstico se generan desde el propio grafo (se ofrece cada nodo, con sus alias o su propio nombre), así que cualquier regla que el usuario agregue es alcanzable sin tocar código ni prompts. El plan contiene exactamente las acciones y parámetros del grafo; el LLM solo las ordena y redacta el brief para OpenHands. Los problemas sin regla en el grafo no los limpia el LLM por su cuenta: quedan como "sin regla" y se informan al final.
 
 ### Qué Produce
 

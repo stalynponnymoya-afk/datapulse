@@ -35,8 +35,6 @@ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 from src.quality_checker import (  # noqa: E402
-    PALABRAS_NEGATIVOS_PERMITIDOS,
-    PALABRAS_NO_NEGATIVAS,
     _nombre_contiene,
     check_duplicates,
     columnas_indice,
@@ -297,6 +295,8 @@ PROBLEMA_MAP = {
 
 # Problemas estructurales que no dependen del tipo de variable: sus reglas
 # cuelgan del nodo origen "Esquema_General" en el grafo de conocimiento.
+NODO_ESQUEMA_GENERAL = "Esquema_General"
+
 ESQUEMA_GENERAL_TARGETS = {
     "Duplicados_Registros",
     "Valores_Constantes",
@@ -1983,8 +1983,9 @@ class DataPulseState(TypedDict):
     diagnostico: Dict[str, Any]
     acciones_grafo: Dict[str, Any]
 
-    # Planificación
+    # Planificación (solo acciones del grafo)
     plan_acciones: List[Dict[str, Any]]
+    sin_regla: List[Dict[str, Any]]   # problemas detectados sin regla en el grafo
     brief_tecnico: str
 
     # Ejecución
@@ -2548,23 +2549,12 @@ def node_ingestar(state: DataPulseState) -> DataPulseState:
 DIAGNOSTIC_PROMPT = """Eres un ingeniero de datos senior especializado en calidad de datos. Analiza la metadata del dataset y devuelve UN SOLO JSON válido (sin markdown, sin explicaciones) con el diagnóstico por columna.
 
 Para cada columna, infiere estos campos:
-- tipo_inferido: uno de [numerica_continua_simetrica, numerica_continua_sesgada, numerica_discreta, binaria, categorica_nominal, categorica_ordinal, temporal_fecha_puntual, temporal_serie, texto_libre, identificador, contacto, financiero, signo_vital, laboratorio, codigo_medico, fecha_clinica, tasa_interes, ratio_financiero, indicador_economico, exposicion, incidente]
+- tipo_inferido: UNA etiqueta de esta lista. Cada línea es un tipo de variable del Grafo de Conocimiento (entre paréntesis) con las etiquetas que lo representan:
+{vocabulario_tipos}
 - dtype_actual: el dtype de pandas
-- problemas: LISTA de todos los problemas detectados (puede tener varios). Valores posibles:
-    nulos_bajos, nulos_medios, nulos_altos, nulos_criticos,
-    outlier_severo, outlier_extremo,
-    nulos_disfrazados,          ← valores centinela como -999, -1, 9999, 99, 0 en contextos donde 0 es inválido
-    duplicados,                 ← solo para filas enteras o columnas identificador con valores repetidos
-    inconsistencia_formato,     ← mezcla de formatos (fechas, emails, teléfonos inválidos)
-    tipo_incorrecto,            ← columna debería ser numérica pero es object
-    escala_diferente,
-    cardinalidad_baja, cardinalidad_media, cardinalidad_excesiva,
-    colinealidad_alta,
-    valores_negativos_inesperados, ← negativos en columnas que deberían ser ≥0 (ver regla 4)
-    rango_clinico_invalido, codigo_medico_invalido, fecha_clinica_inconsistente,
-    rango_financiero_invalido, consistencia_contable, rango_economico_invalido,
-    rango_ocupacional_invalido, exposicion_limite_excedido,
-    ninguno
+- problemas: LISTA de todos los problemas detectados (puede tener varios). Cada línea es un problema que el Grafo de Conocimiento sabe tratar (entre paréntesis) con sus etiquetas:
+{vocabulario_problemas}
+    Si detectas un problema real que no corresponde a ninguna etiqueta, inclúyelo igualmente con una etiqueta descriptiva en snake_case: quedará registrado como problema sin regla en el grafo (se informa, no se limpia). Si la columna no tiene problemas, usa "ninguno".
 - problema_principal: el problema más crítico de la lista (una sola cadena)
 - severidad: uno de [baja, media, alta, critica]
 - detalle: descripción concreta de cada problema encontrado. Incluir valores específicos si los ves en la muestra.
@@ -2573,7 +2563,7 @@ REGLAS CRÍTICAS DE DIAGNÓSTICO (aplican a CUALQUIER dataset, dominio o idioma)
 1. CENTINELAS: Valores como -999, -1, -9999, 9999, 999, 99, 0 en contextos donde 0 es inválido (edad, ID, presión) → "nulos_disfrazados", NO "outlier_severo". Detectar por: min/max extremos que no tienen sentido en el contexto de la columna. En texto y categorías, cadenas como "N/A", "null", "na", "None" o vacías también son "nulos_disfrazados". En fechas, una fecha marcador repetida (p. ej. 1900-01-01) → "nulos_disfrazados".
 2. FORMATO TEXTO: Si la muestra contiene strings que no cumplen el patrón esperado del dominio (emails sin @, teléfonos con letras, fechas con formato mixto, códigos con longitud incorrecta) → "inconsistencia_formato".
 3. IDENTIFICADORES: Columnas con nombres que contengan id, cod, code, num, key, clave, folio, ticket, cedula, rut, dni, ssn, nit, rfc → tipo "identificador". Si unique_count < total filas → añadir "duplicados".
-4. NEGATIVOS INESPERADOS: Valores negativos en columnas cuyo nombre contenga alguna de estas palabras: {lista_no_negativos} → "valores_negativos_inesperados". EXCEPCIÓN: si el nombre contiene {lista_negativos_permitidos}, los negativos SÍ son válidos (saldos y márgenes pueden ser negativos), aunque también contenga una palabra de la lista anterior. En cualquier otra columna (longitud geográfica, beneficio, variación, temperatura…) un negativo no es un error por sí mismo.
+4. NEGATIVOS INESPERADOS: usa los campos "negativos" y "min" de la metadata. Si por el significado de la columna un valor negativo no tiene sentido → "valores_negativos_inesperados". Un negativo no es un error por sí mismo: decide según lo que mide la columna.
 5. MÚLTIPLES PROBLEMAS: Cada columna debe listar TODOS sus problemas. Ejemplos genéricos:
    - Columna numérica con nulo + negativo → ["nulos_bajos", "valores_negativos_inesperados"]
    - Columna de texto con espacios + casing mixto → ["espacios_extra", "inconsistencia_formato"]
@@ -2606,12 +2596,45 @@ Metadata:
 
 Responde SOLO con el JSON. No incluyas ```json ni ```."""
 
+def _nodos_grafo() -> tuple:
+    """(nodos tipo, nodos problema) que tienen alguna regla en el grafo vigente."""
+    tipos = sorted({u for u, _ in kg.edges() if u != NODO_ESQUEMA_GENERAL})
+    problemas = sorted({v for _, v in kg.edges()})
+    return tipos, problemas
+
+
+def _etiquetas_nodo(nodo: str, mapa: Dict[str, Any]) -> List[str]:
+    """Etiquetas que el LLM puede usar para un nodo: sus alias y su propio nombre."""
+    etiquetas = [alias for alias, destino in mapa.items() if destino == nodo]
+    propio = nodo.lower()
+    if propio not in etiquetas:
+        etiquetas.append(propio)
+    return etiquetas
+
+
+def vocabulario_grafo() -> Dict[str, Dict[str, List[str]]]:
+    """
+    Vocabulario que se ofrece al LLM, generado del grafo vigente: así cualquier
+    nodo que el usuario agregue (aunque no tenga alias) es alcanzable.
+    """
+    tipos, problemas = _nodos_grafo()
+    return {
+        "tipos": {n: _etiquetas_nodo(n, TIPO_MAP) for n in tipos},
+        "problemas": {n: _etiquetas_nodo(n, PROBLEMA_MAP) for n in problemas},
+    }
+
+
 def construir_prompt_diagnostico(metadata: dict) -> str:
-    """Rellena DIAGNOSTIC_PROMPT; la regla 4 sale de las constantes de quality_checker."""
+    """Rellena DIAGNOSTIC_PROMPT con la metadata y el vocabulario del grafo vigente."""
+    vocab = vocabulario_grafo()
+
+    def _lineas(nodos):
+        return "\n".join(f"    · {', '.join(etiquetas)}  ({nodo})" for nodo, etiquetas in nodos.items())
+
     return DIAGNOSTIC_PROMPT.format(
         metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2),
-        lista_no_negativos=", ".join(PALABRAS_NO_NEGATIVAS),
-        lista_negativos_permitidos=", ".join(PALABRAS_NEGATIVOS_PERMITIDOS),
+        vocabulario_tipos=_lineas(vocab["tipos"]),
+        vocabulario_problemas=_lineas(vocab["problemas"]),
     )
 
 
@@ -2695,14 +2718,27 @@ def _map_tipo_problema(tipo_inferido: str, problema: str) -> tuple:
     tanto las reglas estadísticas base como las reglas de dominio (Salud,
     Finanzas, Economía y Seguridad Ocupacional).
 
+    Si la etiqueta no es un alias, se acepta el nombre del nodo tal cual (sin
+    distinguir mayúsculas), de modo que un nodo nuevo del usuario es alcanzable
+    sin tocar los mapas.
+
     Retorna (source_node, target_node) o (None, None) si no hay match.
     """
-    src = TIPO_MAP.get(tipo_inferido)
-    tgt = PROBLEMA_MAP.get(problema)
-    return src, tgt
+    tipos, problemas = _nodos_grafo()
+    return (_resolver_etiqueta(tipo_inferido, TIPO_MAP, tipos),
+            _resolver_etiqueta(problema, PROBLEMA_MAP, problemas))
 
 
-UMBRAL_SKEWNESS = 1.0
+def _resolver_etiqueta(etiqueta, mapa: Dict[str, Any], nodos: List[str]) -> Optional[str]:
+    """Alias del mapa o, si no, el nombre de un nodo del grafo (sin distinguir mayúsculas)."""
+    if not isinstance(etiqueta, str) or not etiqueta.strip():
+        return None
+    if etiqueta in mapa:
+        return mapa[etiqueta]
+    buscada = etiqueta.strip().lower()
+    if buscada in mapa:
+        return mapa[buscada]
+    return next((n for n in nodos if n.lower() == buscada), None)
 
 
 def _aplicar_fechas_centinela(accion: dict) -> dict:
@@ -2718,41 +2754,12 @@ def _aplicar_fechas_centinela(accion: dict) -> dict:
     return ajustada
 
 
-def _ajustar_por_skewness(accion: dict, skewness: Optional[float]) -> dict:
-    """
-    Si la variable está sesgada (|skewness| > 1 según la metadata real, no la
-    etiqueta del LLM) y la acción es fillna_mean, la cambia por fillna_median.
-    """
-    if accion.get("accion") != "fillna_mean" or skewness is None:
-        return accion
-    try:
-        sesgo = float(skewness)
-    except (TypeError, ValueError):
-        return accion
-    if abs(sesgo) <= UMBRAL_SKEWNESS:
-        return accion
-    ajustada = dict(accion)
-    ajustada["accion"] = "fillna_median"
-    ajustada["parametros"] = {**(accion.get("parametros") or {}), "strategy": "median"}
-    ajustada["justificacion_es"] = (
-        f"{accion.get('justificacion_es') or ''} [Ajuste: |skewness| = {abs(sesgo):.2f} > "
-        f"{UMBRAL_SKEWNESS:g} en la metadata; la media está sesgada, se usa la mediana.]"
-    ).strip()
-    ajustada["justificacion_en"] = (
-        f"{accion.get('justificacion_en') or ''} [Adjusted: |skewness| = {abs(sesgo):.2f} > "
-        f"{UMBRAL_SKEWNESS:g} in metadata; the mean is skewed, median is used.]"
-    ).strip()
-    ajustada["ajuste"] = "skewness"
-    return ajustada
-
-
 def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
     global kg
     if kg is None:
         raise RuntimeError("El grafo de conocimiento (kg) no ha sido cargado.")
 
     diagnostico = state["diagnostico"]
-    columnas_info = (state.get("metadata") or {}).get("columnas_info", {})
     acciones = {}
 
     for col_name, diag in diagnostico.items():
@@ -2761,7 +2768,6 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             print(f"   ⚠️ Se omite '{col_name}': su diagnóstico no es un objeto ({type(diag).__name__}).")
             continue
         tipo = diag.get("tipo_inferido", "")
-        skewness = (columnas_info.get(col_name) or {}).get("skewness")
 
         # Soportar tanto "problema" (string, formato anterior)
         # como "problemas" (lista, formato nuevo multi-problema)
@@ -2791,11 +2797,11 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             if src is not None and kg.has_edge(src, tgt):
                 for key, data in kg[src][tgt].items():
                     edges_data.append(data)
-            if not edges_data and tgt in ESQUEMA_GENERAL_TARGETS and kg.has_edge("Esquema_General", tgt):
+            if not edges_data and kg.has_edge(NODO_ESQUEMA_GENERAL, tgt):
                 # Problemas estructurales (duplicados, filas/columnas vacías,
                 # valores constantes, encoding) no dependen del tipo de variable:
                 # la regla vive bajo el nodo origen "Esquema_General".
-                for key, data in kg["Esquema_General"][tgt].items():
+                for key, data in kg[NODO_ESQUEMA_GENERAL][tgt].items():
                     edges_data.append(data)
             if not edges_data:
                 fallbacks_col.append(problema)
@@ -2810,7 +2816,6 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
                 "justificacion_en": best.get("justificacion_en"),
                 "fuente_decision": "knowledge_graph",
             }
-            accion_col = _ajustar_por_skewness(accion_col, skewness)
             acciones_col.append(_aplicar_fechas_centinela(accion_col))
 
         if not acciones_col and not fallbacks_col:
@@ -2829,63 +2834,121 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. NODE 4 — PLANIFICAR (Groq resuelve fallbacks + ordena)
+# 7. NODE 4 — PLANIFICAR (el plan sale del grafo; el LLM ordena y explica)
 # ═══════════════════════════════════════════════════════════════
 
-PLANIFICAR_PROMPT = """Eres el planificador técnico de DataPulse. Recibes el análisis multi-problema por columna del grafo de conocimiento.
+PLANIFICAR_PROMPT = """Eres el planificador técnico de DataPulse. Las decisiones de limpieza YA están tomadas: son las acciones que el Grafo de Conocimiento (las reglas del usuario) eligió para cada columna. Tu trabajo es solo ordenarlas y explicárselas a OpenHands.
 
-Tu trabajo:
-A) Cada columna puede tener MÚLTIPLES acciones (una por problema). Incluye TODAS en el plan, no solo la primera.
-B) Para problemas_fallback (sin regla en el grafo), decide la acción más apropiada. Máx. confianza: 0.70. fuente_decision: "llm_fallback".
-C) Trata centinelas correctamente: si ves nulos_disfrazados con valores como -999 (o cadenas como "N/A" en texto), la acción es REEMPLAZAR ese valor por NaN (no winsorizar). EXCEPCIÓN — fechas: las fechas centinela (marcar_fecha_centinela) SOLO se marcan con un flag; NUNCA se reemplazan ni se imputan.
-D) Trata negativos correctamente: si ves valores_negativos_inesperados en edad/precio/cantidad, la acción es FLAG + reemplazar por NaN (no recortar a 0 sin revisar).
-E) Ordena las acciones por prioridad:
-   1. drop_duplicates (primero siempre)
-   2. Reemplazar centinelas/nulos_disfrazados por NaN
-   3. Limpieza de strings (strip, lower, validación formato)
-   4. Conversión de tipos
-   5. Imputaciones (fillna, interpolate)
-   6. Outliers (winsorize, clip) — SOLO si NO son centinelas
-   7. Encoding / Escalado
-
-El brief_tecnico debe ser DETALLADO y específico por columna, indicando exactamente:
-- Qué problema tiene cada columna (con valores concretos si se conocen)
-- Qué transformación aplicar y con qué parámetros
-- Qué NO hacer (ej: no winsorizar centinelas, no imputar con media valores negativos que son errores)
+Reglas:
+A) Usa EXACTAMENTE las acciones de la lista (mismo id, acción y parámetros). No cambies ni añadas acciones: no hay más reglas que las del grafo.
+B) Los problemas de "sin_regla" no tienen regla en el grafo: NO propongas cómo tratarlos. El brief debe indicar que esas columnas no se tocan por esos problemas (se informan al final).
+C) Ordena las acciones para que ninguna anule el efecto de otra.
+D) brief_tecnico: instrucciones por columna, en el orden elegido, con los parámetros de cada acción y la justificación que da el grafo.
 
 Devuelve UN SOLO JSON con esta estructura exacta:
-{{
-  "plan_acciones": [
-    {{
-      "columna": "nombre",
-      "problema": "el problema que resuelve esta accion",
-      "accion": "snake_case_funcion",
-      "confianza": 0.88,
-      "fuente_decision": "knowledge_graph" | "llm_fallback",
-      "parametros": {{...}},
-      "justificacion": "..."
-    }}
-  ],
-  "brief_tecnico": "instrucciones detalladas y específicas para OpenHands..."
-}}
+{{"orden": ["a1", "a2", "..."], "brief_tecnico": "instrucciones para OpenHands..."}}
 
-Análisis del grafo (multi-problema):
+Acciones del grafo:
 {acciones_json}
+
+Problemas sin regla en el grafo:
+{sin_regla_json}
 
 Responde SOLO con el JSON. Sin markdown."""
 
+
+def _acciones_y_sin_regla(acciones_grafo: Dict[str, Any]) -> tuple:
+    """Lista de acciones del grafo (con id) y lista de problemas sin regla."""
+    acciones, sin_regla = [], []
+    for columna, info in (acciones_grafo or {}).items():
+        for accion in info.get("acciones", []):
+            acciones.append({
+                "id": f"a{len(acciones) + 1}",
+                "columna": columna,
+                "problema": accion.get("problema"),
+                "accion": accion.get("accion"),
+                "parametros": accion.get("parametros", {}),
+                "confianza": accion.get("confianza"),
+                "justificacion": accion.get("justificacion_es"),
+            })
+        for problema in info.get("problemas_fallback", []):
+            if problema and problema != "ninguno":
+                sin_regla.append({"columna": columna, "problema": problema})
+    return acciones, sin_regla
+
+
+def _ordenar_plan(acciones: List[Dict[str, Any]], orden: Any) -> List[Dict[str, Any]]:
+    """
+    Aplica el orden propuesto por el LLM sin dejarle cambiar el contenido: ids
+    desconocidos se ignoran y las acciones que no ordenó se añaden al final.
+    """
+    por_id = {a["id"]: a for a in acciones}
+    vistos, plan = set(), []
+    for item in orden if isinstance(orden, list) else []:
+        clave = str(item)
+        if clave in por_id and clave not in vistos:
+            plan.append(por_id[clave])
+            vistos.add(clave)
+        elif clave not in por_id:
+            print(f"   ⚠️ Planificador: se ignora '{clave}', no es una acción del grafo.")
+    faltan = [a for a in acciones if a["id"] not in vistos]
+    if faltan and orden:
+        print(f"   ⚠️ Planificador: acciones del grafo sin ordenar, se añaden al final: "
+              f"{[a['id'] for a in faltan]}")
+    return plan + faltan
+
+
+def _seccion_obligatoria(plan: List[Dict[str, Any]], sin_regla: List[Dict[str, Any]]) -> str:
+    """Bloque determinista del brief: las acciones exactas del grafo y lo que no se toca."""
+    acciones = [{k: a[k] for k in ("columna", "problema", "accion", "parametros")} for a in plan]
+    texto = ("\n\n## ACCIONES DEL GRAFO (obligatorias, en este orden; no añadas otras)\n"
+             + json.dumps(acciones, ensure_ascii=False, indent=2))
+    if sin_regla:
+        texto += ("\n\n## PROBLEMAS SIN REGLA EN EL GRAFO (no tratarlos; se informan)\n"
+                  + json.dumps(sin_regla, ensure_ascii=False, indent=2))
+    return texto
+
+
 def node_planificar(state: DataPulseState) -> DataPulseState:
-    llm = get_llm()
-    prompt = PLANIFICAR_PROMPT.format(
-        acciones_json=json.dumps(state["acciones_grafo"], ensure_ascii=False, indent=2)
-    )
-    response = llm.invoke([HumanMessage(content=prompt)])
-    parsed = extract_json_from_markdown(response.content)
+    """
+    El plan sale del grafo: las acciones, sus parámetros y su confianza son las
+    de las reglas elegidas. El LLM solo propone el orden y redacta el brief.
+    """
+    acciones, sin_regla = _acciones_y_sin_regla(state.get("acciones_grafo", {}))
+    orden, brief = None, ""
+    if acciones:
+        try:
+            llm = get_llm()
+            prompt = PLANIFICAR_PROMPT.format(
+                acciones_json=json.dumps(acciones, ensure_ascii=False, indent=2),
+                sin_regla_json=json.dumps(sin_regla, ensure_ascii=False, indent=2),
+            )
+            parsed = extract_json_from_markdown(llm.invoke([HumanMessage(content=prompt)]).content)
+            orden = parsed.get("orden")
+            brief = str(parsed.get("brief_tecnico") or "")
+        except Exception as exc:
+            print(f"   ⚠️ Planificador sin respuesta válida ({type(exc).__name__}): "
+                  "se usa el orden del grafo y solo las acciones obligatorias.")
+    else:
+        brief = "El Grafo de Conocimiento no tiene acciones para los problemas detectados."
 
-    plan = parsed.get("plan_acciones", [])
-    brief = parsed.get("brief_tecnico", "")
-
-    return {"plan_acciones": plan, "brief_tecnico": brief}
+    plan = [
+        {
+            "columna": a["columna"],
+            "problema": a["problema"],
+            "accion": a["accion"],
+            "confianza": a["confianza"],
+            "fuente_decision": "knowledge_graph",
+            "parametros": a["parametros"],
+            "justificacion": a["justificacion"],
+        }
+        for a in _ordenar_plan(acciones, orden)
+    ]
+    return {
+        "plan_acciones": plan,
+        "sin_regla": sin_regla,
+        "brief_tecnico": brief + _seccion_obligatoria(plan, sin_regla),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3662,10 +3725,7 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
             1 for a in state.get("plan_acciones", [])
             if a.get("fuente_decision") == "knowledge_graph"
         ),
-        "decisiones_llm_fallback": sum(
-            1 for a in state.get("plan_acciones", [])
-            if a.get("fuente_decision") == "llm_fallback"
-        ),
+        "problemas_sin_regla": state.get("sin_regla", []),
         "plan_acciones": state.get("plan_acciones", [])
     }
     files_to_commit.append((f"outputs/{ts}/audit_log.json", json.dumps(audit, ensure_ascii=False, indent=2)))
@@ -3914,6 +3974,7 @@ def run_datapulse(
         "diagnostico":          {},
         "acciones_grafo":       {},
         "plan_acciones":        [],
+        "sin_regla":            [],
         "brief_tecnico":        "",
         "codigo":               "",
         "intentos":             0,

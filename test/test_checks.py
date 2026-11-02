@@ -168,20 +168,14 @@ def test_excepciones_y_otras_columnas_no_penalizan(nombre):
     assert check_negative_values(df)[nombre]["penalizado"] is False, nombre
 
 
-def test_lista_unica_en_checker_y_prompt():
+def test_lista_de_negativos_solo_en_el_checker_no_en_el_prompt():
+    """
+    La lista de palabras es un criterio de medición del checker. El prompt de
+    diagnóstico no lleva reglas de dominio: el LLM decide por el significado.
+    """
     import datapulse_prod as dp
     from src import quality_checker as qc
 
-    # datapulse_prod usa exactamente las mismas constantes (no una copia)
-    assert dp.PALABRAS_NO_NEGATIVAS is qc.PALABRAS_NO_NEGATIVAS
-    assert dp.PALABRAS_NEGATIVOS_PERMITIDOS is qc.PALABRAS_NEGATIVOS_PERMITIDOS
-
-    prompt = dp.construir_prompt_diagnostico({"filas": 1})
-    regla4 = next(l for l in prompt.splitlines() if l.startswith("4. NEGATIVOS INESPERADOS"))
-    for palabra in qc.PALABRAS_NO_NEGATIVAS + qc.PALABRAS_NEGATIVOS_PERMITIDOS:
-        assert palabra in regla4, palabra
-    assert '"filas": 1' in prompt
-    # La lista base pedida, con equivalentes en inglés y los añadidos
     esperadas = {
         "monto", "amount", "importe", "precio", "price", "costo", "cost", "edad", "age",
         "peso", "weight", "altura", "height", "cantidad", "quantity", "stock", "distancia",
@@ -189,6 +183,12 @@ def test_lista_unica_en_checker_y_prompt():
     }
     assert esperadas <= set(qc.PALABRAS_NO_NEGATIVAS)
     assert set(qc.PALABRAS_NEGATIVOS_PERMITIDOS) == {"saldo", "balance", "margen", "margin"}
+
+    prompt = dp.construir_prompt_diagnostico({"filas": 1})
+    regla4 = next(l for l in prompt.splitlines() if l.startswith("4. NEGATIVOS INESPERADOS"))
+    for palabra in ("monto", "precio", "saldo", "margen"):
+        assert palabra not in regla4, palabra
+    assert '"filas": 1' in prompt
 
 
 def test_score_penaliza_solo_negativos_marcados():

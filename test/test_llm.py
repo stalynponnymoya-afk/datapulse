@@ -222,8 +222,7 @@ def test_diagnostico_y_brief_con_claude(monkeypatch):
     diagnostico = {"edad": {"tipo_inferido": "numerica_discreta",
                             "problemas": ["nulos_disfrazados"],
                             "problema_principal": "nulos_disfrazados"}}
-    plan = {"plan_acciones": [{"columna": "edad", "accion": "reemplazar_centinela_por_nan"}],
-            "brief_tecnico": "Reemplazar -999 por NaN en edad."}
+    plan = {"orden": ["a1"], "brief_tecnico": "Reemplazar -999 por NaN en edad."}
     clientes = iter([ClienteFalso(texto=json.dumps(diagnostico)),
                      ClienteFalso(texto=json.dumps(plan))])
     monkeypatch.setattr(dp, "LLM_PROVEEDOR", "claude")
@@ -235,7 +234,9 @@ def test_diagnostico_y_brief_con_claude(monkeypatch):
     grafo = dp.node_consultar_grafo({"diagnostico": diag})["acciones_grafo"]
     assert grafo["edad"]["acciones"][0]["accion"] == "reemplazar_centinela_por_nan"
     salida = dp.node_planificar({"acciones_grafo": grafo})
-    assert salida["brief_tecnico"] == plan["brief_tecnico"]
+    assert salida["brief_tecnico"].startswith(plan["brief_tecnico"])
+    assert "reemplazar_centinela_por_nan" in salida["brief_tecnico"]
+    assert [a["accion"] for a in salida["plan_acciones"]] == ["reemplazar_centinela_por_nan"]
 
 
 def test_generacion_local_con_claude_sin_clave_no_rompe(tmp_path, monkeypatch):

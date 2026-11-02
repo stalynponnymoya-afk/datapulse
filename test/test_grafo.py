@@ -49,31 +49,16 @@ def test_negativos_financieros_flag_y_nan():
     assert "clip_min" not in accion["parametros"]
 
 
-def test_sesgada_con_nulos_bajos_usa_mediana():
-    # La etiqueta del LLM dice "simétrica", pero la metadata muestra sesgo
-    for etiqueta in ("numerica_continua_sesgada", "numerica_continua_simetrica"):
-        res = _consultar(etiqueta, "nulos_bajos", skewness=2.7)
-        accion = res["acciones"][0]
-        assert accion["accion"] == "fillna_median", etiqueta
-        assert accion["parametros"]["strategy"] == "median"
-        assert "skewness" in accion["justificacion_es"]
-        assert accion["ajuste"] == "skewness"
-
-    # Sesgo negativo también cuenta
-    assert _consultar("numerica_continua", "nulos_bajos", skewness=-1.5)["acciones"][0][
-        "accion"] == "fillna_median"
-
-
-def test_simetrica_con_nulos_bajos_mantiene_media():
-    for skew in (0.3, -1.0, None, "no-numero"):
+def test_la_accion_del_grafo_no_se_modifica_en_codigo():
+    """Sin reglas fuera del grafo: la skewness no cambia la acción elegida."""
+    for skew in (2.7, -1.5, 0.3, None):
         res = _consultar("numerica_continua_sesgada", "nulos_bajos", skewness=skew)
-        assert res["acciones"][0]["accion"] == "fillna_mean", skew
-
-
-def test_sin_metadata_no_rompe():
-    out = dp.node_consultar_grafo({"diagnostico": {
-        "x": {"tipo_inferido": "numerica_continua", "problemas": ["nulos_bajos"]}}})
-    assert out["acciones_grafo"]["x"]["acciones"][0]["accion"] == "fillna_mean"
+        accion = res["acciones"][0]
+        datos = max(dp.kg["Variable_Numerica_Continua"]["Nulos_Bajos"].values(),
+                    key=lambda d: d["confianza"])
+        assert accion["accion"] == datos["accion"]
+        assert accion["parametros"] == datos.get("parametros", {})
+        assert "ajuste" not in accion
 
 
 def test_conteo_de_reglas():
@@ -124,7 +109,12 @@ def test_fechas_centinela_configurables(monkeypatch, capsys):
     assert "no-es-fecha" in capsys.readouterr().out
 
 
-def test_prompts_no_contradicen_el_grafo_en_fechas():
-    assert "NUNCA se reemplazan ni se imputan" in dp.PLANIFICAR_PROMPT
-    prompt = dp.construir_prompt_diagnostico({})
-    assert '"N/A"' in prompt and "1900-01-01" in prompt
+def test_prompts_sin_reglas_de_limpieza():
+    """Las reglas de limpieza solo viven en el grafo; los prompts no deciden acciones."""
+    plan = dp.PLANIFICAR_PROMPT.lower()
+    for decision in ("winsoriz", "por nan", "recortar", "drop_duplicates", "fillna"):
+        assert decision not in plan, decision
+    assert "no cambies ni añadas acciones" in plan
+    # El diagnóstico sí describe cómo reconocer centinelas (es diagnóstico, no limpieza)
+    diag = dp.construir_prompt_diagnostico({})
+    assert '"N/A"' in diag and "1900-01-01" in diag
