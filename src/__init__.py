@@ -16,6 +16,7 @@ en el Grafo de Conocimiento.
 from .quality_checker import (
     load_dataset,
     generate_report,
+    generate_report_df,
     check_nulls,
     check_duplicates,
     check_outliers,
@@ -28,6 +29,7 @@ from .quality_checker import (
 __all__ = [
     "load_dataset",
     "generate_report",
+    "generate_report_df",
     "check_nulls",
     "check_duplicates",
     "check_outliers",
@@ -58,6 +60,7 @@ _LAZY = {
     "node_planificar": ("src.graph_nodes", "node_planificar"),
     "node_ejecutar": ("src.graph_nodes", "node_ejecutar"),
     "node_validar_score": ("src.graph_nodes", "node_validar_score"),
+    "generar_informe_final": ("src.graph_nodes", "generar_informe_final"),
     "node_commit": ("src.graph_nodes", "node_commit"),
     "router_validar_score": ("src.graph_nodes", "router_validar_score"),
     "build_datapulse_graph": ("src.graph_nodes", "build_datapulse_graph"),

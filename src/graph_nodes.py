@@ -10,12 +10,16 @@ quedan garantizadas en ambos puntos de entrada.
 
 Nodos expuestos:
 - ``node_ingestar``       — carga el archivo y extrae metadata
-- ``node_diagnosticar``   — Groq infiere tipos y detecta problemas
+- ``node_diagnosticar``   — el LLM diagnostica con etiquetas generadas del grafo
 - ``node_consultar_grafo``— el Grafo de Conocimiento decide la acción
-- ``node_planificar``     — Groq resuelve fallbacks y construye el brief
-- ``node_ejecutar``       — OpenHands (o fallback local con Groq)
-- ``node_validar_score``  — passthrough hacia el router condicional
+- ``node_planificar``     — acciones del grafo (sin cambios) + respaldo del LLM (≤ 0.70)
+- ``node_ejecutar``       — OpenHands (o modo local con el LLM configurado)
+- ``node_validar_score``  — mide el processed_data.csv real (score independiente)
 - ``node_commit``         — publica en GitHub o en ``outputs/`` localmente
+- ``router_validar_score``— retry | commit | end_no_commit
+
+Fuera del grafo: ``generar_informe_final`` (determinista, sin LLM), que
+``run_datapulse`` llama después de ``app.invoke``.
 - ``build_datapulse_graph`` / ``run_datapulse``
 """
 
@@ -32,6 +36,7 @@ from datapulse_prod import (  # noqa: E402
     node_commit,
     node_consultar_grafo,
     node_diagnosticar,
+    generar_informe_final,
     node_ejecutar,
     node_ingestar,
     node_planificar,
@@ -49,6 +54,7 @@ __all__ = [
     "node_ejecutar",
     "node_validar_score",
     "node_commit",
+    "generar_informe_final",
     "router_validar_score",
     "build_datapulse_graph",
     "run_datapulse",

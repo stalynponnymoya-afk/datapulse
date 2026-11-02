@@ -37,10 +37,9 @@ def test_knowledge_graph_construction():
     kg = agregar_reglas_dominio(kg)
     assert kg.number_of_edges() > edges_before, "Domain rules should add edges"
 
-    # Base (~58 estadísticas + estructurales) + 24 de dominio > 100 aristas
-    assert kg.number_of_edges() > 100, (
-        f"Total edges should exceed 100, got {kg.number_of_edges()}"
-    )
+    # Sin conteos exactos: el formato de cada regla lo comprueba el validador
+    from datapulse_prod import errores_grafo
+    assert errores_grafo(kg) == []
     print(f"✅ Knowledge Graph: {kg.number_of_nodes()} nodes, {kg.number_of_edges()} edges")
 
 
@@ -60,8 +59,10 @@ def test_domain_rules_connected():
     for alias, node in PROBLEMA_MAP_DOMINIO.items():
         assert PROBLEMA_MAP.get(alias) == node, f"PROBLEMA_MAP missing domain alias {alias}"
 
+    # Con DOMINIOS_ACTIVOS vacía los alias de dominio no resuelven (fallback del LLM);
+    # la resolución con el dominio activo se prueba en test_dominios.py.
     src, tgt = _map_tipo_problema("signo_vital", "rango_clinico_invalido")
-    assert (src, tgt) == ("Variable_Clinica_Signo_Vital", "Rango_Clinico_Invalido")
+    assert (src, tgt) == (None, None)
     print("✅ Domain rules connected through global maps")
 
 
@@ -137,7 +138,10 @@ def test_clean_data_edges_activated():
         assert not res["requiere_llm_fallback"], (
             f"{col} ({res['tipo_inferido']}) fell back to LLM for clean data"
         )
-        assert res["acciones"][0]["accion"], f"{col} produced no action"
+        # En modo "bi" las reglas "Ninguno" solo de modelos (encoding, 0/1) se omiten por modo
+        assert res["acciones"] or res["omitidos_por_modo"], f"{col} produced no action"
+        if res["acciones"]:
+            assert res["acciones"][0]["accion"], f"{col} produced no action"
     print(f"✅ Clean-data edges activated for {len(tipos_con_ninguno)} types")
 
 
@@ -206,46 +210,63 @@ def test_all_map_combinations_resolve():
 
 def test_router_retry_policy():
     """
-    Infra failures must not re-launch sandboxes (short budget), while a low
-    score from a successful run must still get an autocorrection retry.
+    Los límites son el número TOTAL de intentos: un fallo de infraestructura
+    se reintenta hasta OH_MAX_INTENTOS_INFRA intentos y un score bajo hasta
+    OH_MAX_INTENTOS_SCORE, nunca con commit si no se aprueba.
     """
     from datapulse_prod import (
         router_validar_score,
-        OH_MAX_RETRIES,
-        OH_MAX_SCORE_RETRIES,
+        OH_MAX_INTENTOS_INFRA,
+        OH_MAX_INTENTOS_SCORE,
         OH_RETRY_ON_LOW_SCORE,
+        MIN_SCORE_PASS,
     )
 
-    def walk(status, score):
+    assert OH_MAX_INTENTOS_INFRA == 2
+    assert OH_MAX_INTENTOS_SCORE == 3
+
+    def walk(status, score, **extra):
         intentos, path = 0, []
         while True:
             intentos += 1
             decision = router_validar_score(
-                {"intentos": intentos, "openhands_status": status, "score_despues": score}
+                {"intentos": intentos, "openhands_status": status, "score_despues": score, **extra}
             )
             path.append(decision)
             if decision != "retry":
                 return path
 
-    # Error de infraestructura: presupuesto corto, nunca commit.
-    infra = walk("error", 0)
-    assert infra[-1] == "end_no_commit", infra
-    assert "commit" not in infra, infra
+    # Error de infraestructura: 2 intentos en total (1 reintento), nunca commit.
+    for estado in ("error", "timeout", "stuck", "stopped"):
+        infra = walk(estado, 0)
+        assert infra == ["retry"] * (OH_MAX_INTENTOS_INFRA - 1) + ["end_no_commit"], infra
+    # Aunque el score fuera alto, un fallo de infraestructura no hace commit.
+    assert "commit" not in walk("error", 100)
 
-    # Score bajo con ejecución OK: se agota el presupuesto de autocorrección.
-    # OH_MAX_SCORE_RETRIES es el total de intentos, así que los reintentos son uno menos.
+    # Score bajo con ejecución OK: 3 intentos en total (2 reintentos).
     assert OH_RETRY_ON_LOW_SCORE, "Autocorrection should be enabled by default"
     low = walk("finished", 40)
-    assert low.count("retry") == OH_MAX_SCORE_RETRIES - 1, low
-    assert len(low) <= OH_MAX_SCORE_RETRIES, low
-    assert low[-1] == "end_no_commit", low
+    assert low == ["retry"] * (OH_MAX_INTENTOS_SCORE - 1) + ["end_no_commit"], low
 
-    # Score suficiente: commit directo.
+    # Sin validar: mismo presupuesto que el score bajo, nunca commit.
+    # Sin validar: solo se reintenta si processed_data.csv debía existir y no
+    # apareció (mismo presupuesto que el score bajo); nunca hay commit.
+    assert walk("sin_validar", 100, processed_esperado=True) == low
+    assert walk("sin_validar", 100, processed_esperado=False) == ["end_no_commit"]
+    assert walk("sin_validar", 100) == ["end_no_commit"]
+
+    # Rechazo por configuración/política: fin inmediato.
+    assert walk("rechazado", 100) == ["end_no_commit"]
+
+    # Score suficiente: commit directo; justo en el umbral también aprueba.
     assert walk("finished", 85) == ["commit"]
-    print(
-        f"✅ Router: infra={infra} | low_score={low} "
-        f"(OH_MAX_RETRIES={OH_MAX_RETRIES}, OH_MAX_SCORE_RETRIES={OH_MAX_SCORE_RETRIES})"
-    )
+    assert walk("finished", MIN_SCORE_PASS) == ["commit"]
+    assert walk("finished", MIN_SCORE_PASS - 1)[-1] == "end_no_commit"
+
+    # Estado incompleto: no explota y no hace commit (score 0 → autocorrección).
+    assert router_validar_score({}) == "retry"
+    print(f"✅ Router: infra={infra} | low_score={low}")
+
 
 def test_extract_json_robust():
     """

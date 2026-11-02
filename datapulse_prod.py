@@ -29,22 +29,103 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from github import Github
 
+# El cargador de datos vive en src/: en Colab hay que clonar el repo completo
+# (no basta con subir este archivo) para que este import funcione.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from src.quality_checker import (  # noqa: E402
+    _nombre_contiene,
+    check_duplicates,
+    columnas_indice,
+    discrepancia_negativos,
+    convertir_numerico,
+    es_mayormente_fecha,
+    es_mayormente_numerica,
+    extremos_iqr,
+    fechas_imposibles,
+    generate_report_df,
+    load_dataset,
+    normalizar_decision_negativos,
+    parsear_fechas_flexible,
+)
+
 # ════════════════════════════════════════════════
 # CONFIGURACIÓN DEL PROYECTO
 # ════════════════════════════════════════════════
-GITHUB_USERNAME   = "stalynponnymoya-afk"
-GITHUB_REPO       = "datapulse"
+# El código no contiene claves: cada valor se lee POR SEPARADO de los Secrets
+# de Colab y, si no está ahí, de una variable de entorno. Así un secreto que
+# falte (p. ej. OPENHANDS_API_KEY para usar el modo local) no anula a los demás.
+ORIGEN_CONFIG: Dict[str, str] = {}
+
+
+def _leer_config(nombre: str, defecto: str = "") -> str:
+    """
+    Lee ``nombre`` del secreto de Colab; si no existe (o no hay acceso), de la
+    variable de entorno; si tampoco, ``defecto``. Anota el origen en
+    ORIGEN_CONFIG (nunca el valor).
+    """
+    try:
+        from google.colab import userdata  # solo existe dentro de Colab
+    except Exception:
+        userdata = None
+    if userdata is not None:
+        try:
+            valor = userdata.get(nombre)
+        except Exception:
+            # SecretNotFoundError, NotebookAccessError o ejecución con !python
+            valor = None
+        if valor:
+            ORIGEN_CONFIG[nombre] = "secreto de Colab"
+            return str(valor).strip()
+    valor = os.environ.get(nombre, "").strip()
+    if valor:
+        ORIGEN_CONFIG[nombre] = "variable de entorno"
+        return valor
+    ORIGEN_CONFIG[nombre] = "valor por defecto" if defecto else "no definido"
+    return defecto
+
+
+# Usuario y repositorio de GitHub: sin valor por defecto (antes apuntaban al
+# repo del autor). Si faltan, el modo OpenHands no arranca y node_commit
+# guarda las salidas en local.
+GITHUB_USERNAME   = _leer_config("GITHUB_USERNAME")
+GITHUB_REPO       = _leer_config("GITHUB_REPO")
 # Modelo de Groq: configurable por el usuario. Anteriormente se usaba
 # "llama-3.3-70b-versatile", que Groq deprecó el 16/08/2026 (pasó a Enterprise);
-# su reemplazo recomendado es "openai/gpt-oss-120b". Puedes cambiarlo con la
-# variable de entorno GROQ_MODEL según los modelos disponibles en tu cuenta.
-GROQ_MODEL        = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+# su reemplazo recomendado es "openai/gpt-oss-120b". Puedes cambiarlo con
+# GROQ_MODEL (secreto de Colab o variable de entorno).
+GROQ_MODEL        = _leer_config("GROQ_MODEL", "openai/gpt-oss-120b")
 OH_TIMEOUT_SEG    = 900    # ventana de ejecución remota en OpenHands (~15 min)
 OH_STARTUP_TIMEOUT_SEG = 600  # espera máxima a que el sandbox quede READY
-OH_MAX_RETRIES    = 1      # reintentos ante fallo de infraestructura (no re-lanzar sandboxes)
+# Política de intentos. Ambos valores son el NÚMERO TOTAL de intentos (el
+# primero incluido), no el número de reintentos:
+#   - OH_MAX_INTENTOS_INFRA = 2 → ante un fallo de infraestructura o del script
+#     se reintenta una vez (2 intentos en total).
+#   - OH_MAX_INTENTOS_SCORE = 3 → ante un score bajo o un resultado sin validar
+#     se reintenta hasta dos veces (3 intentos en total) con los errores previos.
+OH_MAX_INTENTOS_INFRA  = 2
 OH_RETRY_ON_LOW_SCORE  = True   # reintentar cuando el score queda bajo el umbral
-OH_MAX_SCORE_RETRIES   = 2      # presupuesto de intentos por score bajo (autocorrección)
-MIN_SCORE_PASS    = 70
+OH_MAX_INTENTOS_SCORE  = 3
+# Estados terminales de OpenHands que indican fallo de infraestructura
+OH_ESTADOS_INFRA = ("error", "timeout", "stuck", "stopped")
+
+
+
+def _entero_env(nombre: str, defecto: int) -> int:
+    """Lee un entero de una variable de entorno; si no es válido usa el defecto."""
+    valor = os.environ.get(nombre, "").strip()
+    if not valor:
+        return defecto
+    try:
+        return int(valor)
+    except ValueError:
+        print(f"⚠️ {nombre}={valor!r} no es un entero; se usa {defecto}.")
+        return defecto
+
+
+# Umbral de aprobación del score independiente (configurable por entorno)
+MIN_SCORE_PASS    = _entero_env("DATAPULSE_MIN_SCORE_PASS", 70)
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  DATASET A LIMPIAR — EDITAR ESTA LÍNEA ANTES DE EJECUTAR   ║
@@ -61,19 +142,103 @@ MIN_SCORE_PASS    = 70
 GITHUB_DATA_FILE   = ""          # ← ESCRIBE AQUÍ EL NOMBRE DE TU ARCHIVO
 GITHUB_DATA_BRANCH = "main"      # rama donde vive el archivo (normalmente "main")
 
-# Carga de Secrets en Colab
-try:
-    from google.colab import userdata
-    GROQ_API_KEY       = userdata.get('GROQ_API_KEY')
-    GITHUB_TOKEN       = userdata.get('GITHUB_TOKEN')
-    OPENHANDS_API_KEY  = userdata.get('OPENHANDS_API_KEY')
-except Exception:
-    GROQ_API_KEY       = os.environ.get('GROQ_API_KEY', '')
-    GITHUB_TOKEN       = os.environ.get('GITHUB_TOKEN', '')
-    OPENHANDS_API_KEY  = os.environ.get('OPENHANDS_API_KEY', '')
+# Dominios de reglas que se agregan al grafo de conocimiento (ver DOMINIOS):
+# "salud", "finanzas", "economia", "ocupacional", "retail" (demo con valores de
+# ejemplo) o uno propio registrado. Vacía
+# por defecto: solo las reglas base; solo los tipos y problemas de los
+# dominios activos aparecen en el vocabulario del diagnóstico.
+DOMINIOS_ACTIVOS: List[str] = []
+
+# Contexto del dataset (texto libre) que se añade al prompt de diagnóstico, p. ej.
+# "Mediciones meteorológicas horarias de 12 estaciones andinas". Si queda vacío
+# se usa la variable de entorno DATAPULSE_CONTEXTO.
+CONTEXTO_DATASET   = ""
+# Decisiones del usuario sobre negativos por columna: {"columna": "validos" |
+# "invalidos"}. Reemplazan la decisión del LLM para esa columna (fuente "usuario").
+DECISIONES_NEGATIVOS: Dict[str, str] = {}
+# Modo de salida: "bi" (análisis/BI: conserva valores reales y legibles) o "ml"
+# (preparación para modelos). consultar_grafo omite las reglas cuyo atributo
+# modo no coincide; las reglas sin modo se aplican en ambos.
+MODO_SALIDA        = "bi"
+
+# Claves: cada una por separado (secreto de Colab → variable de entorno → vacía)
+GROQ_API_KEY       = _leer_config("GROQ_API_KEY")
+GITHUB_TOKEN       = _leer_config("GITHUB_TOKEN")
+OPENHANDS_API_KEY  = _leer_config("OPENHANDS_API_KEY")
+# La clave de Anthropic se pasa directamente al cliente y NO se copia a
+# os.environ, para que ningún proceso hijo pueda heredarla.
+ANTHROPIC_API_KEY  = _leer_config("ANTHROPIC_API_KEY")
 
 # Configuración de variables de entorno para LangChain/Groq
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+
+# ── LLM que diagnostica, planifica (brief para OpenHands) y, en modo local,
+# genera el script. OpenHands usa su propio modelo, configurado en su cuenta.
+# Claude Sonnet 5.5 por defecto cuando hay ANTHROPIC_API_KEY; Groq si no.
+CLAUDE_MODEL       = _leer_config("CLAUDE_MODEL", "claude-sonnet-5-5")
+_EFFORTS_VALIDOS   = ("low", "medium", "high", "xhigh", "max")
+
+
+def _resolver_effort() -> str:
+    """Nivel de esfuerzo de Claude (DATAPULSE_CLAUDE_EFFORT, por defecto medium)."""
+    effort = _leer_config("DATAPULSE_CLAUDE_EFFORT", "medium").lower()
+    if effort not in _EFFORTS_VALIDOS:
+        print(f"⚠️ DATAPULSE_CLAUDE_EFFORT={effort!r} no es válido "
+              f"({', '.join(_EFFORTS_VALIDOS)}); se usa 'medium'.")
+        return "medium"
+    return effort
+
+
+def _resolver_proveedor() -> str:
+    """
+    DATAPULSE_LLM = claude | groq. Sin valor (o con uno desconocido): Claude si
+    hay ANTHROPIC_API_KEY, Groq si no.
+    """
+    pedido = _leer_config("DATAPULSE_LLM").lower()
+    if pedido in ("claude", "anthropic"):
+        return "claude"
+    if pedido == "groq":
+        return "groq"
+    if pedido:
+        print(f"⚠️ DATAPULSE_LLM={pedido!r} no es válido (claude | groq); se elige automáticamente.")
+    return "claude" if ANTHROPIC_API_KEY else "groq"
+
+
+CLAUDE_EFFORT      = _resolver_effort()
+LLM_PROVEEDOR      = _resolver_proveedor()
+
+
+def describir_llm() -> str:
+    """Nombre legible del LLM en uso, para mensajes y resúmenes."""
+    if LLM_PROVEEDOR == "claude":
+        return f"Claude ({CLAUDE_MODEL}, effort {CLAUDE_EFFORT})"
+    return f"Groq ({GROQ_MODEL})"
+
+
+def resumen_configuracion() -> str:
+    """Describe de dónde salió cada valor y el modo resultante (sin mostrar claves)."""
+    lineas = ["🔑 Configuración:"]
+    for nombre in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENHANDS_API_KEY", "GITHUB_TOKEN",
+                   "GITHUB_USERNAME", "GITHUB_REPO"):
+        lineas.append(f"   - {nombre}: {ORIGEN_CONFIG.get(nombre, 'no definido')}")
+    lineas.append(f"   - LLM (diagnóstico, plan y brief): {describir_llm()}")
+    clave_llm = "ANTHROPIC_API_KEY" if LLM_PROVEEDOR == "claude" else "GROQ_API_KEY"
+    if not (ANTHROPIC_API_KEY if LLM_PROVEEDOR == "claude" else GROQ_API_KEY):
+        lineas.append(f"   ⚠️ Falta {clave_llm}: el diagnóstico y la planificación no funcionarán.")
+    lineas.append(
+        "   - Ejecución: "
+        + ("OpenHands (con su propio modelo)" if OPENHANDS_API_KEY
+           else f"modo local (script generado con {describir_llm()})")
+    )
+    publica = GITHUB_TOKEN and GITHUB_USERNAME and GITHUB_REPO
+    lineas.append(
+        "   - Resultados: "
+        + (f"GitHub ({GITHUB_USERNAME}/{GITHUB_REPO})" if publica else "carpeta local outputs/")
+    )
+    return "\n".join(lineas)
+
+
+print(resumen_configuracion())
 
 # DataPulseState — canonical definition later in file (uses Annotated + Optional)
 # Mapeos base — sacar de _map_tipo_problema a nivel global
@@ -122,7 +287,7 @@ PROBLEMA_MAP = {
     "outlier_severo":                  "Outlier_Severo",
     "outlier_extremo":                 "Outlier_Severo",
     "tipo_incorrecto":                 "Formato_No_Estandar",
-    "nulos_disfrazados":              "Nulos_Criticos",
+    "nulos_disfrazados":               "Valores_Centinela",
     "duplicados":                      "Duplicados_Registros",
     "inconsistencia_formato":          "Formato_No_Estandar",
     "escala_diferente":                "Escalas_Diferentes",
@@ -131,6 +296,7 @@ PROBLEMA_MAP = {
     "colinealidad_alta":               "Colinealidad_Alta",
     "valores_negativos_inesperados":   "Rango_Invalido",
     "rango_invalido":                  "Rango_Invalido",
+    "negativos_inciertos":             "Negativos_Inciertos",
     "ninguno":                         "Ninguno",
     "none":                            "Ninguno",
     "clean":                           "Ninguno",
@@ -151,6 +317,8 @@ PROBLEMA_MAP = {
 
 # Problemas estructurales que no dependen del tipo de variable: sus reglas
 # cuelgan del nodo origen "Esquema_General" en el grafo de conocimiento.
+NODO_ESQUEMA_GENERAL = "Esquema_General"
+
 ESQUEMA_GENERAL_TARGETS = {
     "Duplicados_Registros",
     "Valores_Constantes",
@@ -164,7 +332,107 @@ ESQUEMA_GENERAL_TARGETS = {
 # a grafos de conocimiento y cada estado representa una relacion logica
 # que le permite saber que desicion tomar y como manejar los datos faltantes
 
+# Cadenas que representan un nulo. Fuente única para la regla
+# Texto_General → Cadenas_Vacias_Representan_Nulos y para las aristas de
+# Valores_Centinela desde columnas categóricas y de texto.
+CADENAS_NULAS = ["", " ", "NA", "N/A", "null", "NULL", "None", "n/a", "na"]
+
+# Centinelas numéricos (-999, 9999…) que codifican "sin dato".
+CENTINELAS_NUMERICOS = [-999, -9999, 999, 9999, -1]
+
+
+def _fechas_centinela_config() -> List[str]:
+    """
+    Fechas centinela (p. ej. 1900-01-01, 9999-12-31) configurables con
+    DATAPULSE_FECHAS_CENTINELA, separadas por comas. Vacía por defecto: no hay
+    una fecha que sea centinela en todos los dominios. Las entradas que no son
+    fechas se ignoran con un aviso.
+    """
+    fechas = []
+    for valor in os.environ.get("DATAPULSE_FECHAS_CENTINELA", "").split(","):
+        valor = valor.strip()
+        if not valor:
+            continue
+        try:
+            # Sin pasar por Timestamp: 9999-12-31 está fuera de su rango
+            fechas.append(datetime.strptime(valor, "%Y-%m-%d").date().isoformat())
+        except ValueError:
+            print(f"⚠️ DATAPULSE_FECHAS_CENTINELA: '{valor}' no es una fecha AAAA-MM-DD; se ignora.")
+    return fechas
+
+
+# ═══════════════════════════════════════════════════════════════
+# VALIDADOR DEL GRAFO — se ejecuta al construirlo y antes de cada ejecución
+# ═══════════════════════════════════════════════════════════════
+
+MODOS_REGLA = ("bi", "ml")
+
+
+class GrafoInvalidoError(ValueError):
+    """El grafo de conocimiento tiene reglas o nodos que no cumplen el formato."""
+
+
+def _errores_arista(origen, destino, clave, datos: Dict[str, Any]) -> List[str]:
+    """Errores de formato de una arista (vacío si es válida)."""
+    accion = datos.get("accion")
+    nombre = f"arista {origen} → {destino} [clave {clave}]"
+    if isinstance(accion, str) and accion.strip():
+        nombre += f" (accion={accion!r})"
+    errores = []
+    if not isinstance(accion, str) or not accion.strip():
+        errores.append(f"{nombre}: 'accion' debe ser un texto no vacío (valor: {accion!r})")
+    confianza = datos.get("confianza")
+    if (isinstance(confianza, bool) or not isinstance(confianza, (int, float))
+            or not 0 <= confianza <= 1):
+        errores.append(f"{nombre}: 'confianza' debe ser un número entre 0 y 1 "
+                       f"(valor: {confianza!r})")
+    if not isinstance(datos.get("parametros"), dict):
+        errores.append(f"{nombre}: 'parametros' debe ser un dict, aunque sea {{}} "
+                       f"(valor: {datos.get('parametros')!r})")
+    for idioma in ("justificacion_es", "justificacion_en"):
+        texto = datos.get(idioma)
+        if not isinstance(texto, str) or not texto.strip():
+            errores.append(f"{nombre}: '{idioma}' debe ser un texto no vacío (valor: {texto!r})")
+    if "modo" in datos and datos["modo"] not in MODOS_REGLA:
+        errores.append(f"{nombre}: 'modo' debe ser \"bi\" o \"ml\" u omitirse "
+                       f"(valor: {datos['modo']!r})")
+    return errores
+
+
+def errores_grafo(grafo) -> List[str]:
+    """Lista de errores del grafo: aristas mal formadas y nodos sin ninguna arista."""
+    errores = []
+    for origen, destino, clave, datos in grafo.edges(keys=True, data=True):
+        errores += _errores_arista(origen, destino, clave, datos)
+    for nodo in grafo.nodes():
+        if grafo.degree(nodo) == 0:
+            errores.append(f"nodo {nodo!r}: no tiene ninguna arista (añade una regla que lo use "
+                           "o quítalo con kg.remove_node)")
+    return errores
+
+
+def validar_grafo(grafo):
+    """
+    Comprueba que cada arista tenga accion no vacía, confianza en [0, 1],
+    parametros dict, justificacion_es/en no vacías y, si lo trae, modo "bi" o
+    "ml"; y que no haya nodos sin aristas. Devuelve el grafo si es válido; si
+    no, lanza GrafoInvalidoError con todos los errores (qué arista y qué
+    atributo).
+    """
+    errores = errores_grafo(grafo)
+    if errores:
+        raise GrafoInvalidoError(
+            f"Grafo de conocimiento inválido ({len(errores)} error(es)):\n"
+            + "\n".join(f"  - {e}" for e in errores))
+    return grafo
+
+
 def construir_grafo_conocimiento() -> nx.DiGraph:
+    """
+    Construye el grafo base: reglas estadísticas y estructurales que valen
+    para cualquier giro de negocio. Las reglas de dominio son opcionales y se
+    agregan después con agregar_reglas_dominio(kg, DOMINIOS_ACTIVOS).
+    """
     kg = nx.MultiDiGraph()
 
     # ============================================================
@@ -284,7 +552,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
     kg.add_edge("Texto_General", "Cadenas_Vacias_Representan_Nulos",
                 accion="replace_to_na",
                 confianza=0.99,
-                parametros={"to_replace": ["", " ", "NA", "N/A", "null", "NULL", "None", "n/a", "na"], "value": None},
+                parametros={"to_replace": list(CADENAS_NULAS), "value": None},
                 justificacion_es="Las cadenas vacías y sus variantes textuales ('NA', 'N/A') deben unificarse al tipo nulo nativo del sistema para habilitar funciones estadísticas de omisión y imputación.",
                 justificacion_en="Empty strings and their textual variants ('NA', 'N/A') must be unified to the system's native null type to enable statistical omission and imputation functions.")
 
@@ -516,6 +784,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Outlier_Severo",
                 accion="scipy_winsorize",
+                modo="ml",
                 confianza=0.86,
                 parametros={"limits": [0.01, 0.01], "inclusive": [True, True]},
                 justificacion_es="La winsorización al percentil 1 y 99 reemplaza outliers por los valores de corte, preservando el tamaño muestral y reduciendo el impacto de colas pesadas sin eliminar registros.",
@@ -523,10 +792,21 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Outlier_Severo",
                 accion="scipy_winsorize",
+                modo="ml",
                 confianza=0.84,
                 parametros={"limits": [0.05, 0.05], "inclusive": [True, True]},
                 justificacion_es="La winsorización al 5-95 es más agresiva, recomendada cuando la distribución subyacente se sabe que tiene colas pesadas (log-normal, Pareto) y el interés está en el cuerpo central.",
                 justificacion_en="The 5-95 winsorization is more aggressive, recommended when the underlying distribution is known to have heavy tails (log-normal, Pareto) and the interest is in the central body.")
+
+    # Modo BI: los valores reales no se recortan; el outlier se marca y se
+    # conserva (mismos parámetros que la regla financiera).
+    kg.add_edge("Variable_Numerica_Continua", "Outlier_Severo",
+                accion="flag_outlier_no_remove",
+                modo="bi",
+                confianza=0.85,
+                parametros={"strategy": "flag_no_remove", "flag_suffix": "_outlier"},
+                justificacion_es="Para análisis/BI el valor real se conserva: el outlier se MARCA con un flag y no se elimina ni se recorta (winsorizar cambia sumas y promedios del reporte).",
+                justificacion_en="For analysis/BI the real value is kept: the outlier is FLAGGED and neither removed nor capped (winsorizing changes report sums and averages).")
 
     kg.add_edge("Variable_Numerica_Continua", "Outlier_Multivariado",
                 accion="sklearn_isolation_forest",
@@ -544,6 +824,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Distribucion_Sesgada_Positiva",
                 accion="scipy_boxcox",
+                modo="ml",
                 confianza=0.78,
                 parametros={"lmbda": None},
                 justificacion_es="La transformación Box-Cox estima el parámetro lambda óptimo para maximizar la normalidad de la distribución, siendo el método paramétrico gold-standard para normalización de colas asimétricas. Requiere valores estrictamente positivos.",
@@ -551,6 +832,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Distribucion_Sesgada_Positiva",
                 accion="sklearn_power_transform_boxcox",
+                modo="ml",
                 confianza=0.80,
                 parametros={"method": "box-cox", "standardize": True},
                 justificacion_es="PowerTransformer con Box-Cox optimiza la normalidad de variables estrictamente positivas, siendo superior a la transformación logarítmica manual porque estima lambda de máxima verosimilitud.",
@@ -558,6 +840,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Distribucion_Sesgada_Rango_Mixto",
                 accion="sklearn_power_transform_yeo_johnson",
+                modo="ml",
                 confianza=0.80,
                 parametros={"method": "yeo-johnson", "standardize": True},
                 justificacion_es="Yeo-Johnson dentro de PowerTransformer maneja rangos mixtos (positivos, negativos, cero), proporcionando una normalización automática sin requerir pre-procesamiento de signo.",
@@ -570,6 +853,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes",
                 accion="sklearn_min_max_scale",
+                modo="ml",
                 confianza=0.92,
                 parametros={"feature_range": [0, 1]},
                 justificacion_es="El escalado Min-Max transforma variables a un rango fijo [0,1], preservando la forma de la distribución y siendo indispensable para algoritmos basados en distancia (KNN, K-Means, SVM, redes neuronales).",
@@ -577,6 +861,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes",
                 accion="sklearn_standard_scale",
+                modo="ml",
                 confianza=0.93,
                 parametros={"with_mean": True, "with_std": True},
                 justificacion_es="La estandarización Z-score (media 0, desviación 1) es requisito para modelos que asumen normalidad multivariada (regresión logística, LDA, Gaussian NB) y mejora la convergencia del gradient descent.",
@@ -584,6 +869,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Outliers_Presentes",
                 accion="sklearn_robust_scale",
+                modo="ml",
                 confianza=0.90,
                 parametros={"with_centering": True, "with_scaling": True, "quantile_range": [25.0, 75.0]},
                 justificacion_es="RobustScaler usa mediana e IQR en lugar de media y desviación estándar, siendo inmune a outliers severos. Es la estrategia de escalado por defecto recomendada cuando no se ha tratado previamente outliers.",
@@ -591,6 +877,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Centrado_Cero",
                 accion="sklearn_max_abs_scale",
+                modo="ml",
                 confianza=0.85,
                 parametros={},
                 justificacion_es="MaxAbsScaler escala por el valor absoluto máximo, preservando el signo y siendo útil para datos ya centrados en cero o sparse matrices donde no se desea introducir nuevos ceros.",
@@ -598,6 +885,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Gaussianas",
                 accion="sklearn_quantile_transform_uniform",
+                modo="ml",
                 confianza=0.82,
                 parametros={"n_quantiles": 1000, "output_distribution": "uniform", "random_state": 42},
                 justificacion_es="La transformación cuantílica a uniforme aplana cualquier distribución a una uniforme en [0,1], eliminando asimetría y colas pesadas. Es no paramétrica y robusta a la forma de la distribución original.",
@@ -605,6 +893,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Gaussianas",
                 accion="sklearn_quantile_transform_normal",
+                modo="ml",
                 confianza=0.81,
                 parametros={"n_quantiles": 1000, "output_distribution": "normal", "random_state": 42},
                 justificacion_es="La transformación cuantílica a normal fuerza una distribución gaussiana independientemente de la forma original, siendo útil cuando el modelo subyacente asume estrictamente normalidad multivariada.",
@@ -612,6 +901,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_LogNormales",
                 accion="sklearn_power_transform_boxcox",
+                modo="ml",
                 confianza=0.80,
                 parametros={"method": "box-cox", "standardize": True},
                 justificacion_es="PowerTransformer con Box-Cox optimiza la normalidad de variables estrictamente positivas, siendo superior a la transformación logarítmica manual porque estima lambda de máxima verosimilitud.",
@@ -619,6 +909,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Rango_Mixto",
                 accion="sklearn_power_transform_yeo_johnson",
+                modo="ml",
                 confianza=0.80,
                 parametros={"method": "yeo-johnson", "standardize": True},
                 justificacion_es="Yeo-Johnson dentro de PowerTransformer maneja rangos mixtos (positivos, negativos, cero), proporcionando una normalización automática sin requerir pre-procesamiento de signo.",
@@ -626,6 +917,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Nominal", "Cardinalidad_Baja",
                 accion="pd_get_dummies",
+                modo="ml",
                 confianza=0.95,
                 parametros={"drop_first": True, "dtype": "int"},
                 justificacion_es="One-Hot Encoding con drop_first=True elimina la multicolinealidad perfecta (dummy variable trap) y representa categorías nominales en un espacio euclídeo donde todas las categorías son equidistantes.",
@@ -633,6 +925,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Nominal", "Cardinalidad_Baja",
                 accion="sklearn_one_hot_encode",
+                modo="ml",
                 confianza=0.95,
                 parametros={"drop": "first", "sparse_output": False, "dtype": "int", "handle_unknown": "ignore"},
                 justificacion_es="OneHotEncoder de sklearn ofrece manejo de categorías desconocidas en inferencia (handle_unknown='ignore'), siendo preferible a pandas cuando el pipeline se despliega en producción con datos nuevos.",
@@ -640,6 +933,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Ordinal", "Orden_Jerarquico_Conocido",
                 accion="pd_map",
+                modo="ml",
                 confianza=0.94,
                 parametros={},
                 justificacion_es="La codificación ordinal manual preserva la distancia semántica entre niveles jerárquicos (bajo=1, medio=2, alto=3), permitiendo que modelos lineales capturen la monotonicidad inherente.",
@@ -647,6 +941,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Ordinal", "Orden_Jerarquico_Auto",
                 accion="sklearn_ordinal_encode",
+                modo="ml",
                 confianza=0.85,
                 parametros={"handle_unknown": "use_encoded_value", "unknown_value": -1},
                 justificacion_es="OrdinalEncoder de sklearn asigna automáticamente enteros a categorías ordenadas lexicográficamente, preservando la secuencialidad sin intervención manual y manejando valores desconocidos en producción.",
@@ -654,6 +949,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Colinealidad_Alta",
                 accion="sklearn_pca",
+                modo="ml",
                 confianza=0.80,
                 parametros={"n_components": 0.95, "svd_solver": "full"},
                 justificacion_es="PCA transforma variables altamente correlacionadas en componentes ortogonales no correlacionados, eliminando redundancia y reduciendo dimensionalidad mientras retiene el 95% de varianza explicada.",
@@ -697,6 +993,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Nominal", "Ninguno",
         accion="evaluar_encoding_por_cardinalidad",
+        modo="ml",
         parametros={
             "if_low_cardinality": {"max": 15, "action": "onehot_encode"},
             "if_high_cardinality": {"min": 16, "action": "label_encode"},
@@ -707,6 +1004,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Ordinal", "Ninguno",
         accion="ordinal_encode",
+        modo="ml",
         parametros={"strategy": "ordinal_encode"},
         confianza=0.85,
         justificacion_es="Ordinal limpia: encoding ordinal preserva relación de orden entre categorías.",
@@ -728,6 +1026,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Booleana", "Ninguno",
         accion="mantener_como_int",
+        modo="ml",
         parametros={"map_to": {"True": 1, "False": 0}},
         confianza=0.88,
         justificacion_es="Booleana limpia: convertir a 0/1 para compatibilidad con modelos predictivos.",
@@ -758,6 +1057,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Texto_General", "Cardinalidad_Excesiva",
         accion="evaluar_drop_o_hash",
+        modo="ml",
         parametros={"threshold_unique_pct": 80, "strategy": "hash_encode_or_drop"},
         confianza=0.78,
         justificacion_es="Texto con cardinalidad >80%: hash encoding o eliminar. NUNCA OneHot.",
@@ -765,6 +1065,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Nominal", "Cardinalidad_Excesiva",
         accion="label_encode",
+        modo="ml",
         parametros={"strategy": "label_encode", "max_categories": 50},
         confianza=0.82,
         justificacion_es="Categórica nominal con alta cardinalidad: LabelEncode en vez de OneHot.",
@@ -914,12 +1215,14 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     # ── RANGO INVÁLIDO ────────────────────────────────────────
 
+    # Rango_Invalido recibe valores_negativos_inesperados y rango_invalido:
+    # la acción cubre ambos casos.
     kg.add_edge("Variable_Numerica_Continua", "Rango_Invalido",
-        accion="clip_to_valid_range",
-        parametros={"strategy": "clip_or_nan"},
+        accion="set_nan_y_flag",
+        parametros={"aplica_a": ["negativos_inesperados", "fuera_de_rango_logico"], "flag_suffix": "_rango_invalido"},
         confianza=0.83,
-        justificacion_es="Valores fuera de rango lógico (ej: edad=-5, precio=-999) recortados o NaN.",
-        justificacion_en="Values outside logical range (e.g. age=-5, price=-999) clipped or NaN.")
+        justificacion_es="Valores fuera de rango lógico o negativos inesperados según el contexto de la columna (p. ej. edad=-5, cantidad=-2): se marcan con un flag y se reemplazan por NaN para tratarlos como nulos. No se recortan, porque recortar inventa un valor.",
+        justificacion_en="Values outside the logical range or unexpected negatives given the column's context (e.g. age=-5, quantity=-2): flagged and replaced with NaN so they are treated as missing. They are not clipped, because clipping fabricates a value.")
 
     # ── NULOS EN FINANCIERA ───────────────────────────────────
 
@@ -937,12 +1240,15 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
         justificacion_es="Datos financieros: outliers se MARCAN pero NO eliminan ni capan (pueden ser legítimos).",
         justificacion_en="Financial data: outliers FLAGGED but NOT removed or capped (may be legitimate).")
 
+    # Misma acción que en las variables numéricas: cubre negativos inesperados
+    # y montos fuera de rango lógico (también positivos absurdos). No se
+    # recorta porque recortar inventa un monto.
     kg.add_edge("Variable_Financiera", "Rango_Invalido",
-        accion="flag_and_clip",
-        parametros={"flag_negative": True, "clip_min": 0},
+        accion="set_nan_y_flag",
+        parametros={"aplica_a": ["negativos_inesperados", "fuera_de_rango_logico"], "flag_suffix": "_rango_invalido"},
         confianza=0.85,
-        justificacion_es="Montos negativos inesperados: marcar con flag y recortar a 0.",
-        justificacion_en="Unexpected negative amounts: flag and clip to 0.")
+        justificacion_es="Montos negativos inesperados o fuera de rango lógico (p. ej. -50 en un precio o un importe positivo absurdo): se marcan con un flag y se reemplazan por NaN para tratarlos como nulos. No se recortan, porque recortar inventa un valor.",
+        justificacion_en="Unexpected negative or out-of-logical-range amounts (e.g. -50 in a price or an absurd positive amount): flagged and replaced with NaN so they are treated as missing. They are not clipped, because clipping fabricates a value.")
 
     # ── NULOS EN CONTACTO ─────────────────────────────────────
 
@@ -999,22 +1305,91 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Discreta", "Outlier_Severo",
         accion="scipy_winsorize",
+        modo="ml",
         confianza=0.85,
         parametros={"limits": [0.01, 0.01]},
         justificacion_es="Winsorización al 1-99% controla valores extremos en conteos sin eliminar registros.",
         justificacion_en="1-99% winsorization controls extreme count values without dropping records.")
 
-    kg.add_edge("Variable_Numerica_Discreta", "Rango_Invalido",
-        accion="clip_to_valid_range",
+    kg.add_edge("Variable_Numerica_Discreta", "Outlier_Severo",
+        accion="flag_outlier_no_remove",
+        modo="bi",
+        parametros={"strategy": "flag_no_remove", "flag_suffix": "_outlier"},
         confianza=0.85,
-        parametros={"strategy": "clip_or_nan"},
-        justificacion_es="Valores negativos o imposibles en conteos/edades convertidos a NaN.",
-        justificacion_en="Negative or impossible values in counts/ages converted to NaN.")
+        justificacion_es="Para análisis/BI el conteo real se conserva: el outlier se MARCA con un flag y no se elimina ni se recorta.",
+        justificacion_en="For analysis/BI the real count is kept: the outlier is FLAGGED and neither removed nor capped.")
+
+    kg.add_edge("Variable_Numerica_Discreta", "Rango_Invalido",
+        accion="set_nan_y_flag",
+        confianza=0.85,
+        parametros={"aplica_a": ["negativos_inesperados", "fuera_de_rango_logico"], "flag_suffix": "_rango_invalido"},
+        justificacion_es="Valores fuera de rango lógico o negativos inesperados según el contexto de la columna (p. ej. edad=-5, cantidad=-2): se marcan con un flag y se reemplazan por NaN para tratarlos como nulos. No se recortan, porque recortar inventa un valor.",
+        justificacion_en="Values outside the logical range or unexpected negatives given the column's context (e.g. age=-5, quantity=-2): flagged and replaced with NaN so they are treated as missing. They are not clipped, because clipping fabricates a value.")
+
+    # ── VALORES CENTINELA (nulos disfrazados) ─────────────────
+    # -999, 9999, -1… son marcadores de "sin dato", no valores reales ni
+    # outliers: se reemplazan por NaN antes de cualquier imputación.
+    kg.add_node("Valores_Centinela", node_type="problema")
+    for _tipo_centinela in (
+        "Variable_Numerica_Continua",
+        "Variable_Numerica_Discreta",
+        "Variable_Financiera",
+    ):
+        kg.add_edge(_tipo_centinela, "Valores_Centinela",
+            accion="reemplazar_centinela_por_nan",
+            parametros={"centinelas": list(CENTINELAS_NUMERICOS)},
+            confianza=0.92,
+            justificacion_es="Los centinelas (-999, 9999, -1…) codifican nulos: se reemplazan por NaN antes de imputar; nunca se winsorizan ni se imputan como valores reales.",
+            justificacion_en="Sentinels (-999, 9999, -1…) encode missing values: replace them with NaN before imputing; never winsorize or impute them as real values.")
+
+    # Texto y categorías: las cadenas tipo "N/A", "null", "na" son nulos.
+    for _tipo_centinela in (
+        "Variable_Categorica_Nominal",
+        "Variable_Categorica_Ordinal",
+        "Texto_General",
+    ):
+        kg.add_edge(_tipo_centinela, "Valores_Centinela",
+            accion="replace_to_na",
+            parametros={"to_replace": list(CADENAS_NULAS), "value": None},
+            confianza=0.92,
+            justificacion_es="Cadenas centinela ('N/A', 'null', 'na', vacío…) en texto o categorías codifican nulos: se reemplazan por NA antes de imputar o codificar, para que no aparezcan como una categoría más.",
+            justificacion_en="Sentinel strings ('N/A', 'null', 'na', empty…) in text or categories encode missing values: replace them with NA before imputing or encoding, so they do not show up as one more category.")
+
+    # Fechas: no hay una fecha centinela universal (1900-01-01 puede ser real).
+    # La lista es configurable y vacía por defecto; si se usa, SOLO se marca con
+    # un flag: esas fechas nunca se reemplazan ni se imputan.
+    kg.add_edge("Variable_Temporal_Timestamp", "Valores_Centinela",
+        accion="marcar_fecha_centinela",
+        parametros={
+            "fechas_centinela": _fechas_centinela_config(),
+            "configurable_con": "DATAPULSE_FECHAS_CENTINELA",
+            "flag_suffix": "_fecha_centinela",
+            "imputar": False,
+        },
+        confianza=0.85,
+        justificacion_es="Fechas centinela (p. ej. 1900-01-01) configuradas por el usuario: se marcan con un flag y NUNCA se imputan ni se reemplazan, porque inventar una fecha falsea el análisis temporal. Con la lista vacía (por defecto) no se marca nada.",
+        justificacion_en="User-configured sentinel dates (e.g. 1900-01-01): flag them and NEVER impute or replace them, since fabricating a date corrupts temporal analysis. With the list empty (default) nothing is flagged.")
+
+    # ── NEGATIVOS INCIERTOS ──────────────────────────────────
+    # El diagnóstico no pudo decidir si los negativos son válidos: se marcan
+    # para revisión y NO se modifican.
+    kg.add_node("Negativos_Inciertos", node_type="problema")
+    for _tipo_negativos in (
+        "Variable_Numerica_Continua",
+        "Variable_Numerica_Discreta",
+        "Variable_Financiera",
+    ):
+        kg.add_edge(_tipo_negativos, "Negativos_Inciertos",
+            accion="flag_sin_modificar",
+            parametros={"flag_suffix": "_negativo_incierto", "modifica_valores": False},
+            confianza=0.85,
+            justificacion_es="Negativos que el contexto disponible no permite clasificar como válidos o inválidos: se marcan con un flag para revisión y no se modifican, porque cambiarlos podría borrar datos válidos o inventar valores.",
+            justificacion_en="Negative values that the available context cannot classify as valid or invalid: flagged for review and left unchanged, since changing them could erase valid data or fabricate values.")
 
     # ═══════════════════════════════════════════════════════════
     # FIN REGLAS NUEVAS
     # ═══════════════════════════════════════════════════════════
-    return kg
+    return validar_grafo(kg)
 
 # Instanciamos el grafo globalmente para que el nodo 3 lo pueda usar
 KNOWLEDGE_GRAPH = construir_grafo_conocimiento()
@@ -1030,40 +1405,15 @@ Fuentes de evidencia para cada rango/regla documentadas inline.
 """
 
 
-def agregar_reglas_dominio(kg):
-    """
-    Agrega ~120 reglas de dominio a un grafo existente.
-    Llamar después de construir_grafo_conocimiento().
-    """
-    count_before = kg.number_of_edges()
+def _agregar_nodos_dominio(kg, problemas: List[str], tipos: List[str]) -> None:
+    """Declara los nodos propios de un dominio (problemas y tipos de variable)."""
+    kg.add_nodes_from(problemas, node_type="problema_dominio")
+    kg.add_nodes_from(tipos, node_type="tipo_variable_dominio")
 
-    # Nodos de problema de dominio nuevos
-    problemas_dominio = [
-        "Rango_Clinico_Invalido",
-        "Codigo_Medico_Invalido",
-        "Fecha_Clinica_Inconsistente",
-        "Rango_Financiero_Invalido",
-        "Consistencia_Contable_Rota",
-        "Rango_Economico_Invalido",
-        "Rango_Ocupacional_Invalido",
-        "Exposicion_Limite_Excedido",
-    ]
 
-    # Nodos de tipo de variable de dominio nuevos
-    tipos_dominio = [
-        "Variable_Clinica_Signo_Vital",
-        "Variable_Clinica_Laboratorio",
-        "Variable_Clinica_Codigo",
-        "Variable_Clinica_Fecha",
-        "Variable_Financiera_Tasa",
-        "Variable_Financiera_Ratio",
-        "Variable_Economica_Indicador",
-        "Variable_Ocupacional_Exposicion",
-        "Variable_Ocupacional_Incidente",
-    ]
-
-    kg.add_nodes_from(problemas_dominio, node_type="problema_dominio")
-    kg.add_nodes_from(tipos_dominio, node_type="tipo_variable_dominio")
+def agregar_reglas_salud(kg):
+    """Dominio "salud": Salud / datos clínicos (rangos OMS-AHA, códigos médicos, fechas clínicas)."""
+    _agregar_nodos_dominio(kg, ['Rango_Clinico_Invalido', 'Codigo_Medico_Invalido', 'Fecha_Clinica_Inconsistente'], ['Variable_Clinica_Signo_Vital', 'Variable_Clinica_Laboratorio', 'Variable_Clinica_Codigo', 'Variable_Clinica_Fecha'])
 
     # ═══════════════════════════════════════════════════════════════
     #
@@ -1278,6 +1628,12 @@ def agregar_reglas_dominio(kg):
         justificacion_es="Fecha clínica limpia: convertir a datetime, extraer componentes, calcular estancia",
         justificacion_en="Clean clinical date: convert to datetime, extract components, calculate length of stay")
 
+    return kg
+
+
+def agregar_reglas_finanzas(kg):
+    """Dominio "finanzas": Finanzas (tasas, ratios, consistencia contable IFRS)."""
+    _agregar_nodos_dominio(kg, ['Rango_Financiero_Invalido', 'Consistencia_Contable_Rota'], ['Variable_Financiera_Tasa', 'Variable_Financiera_Ratio'])
 
     # ═══════════════════════════════════════════════════════════════
     #
@@ -1401,6 +1757,12 @@ def agregar_reglas_dominio(kg):
         justificacion_es="Validación de ecuación contable básica (IFRS). Filas inconsistentes marcadas.",
         justificacion_en="Basic accounting equation validation (IFRS). Inconsistent rows flagged.")
 
+    return kg
+
+
+def agregar_reglas_economia(kg):
+    """Dominio "economia": Economía / indicadores macroeconómicos (FMI)."""
+    _agregar_nodos_dominio(kg, ['Rango_Economico_Invalido'], ['Variable_Economica_Indicador'])
 
     # ═══════════════════════════════════════════════════════════════
     #
@@ -1483,6 +1845,12 @@ def agregar_reglas_dominio(kg):
         justificacion_es="Indicadores con nulos moderados: NO imputar (distorsiona análisis de política). Marcar.",
         justificacion_en="Indicators with moderate nulls: DO NOT impute (distorts policy analysis). Flag instead.")
 
+    return kg
+
+
+def agregar_reglas_ocupacional(kg):
+    """Dominio "ocupacional": Salud ocupacional / seguridad laboral (OSHA)."""
+    _agregar_nodos_dominio(kg, ['Rango_Ocupacional_Invalido', 'Exposicion_Limite_Excedido'], ['Variable_Ocupacional_Exposicion', 'Variable_Ocupacional_Incidente'])
 
     # ═══════════════════════════════════════════════════════════════
     #
@@ -1618,15 +1986,165 @@ def agregar_reglas_dominio(kg):
         justificacion_es="Incidentes con nulos bajos: 0 es supuesto válido (no reportado = no ocurrió) en contexto OSHA",
         justificacion_en="Incidents with low nulls: 0 is valid assumption (not reported = did not occur) in OSHA context")
 
+    return kg
 
-    # ═══════════════════════════════════════════════════════════════
-    # MAPEO DE TIPOS DE DOMINIO — agregar al TIPO_MAP existente
-    # ═══════════════════════════════════════════════════════════════
 
-    print(f"✅ Reglas de dominio agregadas: {kg.number_of_edges() - count_before} reglas en 4 dominios")
+def agregar_reglas_retail(kg):
+    """
+    Dominio DEMO de retail (ventas de una tienda). No está activo por defecto:
+    actívalo con DOMINIOS_ACTIVOS = ["retail"].
+
+    Los valores de negocio de abajo son VALORES DE EJEMPLO, no decisiones
+    definitivas. Cada regla los recibe como parámetros explícitos de su arista
+    (es lo que lee el ejecutor), así que para cambiarlos basta con editar los
+    diccionarios del inicio de esta función. Las reglas cuelgan de los tipos
+    de variable existentes: las demás reglas de esas columnas (mayúsculas,
+    nulos, tipos mixtos...) siguen aplicándose.
+    """
+    # ── VALORES DE EJEMPLO: ajústalos a tu negocio ──────────────────────
+    # Satisfacción: etiqueta de texto → valor de la escala numérica (1–5).
+    etiquetas_satisfaccion = {"excelente": 5, "muy bueno": 4}
+    # Método de pago: valor ambiguo → categoría propia.
+    reemplazos_metodo_pago = {"TARJETA": "Tarjeta sin especificar"}
+    # Números escritos en palabras → número (ampliable: añade las palabras que uses).
+    numeros_en_palabras = {"tres": 3, "veinte": 20, "treinta": 30}
+    # Total de la compra: se recalcula como el producto de los factores.
+    columna_total = "Total_Compra"
+    factores_total = ["Cantidad_Articulos", "Precio_Unitario"]
+    # ────────────────────────────────────────────────────────────────────
+
+    _agregar_nodos_dominio(kg, ["Satisfaccion_Con_Etiquetas_Texto", "Metodo_Pago_Ambiguo",
+                                "Numeros_En_Palabras", "Total_Compra_Inconsistente"], [])
+    ejemplo_es = "Valor de ejemplo: ajústalo a tu negocio."
+    ejemplo_en = "Example value: adjust it to your business."
+
+    # Satisfacción: la escala puede diagnosticarse como ordinal o como discreta
+    for tipo in ("Variable_Categorica_Ordinal", "Variable_Numerica_Discreta"):
+        kg.add_edge(tipo, "Satisfaccion_Con_Etiquetas_Texto",
+            accion="mapear_etiquetas_satisfaccion_a_numero",
+            parametros={"mapeo": dict(etiquetas_satisfaccion),
+                        "ignorar_mayusculas_y_espacios": True,
+                        "valores_numericos": "sin_cambios"},
+            confianza=0.90,
+            justificacion_es="La satisfacción es una escala numérica: cada etiqueta de texto se "
+                             "traduce al número indicado en 'mapeo'. " + ejemplo_es,
+            justificacion_en="Satisfaction is a numeric scale: each text label is translated to "
+                             "the number given in 'mapeo'. " + ejemplo_en)
+
+    kg.add_edge("Variable_Categorica_Nominal", "Metodo_Pago_Ambiguo",
+        accion="reemplazar_categoria_ambigua",
+        parametros={"reemplazos": dict(reemplazos_metodo_pago),
+                    "coincidir_valor_completo": True,
+                    "ignorar_mayusculas_y_espacios": True},
+        confianza=0.90,
+        justificacion_es="Un método de pago que no dice cuál es (p. ej. 'TARJETA' sin crédito ni "
+                         "débito) no se asigna a otra categoría: pasa a la categoría propia de "
+                         "'reemplazos'. " + ejemplo_es,
+        justificacion_en="A payment method that does not say which one it is (e.g. 'TARJETA' "
+                         "without credit or debit) is not assigned to another category: it goes "
+                         "to its own category from 'reemplazos'. " + ejemplo_en)
+
+    for tipo in ("Variable_Numerica_Continua", "Variable_Numerica_Discreta", "Variable_Financiera"):
+        kg.add_edge(tipo, "Numeros_En_Palabras",
+            accion="convertir_numeros_en_palabras",
+            parametros={"palabras": dict(numeros_en_palabras),
+                        "ignorar_mayusculas_y_espacios": True,
+                        "palabras_no_listadas": "sin_cambios",
+                        "aplicar_antes_de": ["to_numeric_coerce", "pd_to_numeric_coerce"]},
+            confianza=0.90,
+            justificacion_es="Los números escritos en palabras se convierten con la tabla "
+                             "'palabras' antes de pasar la columna a número, para no perderlos "
+                             "como NaN. " + ejemplo_es,
+            justificacion_en="Numbers written in words are converted with the 'palabras' table "
+                             "before the column is made numeric, so they are not lost as NaN. "
+                             + ejemplo_en)
+
+    # El total puede diagnosticarse como financiero o como continua
+    for tipo in ("Variable_Financiera", "Variable_Numerica_Continua"):
+        kg.add_edge(tipo, "Total_Compra_Inconsistente",
+            accion="recalcular_total_y_marcar",
+            parametros={"columna_total": columna_total,
+                        "factores": list(factores_total),
+                        "operacion": "multiplicar",
+                        "redondeo": 2,
+                        "tolerancia": 0.01,
+                        "flag_suffix": "_recalculado",
+                        "marcar_solo_filas_que_cambian": True,
+                        "si_falta_un_factor": "conservar_original",
+                        "aplicar_despues_de": ["convertir_numeros_en_palabras"]},
+            confianza=0.88,
+            justificacion_es="El total se recalcula como el producto de 'factores' y las filas "
+                             "cuyo valor cambia se marcan con el flag. " + ejemplo_es,
+            justificacion_en="The total is recomputed as the product of 'factores' and the rows "
+                             "whose value changes are flagged. " + ejemplo_en)
+
+    return kg
+
+
+# Registro de dominios: nombre → función que agrega sus reglas al grafo.
+# Para un dominio propio, copia agregar_reglas_plantilla y regístralo aquí.
+# "retail" es un dominio de demostración con valores de ejemplo.
+DOMINIOS: Dict[str, Any] = {
+    "salud": agregar_reglas_salud,
+    "finanzas": agregar_reglas_finanzas,
+    "economia": agregar_reglas_economia,
+    "ocupacional": agregar_reglas_ocupacional,
+    "retail": agregar_reglas_retail,
+}
+
+
+def agregar_reglas_dominio(kg, dominios: Optional[List[str]] = None):
+    """
+    Agrega al grafo las reglas de los dominios indicados (sus nodos, tipos y
+    problemas). Sin argumentos agrega TODOS los dominios registrados (salud,
+    finanzas, economía, ocupacional y la demo de retail).
+    Llamar después de construir_grafo_conocimiento().
+    """
+    nombres = list(DOMINIOS) if dominios is None else [str(d).strip().lower() for d in dominios]
+    desconocidos = [n for n in nombres if n not in DOMINIOS]
+    if desconocidos:
+        raise ValueError(f"Dominios desconocidos: {desconocidos}. Registrados: {sorted(DOMINIOS)}.")
+    count_before = kg.number_of_edges()
+    for nombre in nombres:
+        DOMINIOS[nombre](kg)
+    if nombres:
+        print(f"✅ Reglas de dominio agregadas: {kg.number_of_edges() - count_before} reglas "
+              f"({', '.join(nombres)})")
+    else:
+        print("✅ Dominios activos: ninguno (DOMINIOS_ACTIVOS vacía)")
     print(f"   Nodos totales: {kg.number_of_nodes()}")
     print(f"   Edges totales: {kg.number_of_edges()}")
+    return validar_grafo(kg)
 
+
+def agregar_reglas_plantilla(kg):
+    """
+    PLANTILLA para crear un dominio propio (no está registrada ni se aplica).
+
+    1. Copia esta función en datapulse_prod.py como agregar_reglas_<dominio>(kg)
+       (por ejemplo agregar_reglas_retail).
+    2. Declara con _agregar_nodos_dominio los problemas y tipos de variable
+       nuevos del dominio. Puedes colgar reglas de nodos existentes
+       (Variable_Numerica_Continua, Rango_Invalido...).
+    3. Añade cada regla con el formato existente: accion (nombre explícito en
+       snake_case, porque el ejecutor la interpreta como texto), confianza
+       (0–1; gana la mayor para el mismo tipo y problema), parametros (dict
+       explícito), justificacion_es/en y, opcional, modo="bi" | "ml".
+    4. Regístrala en DOMINIOS:  DOMINIOS["<dominio>"] = agregar_reglas_<dominio>
+    5. Actívala en el bloque de configuración:  DOMINIOS_ACTIVOS = ["<dominio>"]
+       (en Colab: dp.DOMINIOS_ACTIVOS = ["<dominio>"] antes de run_datapulse).
+    6. Opcional: alias en TIPO_MAP / PROBLEMA_MAP. Sin alias, el LLM usa el
+       nombre del nodo en minúsculas (Mi_Problema → "mi_problema").
+    7. Al agregar los dominios, validar_grafo comprueba el formato de cada
+       regla y falla indicando qué arista y qué atributo están mal.
+    """
+    _agregar_nodos_dominio(kg, ["Mi_Problema"], ["Variable_Mi_Tipo"])
+    kg.add_edge("Variable_Mi_Tipo", "Mi_Problema",
+        accion="nombre_explicito_de_la_accion",
+        parametros={"parametro": "valor explícito"},
+        confianza=0.80,
+        justificacion_es="Por qué esta acción resuelve este problema en este dominio.",
+        justificacion_en="Why this action solves this problem in this domain.")
     return kg
 
 
@@ -1732,11 +2250,33 @@ PROBLEMA_MAP_DOMINIO = {
     "rango_ocupacional_invalido":      "Rango_Ocupacional_Invalido",
     "exposicion_limite_excedido":      "Exposicion_Limite_Excedido",
     "sobre_limite":                    "Exposicion_Limite_Excedido",
+    # Retail (demo)
+    "etiquetas_texto_en_escala":       "Satisfaccion_Con_Etiquetas_Texto",
+    "numero_en_palabras":              "Numeros_En_Palabras",
+    "total_inconsistente":             "Total_Compra_Inconsistente",
 }
 
-KNOWLEDGE_GRAPH = agregar_reglas_dominio(KNOWLEDGE_GRAPH)
+KNOWLEDGE_GRAPH = agregar_reglas_dominio(KNOWLEDGE_GRAPH, DOMINIOS_ACTIVOS)
+_DOMINIOS_APLICADOS = tuple(DOMINIOS_ACTIVOS)
 TIPO_MAP.update(TIPO_MAP_DOMINIO)
 PROBLEMA_MAP.update(PROBLEMA_MAP_DOMINIO)
+
+
+def aplicar_dominios_activos(forzar: bool = False):
+    """
+    Reconstruye el grafo global (base + DOMINIOS_ACTIVOS) si DOMINIOS_ACTIVOS
+    cambió desde que se construyó (p. ej. dp.DOMINIOS_ACTIVOS = ["salud"] en
+    Colab). Los cambios en caliente hechos antes sobre dp.kg se pierden:
+    fija DOMINIOS_ACTIVOS primero y edita el grafo después.
+    """
+    global KNOWLEDGE_GRAPH, kg, _DOMINIOS_APLICADOS
+    activos = tuple(DOMINIOS_ACTIVOS)
+    if not forzar and activos == _DOMINIOS_APLICADOS:
+        return kg
+    print(f"ℹ️ DOMINIOS_ACTIVOS = {list(activos)}: se reconstruye el grafo de conocimiento.")
+    KNOWLEDGE_GRAPH = kg = agregar_reglas_dominio(construir_grafo_conocimiento(), activos)
+    _DOMINIOS_APLICADOS = activos
+    return kg
 
 # ── Asignar grafo al alias global que usan los nodos del pipeline ──
 kg = KNOWLEDGE_GRAPH
@@ -1755,18 +2295,36 @@ class DataPulseState(TypedDict):
 
     # Diagnóstico
     diagnostico: Dict[str, Any]
+    decisiones_negativos: Dict[str, Dict[str, Any]]   # {columna: {decision, razon, fuente}}
+    discrepancias_negativos: List[Dict[str, Any]]     # vs. PALABRAS_NO_NEGATIVAS (solo informe/audit)
+    avisos_diagnostico: List[str]                     # avisos de la normalización del diagnóstico
+    respuesta_cruda_diagnostico: Optional[str]        # ruta en outputs/ si hubo avisos
     acciones_grafo: Dict[str, Any]
+    modo_salida: str                                  # "bi" | "ml" (MODO_SALIDA al consultar el grafo)
+    omitidos_por_modo: List[Dict[str, Any]]           # problemas cuyas reglas son todas de otro modo
 
-    # Planificación
+    # Planificación (acciones del grafo + respaldo del LLM)
     plan_acciones: List[Dict[str, Any]]
+    sin_regla: List[Dict[str, Any]]   # problemas sin regla en el grafo que el LLM tampoco resolvió
     brief_tecnico: str
 
     # Ejecución
     codigo: str
     intentos: int
     error_history: Annotated[List[str], add]  # LangGraph maneja la reducción
-    score_despues: int
     archivos_generados: Dict[str, str]
+
+    # Validación independiente (node_validar_score recalcula con quality_checker)
+    score_antes: Optional[int]       # score del dataset original
+    score_despues: int               # score real de processed_data.csv
+    score_reportado: Optional[int]   # lo que dijo el script generado (informativo)
+    ruta_processed: Optional[str]    # ruta local de processed_data.csv del intento
+    processed_esperado: bool         # True si el intento debía dejar un processed_data.csv legible
+    residuales: Optional[List[Dict[str, Any]]]  # problemas que quedan en processed_data.csv
+    columnas_nuevas: List[str]                  # en processed pero no en el original (no se evalúan)
+    columnas_eliminadas: List[str]              # del original que ya no están en processed
+    mensaje_ejecucion: Optional[str]            # mensaje final de OpenHands o salida del script
+    directorio_salida: Optional[str] # carpeta local con las salidas del intento
 
     # Fuente del archivo (None = archivo local subido; str = path en repo)
     github_source_branch: Optional[str]
@@ -1797,6 +2355,54 @@ def _is_reasoning_model(model_name: str) -> bool:
     return any(hint in model_name.lower() for hint in _REASONING_MODEL_HINTS)
 
 
+def _falta_repo_github() -> Optional[str]:
+    """Devuelve un mensaje de error si GITHUB_USERNAME o GITHUB_REPO no están definidos."""
+    faltan = [n for n, v in (("GITHUB_USERNAME", GITHUB_USERNAME), ("GITHUB_REPO", GITHUB_REPO)) if not v]
+    if not faltan:
+        return None
+    return (
+        f"Faltan las variables de entorno {', '.join(faltan)}: defínelas con el "
+        "usuario y el repositorio de GitHub donde trabajar (no hay valor por defecto)."
+    )
+
+
+def _get_github_repo():
+    """Abre el repositorio configurado con PyGithub."""
+    try:
+        from github import Auth as GithubAuth
+        g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
+    except ImportError:
+        g = Github(GITHUB_TOKEN)  # fallback para PyGitHub < 1.58
+    return g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+
+
+def _subida_datos_permitida(repo) -> tuple:
+    """
+    Política de subida de datos a GitHub. Solo se permite subir datasets o
+    archivos de datos si DATAPULSE_PERMITIR_SUBIDA_DATOS=1 Y el repo es privado.
+    Devuelve (permitido: bool, motivo: str).
+    """
+    if os.environ.get("DATAPULSE_PERMITIR_SUBIDA_DATOS", "").strip() != "1":
+        return False, "DATAPULSE_PERMITIR_SUBIDA_DATOS no vale 1"
+    if getattr(repo, "private", False) is not True:
+        nombre = getattr(repo, "full_name", None) or f"{GITHUB_USERNAME}/{GITHUB_REPO}"
+        return False, f"el repositorio {nombre} no es privado"
+    return True, "permitido (DATAPULSE_PERMITIR_SUBIDA_DATOS=1 y repo privado)"
+
+
+EXTENSIONES_DATOS = (".csv", ".tsv", ".xlsx", ".xls", ".parquet", ".pq")
+# JSON que son reportes y no datos: se pueden subir siempre
+JSON_REPORTES = ("quality_report.json", "cleaning_log.json", "audit_log.json")
+
+
+def _es_archivo_datos(path: str) -> bool:
+    """True si el archivo contiene datos (no un script ni un reporte)."""
+    nombre = os.path.basename(path).lower()
+    if nombre.endswith(EXTENSIONES_DATOS):
+        return True
+    return nombre.endswith(".json") and nombre not in JSON_REPORTES
+
+
 def get_groq_llm():
     kwargs = dict(
         groq_api_key=GROQ_API_KEY,
@@ -1813,6 +2419,82 @@ def get_groq_llm():
     else:
         kwargs["temperature"] = 0.1
     return ChatGroq(**kwargs)
+
+
+class _RespuestaLLM:
+    """Respuesta mínima con la misma forma que la de LangChain (``.content``)."""
+
+    def __init__(self, content: str):
+        self.content = content
+
+
+class ClaudeLLM:
+    """
+    Adaptador de Claude con la interfaz que usan los nodos: ``invoke(mensajes)``
+    devuelve un objeto con ``.content`` (texto). Usa el SDK oficial ``anthropic``.
+
+    - Pensamiento adaptativo (en Sonnet 5.5 no se puede desactivar); la
+      profundidad se controla con ``effort``. Sin temperature: el modelo la rechaza.
+    - Streaming con max_tokens amplio: el pensamiento también consume tokens.
+    - Fallback del servidor ante rechazos (``fallbacks="default"``).
+    """
+
+    MAX_TOKENS = 64000
+    BETA_FALLBACK = "server-side-fallback-2026-07-01"
+
+    def __init__(self, client, model: str, effort: str):
+        self.client = client
+        self.model = model
+        self.effort = effort
+
+    def invoke(self, mensajes) -> _RespuestaLLM:
+        texto_usuario = "\n\n".join(getattr(m, "content", str(m)) for m in mensajes)
+        with self.client.beta.messages.stream(
+            model=self.model,
+            max_tokens=self.MAX_TOKENS,
+            output_config={"effort": self.effort},
+            betas=[self.BETA_FALLBACK],
+            fallbacks="default",
+            messages=[{"role": "user", "content": texto_usuario}],
+        ) as stream:
+            mensaje = stream.get_final_message()
+
+        # Comprobar el motivo de parada antes de leer el contenido
+        if mensaje.stop_reason == "refusal":
+            detalles = getattr(mensaje, "stop_details", None)
+            categoria = getattr(detalles, "category", None)
+            raise RuntimeError(f"Claude declinó la petición (categoría: {categoria}).")
+        if mensaje.stop_reason == "max_tokens":
+            print(f"   ⚠️ La respuesta de Claude llegó al límite de {self.MAX_TOKENS} tokens; "
+                  "se intentará rescatar el JSON parcial.")
+        if getattr(mensaje, "model", self.model) != self.model:
+            print(f"   ℹ️ Respondió {mensaje.model} (fallback del servidor).")
+
+        # Solo los bloques de texto: los de pensamiento no forman parte de la respuesta
+        texto = "".join(b.text for b in mensaje.content if getattr(b, "type", "") == "text")
+        return _RespuestaLLM(texto)
+
+
+def get_claude_llm() -> ClaudeLLM:
+    """Crea el cliente de Anthropic con la clave leída (nunca desde el código)."""
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError(
+            "Falta ANTHROPIC_API_KEY: agrégala como secreto de Colab o variable de entorno, "
+            "o usa Groq con DATAPULSE_LLM=groq."
+        )
+    try:
+        import anthropic
+    except ImportError as exc:
+        raise RuntimeError(
+            "Falta el paquete 'anthropic': instala las dependencias con "
+            "pip install -r requirements.txt"
+        ) from exc
+    return ClaudeLLM(anthropic.Anthropic(api_key=ANTHROPIC_API_KEY), CLAUDE_MODEL, CLAUDE_EFFORT)
+
+
+def get_llm():
+    """LLM configurado: Claude (por defecto con ANTHROPIC_API_KEY) o Groq."""
+    return get_claude_llm() if LLM_PROVEEDOR == "claude" else get_groq_llm()
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -1955,35 +2637,219 @@ def extract_json_from_markdown(text: str) -> dict:
         f"Inicio de la respuesta: {cleaned[:300]!r}"
     )
 
+_RE_EMAIL = re.compile(r"([A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]*@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
+_RE_DIGITOS_LARGOS = re.compile(r"\d{6,}")
+
+
+def _patron_forma(valor: str) -> str:
+    """Reduce un texto a su forma: letras → a/A, dígitos → 9, resto igual."""
+    return "".join(
+        ("A" if c.isupper() else "a") if c.isalpha() else ("9" if c.isdigit() else c)
+        for c in valor
+    )
+
+
+def _enmascarar_valor(valor: str) -> str:
+    """Enmascara emails (u***@dominio) y secuencias de 6+ dígitos (→ 9…9)."""
+    valor = _RE_EMAIL.sub(lambda m: f"{m.group(1)}***@{m.group(2)}", valor)
+    return _RE_DIGITOS_LARGOS.sub(lambda m: "9" * len(m.group(0)), valor)
+
+
+# Columnas de nombres de persona (se reducen a su forma: "José Muñoz" → "Aaaa Aaaaa").
+PALABRAS_NOMBRE_PERSONA = (
+    "nombre", "nombres", "name", "names", "apellido", "apellidos",
+    "surname", "lastname", "firstname", "fullname",
+)
+# ...salvo que el nombre sea de otra cosa (producto, ciudad, archivo...)
+PALABRAS_NOMBRE_NO_PERSONA = (
+    "producto", "product", "articulo", "item", "archivo", "file", "empresa", "company",
+    "tienda", "store", "ciudad", "city", "pais", "country", "categoria", "category",
+    "marca", "brand", "calle", "street", "columna", "column", "campo", "field",
+)
+# Identificadores y contactos personales: aunque la columna sea numérica, sus
+# secuencias de 6+ dígitos se enmascaran (cédulas, teléfonos, cuentas...).
+PALABRAS_ID_PERSONAL = (
+    "cedula", "dni", "rut", "nif", "nie", "curp", "rfc", "ssn", "pasaporte", "passport",
+    "documento", "telefono", "phone", "celular", "movil", "mobile", "cuenta", "account",
+    "tarjeta", "card", "iban",
+)
+
+MAX_MUESTRA = 3
+MAX_ANOMALOS = 3
+MAX_EJEMPLOS_NO_NUMERICOS = 5
+
+
+def _es_columna_nombre(col) -> bool:
+    return _nombre_contiene(col, PALABRAS_NOMBRE_PERSONA) and \
+        not _nombre_contiene(col, PALABRAS_NOMBRE_NO_PERSONA)
+
+
+def _lectura_columna(serie: pd.Series, indices) -> str:
+    """Cómo se lee la columna: indice, booleana, numerica, mayormente_numerica, fecha o texto."""
+    if serie.name in indices:
+        return "indice"
+    if pd.api.types.is_bool_dtype(serie):
+        return "booleana"
+    if pd.api.types.is_numeric_dtype(serie):
+        return "numerica"
+    if pd.api.types.is_datetime64_any_dtype(serie):
+        return "fecha"
+    if es_mayormente_numerica(serie):
+        return "mayormente_numerica"
+    if es_mayormente_fecha(serie):
+        return "fecha"
+    return "texto"
+
+
+def _enmascarador(col, lectura: str):
+    """
+    Función de enmascarado según el tipo de dato personal de la columna:
+    - nombres de persona → patrón de forma;
+    - texto → emails (u***@dominio) y secuencias de 6+ dígitos (9…9);
+    - columnas que se leen como número o fecha → NUNCA se enmascaran, salvo
+      identificadores/contactos personales (cédula, teléfono...) → 6+ dígitos.
+    """
+    if lectura in ("numerica", "mayormente_numerica", "fecha", "indice", "booleana"):
+        return _enmascarar_valor if _nombre_contiene(col, PALABRAS_ID_PERSONAL) else (lambda v: v)
+    if _es_columna_nombre(col):
+        return _patron_forma
+    return _enmascarar_valor
+
+
+def _enmascarar_muestra(serie: pd.Series, muestra: List[str]) -> List[str]:
+    """Enmascara valores de una columna según su tipo de dato personal (no por cardinalidad)."""
+    funcion = _enmascarador(serie.name, _lectura_columna(serie, columnas_indice(serie.to_frame())))
+    return [funcion(v) for v in muestra]
+
+
+def _num(valor) -> Optional[float]:
+    """float JSON-serializable (None si es NaN)."""
+    return None if valor is None or pd.isna(valor) else float(valor)
+
+
+def _resumen_numerico(numeros: pd.Series) -> Dict[str, Any]:
+    numeros = numeros.dropna()
+    return {
+        "min": _num(numeros.min()) if len(numeros) else None,
+        "max": _num(numeros.max()) if len(numeros) else None,
+        "mean": _num(numeros.mean()) if len(numeros) else None,
+        "std": _num(numeros.std()) if len(numeros) > 1 else None,
+        "skewness": _num(numeros.skew()) if len(numeros) > 2 else None,
+        "negativos": int((numeros < 0).sum()),
+        "ceros": int((numeros == 0).sum()),
+    }
+
+
+def _formato_valor(v) -> str:
+    """Texto de un valor para la muestra (sin '.0' en enteros guardados como float)."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _unicos(valores, limite: int) -> List[str]:
+    vistos = []
+    for v in valores:
+        texto = _formato_valor(v)
+        if texto not in vistos:
+            vistos.append(texto)
+        if len(vistos) >= limite:
+            break
+    return vistos
+
+
+def _enmascarado_activo() -> bool:
+    """El enmascarado está activo salvo DATAPULSE_ENMASCARAR=0."""
+    return os.environ.get("DATAPULSE_ENMASCARAR", "1").strip() != "0"
+
+
 def serialize_metadata(df: pd.DataFrame, filename: str) -> dict:
-    """Produce la metadata estructurada exacta del documento del proyecto."""
+    """
+    Metadata estructurada que recibe el LLM para diagnosticar.
+
+    Además de nulos, cardinalidad y una muestra de las primeras filas, expone
+    los problemas que una muestra corta no deja ver:
+    - columnas índice (enteros únicos consecutivos), excluidas de duplicados;
+    - en columnas mayormente numéricas guardadas como texto: estadísticos de la
+      parte convertible y conteo/ejemplos de los valores no numéricos;
+    - negativos y ceros en columnas numéricas;
+    - formatos y fechas imposibles en columnas de fecha;
+    - muestra_anomala: hasta 3 valores problemáticos (no numéricos, extremos
+      por IQR, fechas imposibles).
+    Los valores se enmascaran según el tipo de dato personal (desactivable con
+    DATAPULSE_ENMASCARAR=0); las columnas de números y fechas no se enmascaran.
+    """
+    enmascarar = _enmascarado_activo()
+    indices = columnas_indice(df)
     cols_info = {}
     for col in df.columns:
         s = df[col]
+        no_nulos = s.dropna()
+        lectura = _lectura_columna(s, indices)
+        mascara = _enmascarador(col, lectura) if enmascarar else (lambda v: v)
+
         info = {
             "dtype_pandas": str(s.dtype),
+            "lectura": lectura,
             "null_count": int(s.isna().sum()),
             "null_pct": round(s.isna().mean() * 100, 2),
             "unique_count": int(s.nunique(dropna=False)),
-            "muestra": s.dropna().head(3).astype(str).tolist()
+            "muestra": [mascara(_formato_valor(v)) for v in no_nulos.head(MAX_MUESTRA)],
         }
-        if pd.api.types.is_numeric_dtype(s):
-            info["min"] = float(s.min()) if not pd.isna(s.min()) else None
-            info["max"] = float(s.max()) if not pd.isna(s.max()) else None
-            info["mean"] = float(s.mean()) if not pd.isna(s.mean()) else None
-            info["std"] = float(s.std()) if not pd.isna(s.std()) else None
-            info["skewness"] = float(s.skew()) if not pd.isna(s.skew()) else None
+        anomalos: List[str] = []
+        # Identificadores personales (cédula, teléfono...): ni estadísticos ni
+        # extremos, porque mostrarían los valores reales.
+        id_personal = enmascarar and _nombre_contiene(col, PALABRAS_ID_PERSONAL)
+
+        if lectura in ("numerica", "mayormente_numerica") and id_personal:
+            info["identificador_personal"] = True
+            numeros = convertir_numerico(no_nulos)
+            info["negativos"] = int((numeros < 0).sum())
+            info["ceros"] = int((numeros == 0).sum())
+        elif lectura == "indice":
+            info["es_indice"] = True
+            info.update({"min": _num(s.min()), "max": _num(s.max())})
+        elif lectura == "numerica":
+            info.update(_resumen_numerico(s.astype(float)))
+            anomalos = _unicos(extremos_iqr(s.astype(float)), MAX_ANOMALOS)
+        elif lectura == "mayormente_numerica":
+            numeros = convertir_numerico(no_nulos)
+            no_numericos = no_nulos[numeros.isna()]
+            info["pct_numerico"] = round(numeros.notna().mean() * 100, 2)
+            info.update(_resumen_numerico(numeros))
+            info["no_numericos"] = {
+                "conteo": int(len(no_numericos)),
+                "ejemplos": [mascara(v) for v in _unicos(no_numericos, MAX_EJEMPLOS_NO_NUMERICOS)],
+            }
+            anomalos = _unicos(list(no_numericos.unique()[:2]) + list(extremos_iqr(numeros)),
+                               MAX_ANOMALOS)
+        elif lectura == "fecha":
+            imposibles = fechas_imposibles(s)
+            info["fechas_imposibles"] = int(len(imposibles))
+            if not pd.api.types.is_datetime64_any_dtype(s):
+                formas = no_nulos.astype(str).str.strip().str.replace(r"\d", "9", regex=True)
+                info["formatos_fecha"] = {k: int(v) for k, v in formas.value_counts().head(5).items()}
+                validas = parsear_fechas_flexible(no_nulos).dropna()
+            else:
+                validas = no_nulos
+            if len(validas):
+                info["rango_fechas"] = {"min": str(validas.min().date()), "max": str(validas.max().date())}
+            anomalos = _unicos(imposibles, MAX_ANOMALOS)
+
+        if lectura in ("numerica", "mayormente_numerica", "fecha") and not id_personal:
+            info["muestra_anomala"] = [mascara(v) for v in anomalos]
         cols_info[col] = info
 
-    dupes = int(df.duplicated().sum())
+    duplicados = check_duplicates(df)
     return {
         "filename": filename,
         "formato": filename.split(".")[-1].lower(),
         "filas": len(df),
         "columnas": len(df.columns),
         "columnas_info": cols_info,
-        "duplicados_exactos": dupes,
-        "duplicados_pct": round(dupes / len(df) * 100, 2) if len(df) > 0 else 0.0
+        "columnas_indice": [str(c) for c in indices],
+        "duplicados_exactos": duplicados["count"],
+        "duplicados_pct": float(duplicados["pct"]),
     }
 
 
@@ -1992,19 +2858,9 @@ def serialize_metadata(df: pd.DataFrame, filename: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def node_ingestar(state: DataPulseState) -> DataPulseState:
-    path = state["filename_path"]
-    ext = state["file_ext"].lower()
-
-    if ext == "csv":
-        df = pd.read_csv(path, encoding="utf-8", low_memory=False)
-    elif ext in ("xlsx", "xls"):
-        df = pd.read_excel(path)
-    elif ext == "json":
-        df = pd.read_json(path)
-    elif ext in ("parquet", "pq"):
-        df = pd.read_parquet(path)
-    else:
-        raise ValueError(f"Formato no soportado: {ext}")
+    # Cargador único (src/quality_checker.py): detecta encoding y separador
+    # y lanza ValueError ante extensiones no soportadas.
+    df = load_dataset(state["filename_path"])
 
     metadata = serialize_metadata(df, state["filename"])
     return {"metadata": metadata}
@@ -2017,38 +2873,29 @@ def node_ingestar(state: DataPulseState) -> DataPulseState:
 DIAGNOSTIC_PROMPT = """Eres un ingeniero de datos senior especializado en calidad de datos. Analiza la metadata del dataset y devuelve UN SOLO JSON válido (sin markdown, sin explicaciones) con el diagnóstico por columna.
 
 Para cada columna, infiere estos campos:
-- tipo_inferido: uno de [numerica_continua_simetrica, numerica_continua_sesgada, numerica_discreta, binaria, categorica_nominal, categorica_ordinal, temporal_fecha_puntual, temporal_serie, texto_libre, identificador, contacto, financiero, signo_vital, laboratorio, codigo_medico, fecha_clinica, tasa_interes, ratio_financiero, indicador_economico, exposicion, incidente]
+- tipo_inferido: UNA etiqueta de esta lista. Cada línea es un tipo de variable del Grafo de Conocimiento (entre paréntesis) con las etiquetas que lo representan:
+{vocabulario_tipos}
 - dtype_actual: el dtype de pandas
-- problemas: LISTA de todos los problemas detectados (puede tener varios). Valores posibles:
-    nulos_bajos, nulos_medios, nulos_altos, nulos_criticos,
-    outlier_severo, outlier_extremo,
-    nulos_disfrazados,          ← valores centinela como -999, -1, 9999, 99, 0 en contextos donde 0 es inválido
-    duplicados,                 ← solo para filas enteras o columnas identificador con valores repetidos
-    inconsistencia_formato,     ← mezcla de formatos (fechas, emails, teléfonos inválidos)
-    tipo_incorrecto,            ← columna debería ser numérica pero es object
-    escala_diferente,
-    cardinalidad_baja, cardinalidad_media, cardinalidad_excesiva,
-    colinealidad_alta,
-    valores_negativos_inesperados, ← negativos en columnas que deberían ser ≥0 (edad, precio, cantidad)
-    rango_clinico_invalido, codigo_medico_invalido, fecha_clinica_inconsistente,
-    rango_financiero_invalido, consistencia_contable, rango_economico_invalido,
-    rango_ocupacional_invalido, exposicion_limite_excedido,
-    ninguno
+- problemas: LISTA de todos los problemas detectados (puede tener varios). Cada línea es un problema que el Grafo de Conocimiento sabe tratar (entre paréntesis) con sus etiquetas:
+{vocabulario_problemas}
+    Si detectas un problema real que no corresponde a ninguna etiqueta, inclúyelo igualmente con una etiqueta descriptiva en snake_case: quedará registrado como problema sin regla en el grafo (se informa, no se limpia). Si la columna no tiene problemas, usa "ninguno".
 - problema_principal: el problema más crítico de la lista (una sola cadena)
+- negativos: SOLO en columnas con "negativos" > 0 en la metadata. Uno de: "validos" (por lo que mide la columna los negativos tienen sentido, p. ej. temperaturas o variaciones), "invalidos" (no tienen sentido, p. ej. edades o cantidades de artículos) o "incierto" (el nombre, las muestras y el contexto no permiten decidir).
+- razon_negativos: una frase que explique esa decisión según lo que mide la columna.
 - severidad: uno de [baja, media, alta, critica]
 - detalle: descripción concreta de cada problema encontrado. Incluir valores específicos si los ves en la muestra.
 
 REGLAS CRÍTICAS DE DIAGNÓSTICO (aplican a CUALQUIER dataset, dominio o idioma):
-1. CENTINELAS NUMÉRICOS: Valores como -999, -1, -9999, 9999, 999, 99, 0 en contextos donde 0 es inválido (edad, ID, presión) → "nulos_disfrazados", NO "outlier_severo". Detectar por: min/max extremos que no tienen sentido en el contexto de la columna.
+1. CENTINELAS: Valores como -999, -1, -9999, 9999, 999, 99, 0 en contextos donde 0 es inválido (edad, ID, presión) → "nulos_disfrazados", NO "outlier_severo". Detectar por: min/max extremos que no tienen sentido en el contexto de la columna. En texto y categorías, cadenas como "N/A", "null", "na", "None" o vacías también son "nulos_disfrazados". En fechas, una fecha marcador repetida (p. ej. 1900-01-01) → "nulos_disfrazados".
 2. FORMATO TEXTO: Si la muestra contiene strings que no cumplen el patrón esperado del dominio (emails sin @, teléfonos con letras, fechas con formato mixto, códigos con longitud incorrecta) → "inconsistencia_formato".
 3. IDENTIFICADORES: Columnas con nombres que contengan id, cod, code, num, key, clave, folio, ticket, cedula, rut, dni, ssn, nit, rfc → tipo "identificador". Si unique_count < total filas → añadir "duplicados".
-4. NEGATIVOS INESPERADOS: Valores negativos en columnas de monto, precio, costo, edad, peso, altura, cantidad, stock, distancia, duración → "valores_negativos_inesperados". OJO: saldos bancarios y márgenes SÍ pueden ser negativos.
+4. NEGATIVOS INESPERADOS: usa los campos "negativos" y "min" de la metadata y el CONTEXTO DEL DATASET. Un negativo no es un error por sí mismo: decide según lo que mide la columna y devuelve "negativos" y "razon_negativos". Si decides "invalidos", incluye "valores_negativos_inesperados" en problemas; si "incierto", incluye "negativos_inciertos"; si "validos", no los marques como problema.
 5. MÚLTIPLES PROBLEMAS: Cada columna debe listar TODOS sus problemas. Ejemplos genéricos:
    - Columna numérica con nulo + negativo → ["nulos_bajos", "valores_negativos_inesperados"]
    - Columna de texto con espacios + casing mixto → ["espacios_extra", "inconsistencia_formato"]
    - Columna ID con duplicados + valores faltantes → ["duplicados", "nulos_bajos"]
-6. DUPLICADOS DE FILAS: Si unique_count del ID principal es menor que el total de filas, hay filas duplicadas. Reportar en la columna ID con "duplicados".
-7. TIPOS MIXTOS: Si dtype es object pero la muestra tiene mezcla de números y texto → "tipos_mixtos".
+6. DUPLICADOS DE FILAS: "duplicados_exactos" cuenta filas idénticas sin tener en cuenta las columnas índice. Si es > 0, o si unique_count del ID principal es menor que el total de filas, reportar "duplicados" en la columna ID.
+7. TIPOS MIXTOS: Si lectura es "mayormente_numerica" (números guardados como texto, con "no_numericos" > 0) o la muestra mezcla números y texto → "tipos_mixtos". Los ejemplos de "no_numericos" muestran qué hay que convertir (p. ej. números escritos en palabras).
 8. CARDINALIDAD: unique_count / total_filas > 80% en texto → "cardinalidad_excesiva". < 10 valores únicos en numérica → puede ser discreta o categórica.
 9. COLUMNAS CONSTANTES: Si unique_count == 1 (o == 2 con nulos) → "valores_constantes".
 10. SKEWNESS: |skewness| > 1 → "numerica_continua_sesgada". |skewness| <= 1 → "numerica_continua_simetrica".
@@ -2059,17 +2906,303 @@ Reglas de severidad:
 - null_pct 30-60% O centinela O negativo inesperado → alta
 - null_pct >= 60% O centinelas absurdos O múltiples problemas críticos → critica
 
+CÓMO LEER LA METADATA:
+- lectura: cómo se lee la columna (indice, numerica, mayormente_numerica, fecha, texto, booleana).
+- muestra: los primeros valores no nulos. muestra_anomala: hasta 3 valores problemáticos (no numéricos en una columna numérica, extremos por IQR, fechas imposibles). Úsala: ahí están los problemas que la muestra no enseña.
+- min, max, mean, std, skewness, negativos, ceros: en columnas numéricas y mayormente numéricas (calculados sobre la parte convertible).
+- fechas_imposibles, formatos_fecha, rango_fechas: en columnas de fecha. Varios formatos_fecha → "inconsistencia_formato"; fechas_imposibles > 0 → también.
+- columnas_indice / es_indice: columnas índice (enteros únicos consecutivos, como "Row"). No son datos: diagnostícalas como "identificador" con problema "ninguno".
+- Enmascarado de datos personales: los emails aparecen como u***@dominio, las secuencias de 6 o más dígitos como 9…9 y las columnas de nombres de persona como su forma ("Aaaa Aaaaa"). Es un efecto del enmascarado, NO un problema del dato: no lo diagnostiques como formato inválido. Las columnas de números y fechas nunca se enmascaran, salvo las de identificadores personales (identificador_personal: true), que llegan sin estadísticos.
+
+FORMATO DE SALIDA (obligatorio):
+Un objeto JSON cuyas claves son EXACTAMENTE los nombres de columna que aparecen en "columnas_info" de la metadata (todas, escritas igual) y cuyo valor es el objeto de diagnóstico de esa columna. No añadas ninguna otra clave: nada de resúmenes, notas generales ni envoltorios como "diagnostico" o "columnas".
+
+CONTEXTO DEL DATASET (lo indica el usuario; úsalo para decidir qué valores son válidos):
+{contexto_dataset}
+
 Metadata:
 {metadata_json}
 
 Responde SOLO con el JSON. No incluyas ```json ni ```."""
 
+def _nodos_grafo() -> tuple:
+    """(nodos tipo, nodos problema) que tienen alguna regla en el grafo vigente."""
+    tipos = sorted({u for u, _ in kg.edges() if u != NODO_ESQUEMA_GENERAL})
+    problemas = sorted({v for _, v in kg.edges()})
+    return tipos, problemas
+
+
+def _etiquetas_nodo(nodo: str, mapa: Dict[str, Any]) -> List[str]:
+    """Etiquetas que el LLM puede usar para un nodo: sus alias y su propio nombre."""
+    etiquetas = [alias for alias, destino in mapa.items() if destino == nodo]
+    propio = nodo.lower()
+    if propio not in etiquetas:
+        etiquetas.append(propio)
+    return etiquetas
+
+
+def vocabulario_grafo() -> Dict[str, Dict[str, List[str]]]:
+    """
+    Vocabulario que se ofrece al LLM, generado del grafo vigente: así cualquier
+    nodo que el usuario agregue (aunque no tenga alias) es alcanzable.
+    """
+    tipos, problemas = _nodos_grafo()
+    return {
+        "tipos": {n: _etiquetas_nodo(n, TIPO_MAP) for n in tipos},
+        "problemas": {n: _etiquetas_nodo(n, PROBLEMA_MAP) for n in problemas},
+    }
+
+
+def construir_prompt_diagnostico(metadata: dict) -> str:
+    """Rellena DIAGNOSTIC_PROMPT con la metadata y el vocabulario del grafo vigente."""
+    vocab = vocabulario_grafo()
+
+    def _lineas(nodos):
+        return "\n".join(f"    · {', '.join(etiquetas)}  ({nodo})" for nodo, etiquetas in nodos.items())
+
+    return DIAGNOSTIC_PROMPT.format(
+        metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2),
+        vocabulario_tipos=_lineas(vocab["tipos"]),
+        vocabulario_problemas=_lineas(vocab["problemas"]),
+        contexto_dataset=contexto_dataset() or "No indicado.",
+    )
+
+
+def contexto_dataset() -> str:
+    """CONTEXTO_DATASET si tiene texto; si no, la variable de entorno DATAPULSE_CONTEXTO."""
+    return (CONTEXTO_DATASET or "").strip() or os.environ.get("DATAPULSE_CONTEXTO", "").strip()
+
+
+def _avisar(avisos: Optional[List[str]], mensaje: str) -> None:
+    """Imprime un aviso del diagnóstico y lo guarda (estado, audit_log, informe)."""
+    print(f"   ⚠️ {mensaje}")
+    if avisos is not None:
+        avisos.append(mensaje)
+
+
+_CLAVES_ENVOLTORIO = ("diagnostico", "diagnóstico", "diagnosis", "columnas", "columns",
+                      "diagnostico_por_columna", "resultado", "result")
+_CLAVES_NOMBRE_COLUMNA = ("columna", "column", "nombre_columna", "nombre", "name")
+
+
+def _normalizar_diagnostico(crudo: Any, columnas: List[str],
+                            columnas_info: Optional[Dict[str, Any]] = None,
+                            decisiones_usuario: Optional[Dict[str, Any]] = None,
+                            avisos: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Deja el diagnóstico del LLM como {columna_real: {diagnóstico}}.
+
+    El LLM no siempre respeta la forma pedida: a veces añade claves de resumen
+    (texto), envuelve todo en otra clave o devuelve una lista. Se desenvuelve,
+    se convierte la lista y se descarta lo que no sea el diagnóstico (dict) de
+    una columna real, avisando de lo ignorado y de lo que falta.
+
+    Con ``columnas_info`` (metadata), valida la decisión sobre negativos en
+    las columnas con negativos > 0 (ver ``_aplicar_decision_negativos``).
+    """
+    columnas = [str(c) for c in columnas]
+    reales = set(columnas)
+
+    # Lista de objetos con el nombre de la columna dentro
+    if isinstance(crudo, list):
+        convertido = {}
+        for item in crudo:
+            if isinstance(item, dict):
+                nombre = next((item[k] for k in _CLAVES_NOMBRE_COLUMNA if k in item), None)
+                if nombre is not None:
+                    convertido[str(nombre)] = item
+        crudo = convertido
+    if not isinstance(crudo, dict):
+        raise ValueError("El diagnóstico del LLM no es un objeto JSON por columna.")
+
+    # Envoltorio: ninguna clave es una columna, pero dentro hay columnas
+    if reales and not (reales & set(map(str, crudo))):
+        for clave in _CLAVES_ENVOLTORIO + tuple(crudo):
+            interno = crudo.get(clave)
+            if isinstance(interno, (dict, list)):
+                try:
+                    return _normalizar_diagnostico(interno, columnas, columnas_info,
+                                                   decisiones_usuario, avisos)
+                except ValueError:
+                    continue
+
+    normalizado, ignoradas = {}, []
+    for clave, valor in crudo.items():
+        clave = str(clave)
+        if (not reales or clave in reales) and isinstance(valor, dict):
+            normalizado[clave] = valor
+        else:
+            ignoradas.append(clave)
+    if ignoradas:
+        _avisar(avisos, f"Diagnóstico: se ignoran claves que no son el diagnóstico de una columna: {ignoradas}")
+    faltan = [c for c in columnas if c not in normalizado]
+    if faltan:
+        _avisar(avisos, f"Diagnóstico: columnas sin diagnóstico del LLM: {faltan}")
+    if not normalizado:
+        raise ValueError(
+            "El diagnóstico del LLM no contiene ninguna columna del dataset "
+            f"(claves recibidas: {list(map(str, crudo))[:10]})."
+        )
+    for col, info in (columnas_info or {}).items():
+        if str(col) in normalizado and (info or {}).get("negativos", 0) > 0:
+            _aplicar_decision_negativos(str(col), normalizado[str(col)], decisiones_usuario or {},
+                                        avisos)
+    return normalizado
+
+
+PROBLEMA_NEGATIVOS_INVALIDOS = "valores_negativos_inesperados"
+PROBLEMA_NEGATIVOS_INCIERTOS = "negativos_inciertos"
+
+
+def _aplicar_decision_negativos(col: str, diag: Dict[str, Any],
+                                decisiones_usuario: Dict[str, Any],
+                                avisos: Optional[List[str]] = None) -> None:
+    """
+    Fija la decisión sobre los negativos de una columna y la refleja en sus
+    problemas:
+    - "invalidos" → asegura valores_negativos_inesperados (regla de Rango_Invalido);
+    - "incierto"  → añade negativos_inciertos (regla de Negativos_Inciertos);
+    - "validos"   → no son un problema.
+    DECISIONES_NEGATIVOS del usuario reemplaza la decisión del LLM (fuente
+    "usuario"). Si el LLM no devolvió el campo "negativos" (o no es válido):
+    con la etiqueta valores_negativos_inesperados la decisión es "invalidos";
+    con negativos_inciertos, "incierto"; sin ninguna señal, "incierto". Si el
+    campo y la etiqueta se contradicen, manda el campo. Todo con aviso.
+    """
+    usuario = {str(k): v for k, v in decisiones_usuario.items()}.get(col)
+    decision_usuario = normalizar_decision_negativos(usuario) if usuario is not None else None
+    if usuario is not None and decision_usuario not in ("validos", "invalidos"):
+        _avisar(avisos, f"DECISIONES_NEGATIVOS['{col}']={usuario!r} no es 'validos' ni 'invalidos': se ignora.")
+        decision_usuario = None
+
+    problemas = diag.get("problemas") or diag.get("problema") or []
+    if isinstance(problemas, str):
+        problemas = [problemas]
+    problemas = [str(p).strip().lower() for p in problemas if p]
+    # Decisión que implican las etiquetas del propio LLM (su señal)
+    if PROBLEMA_NEGATIVOS_INVALIDOS in problemas:
+        por_etiqueta, etiqueta = "invalidos", PROBLEMA_NEGATIVOS_INVALIDOS
+    elif PROBLEMA_NEGATIVOS_INCIERTOS in problemas:
+        por_etiqueta, etiqueta = "incierto", PROBLEMA_NEGATIVOS_INCIERTOS
+    else:
+        por_etiqueta, etiqueta = None, None
+
+    campo = normalizar_decision_negativos(diag.get("negativos"))
+    if decision_usuario:
+        decision, fuente = decision_usuario, "usuario"
+        razon = f"Decisión del usuario (DECISIONES_NEGATIVOS); el LLM dijo: {diag.get('negativos')!r}."
+    elif campo:
+        decision, fuente = campo, "llm"
+        razon = str(diag.get("razon_negativos") or "").strip() or "Sin razón indicada por el LLM."
+        if por_etiqueta and por_etiqueta != campo:
+            _avisar(avisos, f"Diagnóstico: en '{col}' el campo 'negativos' ({campo!r}) contradice "
+                            f"la etiqueta {etiqueta!r}; manda el campo.")
+    elif por_etiqueta:
+        decision, fuente = por_etiqueta, "llm"
+        razon = (str(diag.get("razon_negativos") or "").strip()
+                 or f"Deducido de la etiqueta {etiqueta!r} del LLM.")
+        _avisar(avisos, f"Diagnóstico: '{col}' tiene negativos y el LLM no devolvió el campo "
+                        f"'negativos' ({diag.get('negativos')!r}); se deduce {por_etiqueta!r} de la "
+                        f"etiqueta {etiqueta!r}.")
+    else:
+        decision, fuente = "incierto", "llm"
+        razon = "El LLM no devolvió una decisión sobre los negativos ni ninguna señal."
+        _avisar(avisos, f"Diagnóstico: '{col}' tiene negativos y el LLM no devolvió una decisión "
+                        f"válida ({diag.get('negativos')!r}) ni ninguna señal: se trata como 'incierto'.")
+
+    problemas = [p for p in problemas
+                 if p not in (PROBLEMA_NEGATIVOS_INVALIDOS, PROBLEMA_NEGATIVOS_INCIERTOS)]
+    if decision == "invalidos":
+        problemas.append(PROBLEMA_NEGATIVOS_INVALIDOS)
+    elif decision == "incierto":
+        problemas.append(PROBLEMA_NEGATIVOS_INCIERTOS)
+    if len(problemas) > 1 and "ninguno" in problemas:
+        problemas = [p for p in problemas if p != "ninguno"]
+    diag["problemas"] = problemas or ["ninguno"]
+    principal = str(diag.get("problema_principal") or "").strip().lower()
+    if principal not in diag["problemas"]:
+        diag["problema_principal"] = diag["problemas"][0]
+    diag.update({"negativos": decision, "razon_negativos": razon, "fuente_negativos": fuente})
+
+
+def _decisiones_y_discrepancias(diagnostico: Dict[str, Any]) -> tuple:
+    """Decisiones de negativos por columna y discrepancias con la lista de control."""
+    decisiones, discrepancias = {}, []
+    for col, diag in diagnostico.items():
+        if not isinstance(diag, dict) or "fuente_negativos" not in diag:
+            continue
+        decisiones[col] = {"decision": diag["negativos"], "razon": diag["razon_negativos"],
+                           "fuente": diag["fuente_negativos"]}
+        detalle = discrepancia_negativos(col, diag["negativos"])
+        if detalle:
+            discrepancias.append({"columna": col, "decision": diag["negativos"],
+                                  "fuente": diag["fuente_negativos"], "detalle": detalle})
+    return decisiones, discrepancias
+
+
+def _guardar_respuestas_diagnostico(respuestas: List[tuple], avisos: List[str]) -> str:
+    """Guarda en outputs/ la respuesta cruda del LLM y los avisos (solo en local)."""
+    carpeta = os.path.join("outputs", datetime.now().strftime("%Y%m%d-%H%M%S") + "-diagnostico")
+    os.makedirs(carpeta, exist_ok=True)
+    ruta = os.path.join(carpeta, "respuesta_llm_diagnostico.txt")
+    with open(ruta, "w", encoding="utf-8") as f:
+        f.write("# Avisos del diagnóstico\n" + "\n".join(f"- {a}" for a in avisos) + "\n")
+        for titulo, texto in respuestas:
+            f.write(f"\n# Respuesta cruda del LLM ({titulo})\n{texto}\n")
+    print(f"   🗂️ Respuesta cruda del diagnóstico guardada en {ruta}")
+    return os.path.abspath(ruta)
+
+
 def node_diagnosticar(state: DataPulseState) -> DataPulseState:
-    llm = get_groq_llm()
-    prompt = DIAGNOSTIC_PROMPT.format(metadata_json=json.dumps(state["metadata"], ensure_ascii=False, indent=2))
-    response = llm.invoke([HumanMessage(content=prompt)])
-    diagnostico = extract_json_from_markdown(response.content)
-    return {"diagnostico": diagnostico}
+    """
+    El LLM diagnostica todas las columnas. La respuesta se normaliza y los
+    avisos se guardan en el estado. Si faltaron columnas, se hace un único
+    reintento pidiendo solo esas; las que sigan faltando quedan sin tocar y
+    registradas. Con avisos, la respuesta cruda se guarda en outputs/.
+    """
+    avisos: List[str] = []
+    respuestas: List[tuple] = []
+    metadata = state["metadata"]
+    llm = get_llm()
+    respuesta = llm.invoke([HumanMessage(content=construir_prompt_diagnostico(metadata))]).content
+    respuestas.append(("diagnóstico completo", respuesta))
+    crudo = extract_json_from_markdown(respuesta)
+    columnas_info = (metadata or {}).get("columnas_info", {})
+    diagnostico = _normalizar_diagnostico(crudo, list(columnas_info), columnas_info,
+                                          DECISIONES_NEGATIVOS, avisos)
+
+    faltan = [str(c) for c in columnas_info if str(c) not in diagnostico]
+    if faltan:
+        sub_info = {c: v for c, v in columnas_info.items() if str(c) in faltan}
+        prompt = (construir_prompt_diagnostico({**metadata, "columnas_info": sub_info,
+                                                "columnas": len(sub_info)})
+                  + f"\n\nIMPORTANTE: diagnostica SOLO estas columnas, que faltaron en la "
+                    f"respuesta anterior: {json.dumps(faltan, ensure_ascii=False)}")
+        try:
+            respuesta = llm.invoke([HumanMessage(content=prompt)]).content
+            respuestas.append(("reintento de columnas faltantes", respuesta))
+            extra = _normalizar_diagnostico(extract_json_from_markdown(respuesta), faltan,
+                                            sub_info, DECISIONES_NEGATIVOS, avisos)
+            diagnostico.update({c: d for c, d in extra.items() if c in faltan})
+        except Exception as exc:
+            _avisar(avisos, f"Diagnóstico: el reintento de las columnas que faltaron falló "
+                            f"({type(exc).__name__}: {str(exc)[:150]}).")
+        siguen = [c for c in faltan if c not in diagnostico]
+        if siguen:
+            _avisar(avisos, f"Diagnóstico: tras el reintento siguen sin diagnóstico (quedan sin "
+                            f"tocar): {siguen}")
+        else:
+            _avisar(avisos, f"Diagnóstico: el reintento completó las columnas que faltaban: {faltan}")
+
+    ruta_cruda = _guardar_respuestas_diagnostico(respuestas, avisos) if avisos else None
+    decisiones, discrepancias = _decisiones_y_discrepancias(diagnostico)
+    for col, d in decisiones.items():
+        print(f"   ➖ Negativos en '{col}': {d['decision']} ({d['fuente']}) — {d['razon'][:120]}")
+    for d in discrepancias:
+        print(f"   ↔️ Discrepancia con la lista de control: {d['detalle']}")
+    return {"diagnostico": diagnostico, "decisiones_negativos": decisiones,
+            "discrepancias_negativos": discrepancias, "avisos_diagnostico": avisos,
+            "respuesta_cruda_diagnostico": ruta_cruda}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2081,14 +3214,129 @@ def _map_tipo_problema(tipo_inferido: str, problema: str) -> tuple:
     Mapea los tipos/problemas del LLM a los nodos del grafo kg.
 
     Consulta los diccionarios globales TIPO_MAP y PROBLEMA_MAP, que incluyen
-    tanto las reglas estadísticas base como las reglas de dominio (Salud,
-    Finanzas, Economía y Seguridad Ocupacional).
+    los alias base y los de todos los dominios registrados; solo resuelven los
+    alias cuyo nodo está en el grafo vigente (dominios en DOMINIOS_ACTIVOS).
+
+    Si la etiqueta no es un alias, se acepta el nombre del nodo tal cual (sin
+    distinguir mayúsculas), de modo que un nodo nuevo del usuario es alcanzable
+    sin tocar los mapas.
 
     Retorna (source_node, target_node) o (None, None) si no hay match.
     """
-    src = TIPO_MAP.get(tipo_inferido)
-    tgt = PROBLEMA_MAP.get(problema)
-    return src, tgt
+    tipos, problemas = _nodos_grafo()
+    return (_resolver_etiqueta(tipo_inferido, TIPO_MAP, tipos),
+            _resolver_etiqueta(problema, PROBLEMA_MAP, problemas))
+
+
+def _resolver_etiqueta(etiqueta, mapa: Dict[str, Any], nodos: List[str]) -> Optional[str]:
+    """Alias del mapa o, si no, el nombre de un nodo del grafo (sin distinguir mayúsculas)."""
+    if not isinstance(etiqueta, str) or not etiqueta.strip():
+        return None
+    # Un alias solo vale si su nodo está en el grafo vigente (los alias de un
+    # dominio inactivo no resuelven: el problema va al fallback del LLM).
+    buscada = etiqueta.strip().lower()
+    for clave in (etiqueta, buscada):
+        if clave in mapa and mapa[clave] in kg:
+            return mapa[clave]
+    return next((n for n in nodos if n.lower() == buscada), None)
+
+
+MODOS_SALIDA = MODOS_REGLA
+ESTADO_OMITIDO_POR_MODO = "omitido_por_modo"
+
+
+def modo_salida_vigente() -> str:
+    """MODO_SALIDA normalizado ("bi" o "ml"); un valor distinto falla con un mensaje claro."""
+    modo = str(MODO_SALIDA or "").strip().lower()
+    if modo not in MODOS_SALIDA:
+        raise ValueError(f"MODO_SALIDA debe ser 'bi' o 'ml', no {MODO_SALIDA!r}.")
+    return modo
+
+
+def _arista_aplica_en_modo(datos: Dict[str, Any], modo: str) -> bool:
+    """Una regla sin atributo modo vale en ambos modos; con modo, solo en el suyo."""
+    return datos.get("modo") in (None, modo)
+
+
+UMBRAL_SKEWNESS = 1.0
+
+
+def _ajustar_por_negativos(accion: dict, decision: Optional[str]) -> dict:
+    """
+    Ninguna acción puede modificar negativos que no sean "invalidos". Si la
+    decisión de la columna es "validos" o "incierto":
+    - en acciones con aplica_a (Rango_Invalido → set_nan_y_flag) queda solo
+      "fuera_de_rango_logico";
+    - en reemplazar_centinela_por_nan se quitan los centinelas negativos.
+    Se anota en la justificación.
+    """
+    if decision not in ("validos", "incierto"):
+        return accion
+    parametros = dict(accion.get("parametros") or {})
+    cambio = None
+    aplica_a = parametros.get("aplica_a")
+    if isinstance(aplica_a, list) and "negativos_inesperados" in aplica_a:
+        parametros["aplica_a"] = [a for a in aplica_a if a != "negativos_inesperados"]
+        cambio = "solo se aplica a valores fuera de rango lógico; los negativos no se tocan"
+    centinelas = parametros.get("centinelas")
+    if isinstance(centinelas, list) and any(
+            isinstance(c, (int, float)) and c < 0 for c in centinelas):
+        parametros["centinelas"] = [c for c in centinelas
+                                    if not (isinstance(c, (int, float)) and c < 0)]
+        cambio = "se quitan los centinelas negativos; los negativos no se tocan"
+    if cambio is None:
+        return accion
+    ajustada = dict(accion)
+    ajustada["parametros"] = parametros
+    ajustada["justificacion_es"] = (
+        f"{accion.get('justificacion_es') or ''} [Ajuste: los negativos de esta columna son "
+        f"'{decision}': {cambio}.]").strip()
+    ajustada["justificacion_en"] = (
+        f"{accion.get('justificacion_en') or ''} [Adjusted: negatives in this column are "
+        f"'{decision}', so they are left unchanged.]").strip()
+    ajustada["ajuste"] = "negativos"
+    return ajustada
+
+
+def _aplicar_fechas_centinela(accion: dict) -> dict:
+    """Inyecta la lista vigente de DATAPULSE_FECHAS_CENTINELA en marcar_fecha_centinela."""
+    if accion.get("accion") != "marcar_fecha_centinela":
+        return accion
+    ajustada = dict(accion)
+    ajustada["parametros"] = {
+        **(accion.get("parametros") or {}),
+        "fechas_centinela": _fechas_centinela_config(),
+        "imputar": False,
+    }
+    return ajustada
+
+
+def _ajustar_por_skewness(accion: dict, skewness: Optional[float]) -> dict:
+    """
+    Si la variable está sesgada (|skewness| > 1 según la metadata real, no la
+    etiqueta del LLM) y la acción es fillna_mean, la cambia por fillna_median.
+    """
+    if accion.get("accion") != "fillna_mean" or skewness is None:
+        return accion
+    try:
+        sesgo = float(skewness)
+    except (TypeError, ValueError):
+        return accion
+    if abs(sesgo) <= UMBRAL_SKEWNESS:
+        return accion
+    ajustada = dict(accion)
+    ajustada["accion"] = "fillna_median"
+    ajustada["parametros"] = {**(accion.get("parametros") or {}), "strategy": "median"}
+    ajustada["justificacion_es"] = (
+        f"{accion.get('justificacion_es') or ''} [Ajuste: |skewness| = {abs(sesgo):.2f} > "
+        f"{UMBRAL_SKEWNESS:g} en la metadata; la media está sesgada, se usa la mediana.]"
+    ).strip()
+    ajustada["justificacion_en"] = (
+        f"{accion.get('justificacion_en') or ''} [Adjusted: |skewness| = {abs(sesgo):.2f} > "
+        f"{UMBRAL_SKEWNESS:g} in metadata; the mean is skewed, median is used.]"
+    ).strip()
+    ajustada["ajuste"] = "skewness"
+    return ajustada
 
 
 def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
@@ -2097,10 +3345,18 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
         raise RuntimeError("El grafo de conocimiento (kg) no ha sido cargado.")
 
     diagnostico = state["diagnostico"]
+    columnas_info = (state.get("metadata") or {}).get("columnas_info", {})
+    modo = modo_salida_vigente()
     acciones = {}
+    omitidos = []
 
     for col_name, diag in diagnostico.items():
+        if not isinstance(diag, dict):
+            # Defensa: una entrada mal formada no debe tumbar el pipeline
+            print(f"   ⚠️ Se omite '{col_name}': su diagnóstico no es un objeto ({type(diag).__name__}).")
+            continue
         tipo = diag.get("tipo_inferido", "")
+        skewness = (columnas_info.get(col_name) or {}).get("skewness")
 
         # Soportar tanto "problema" (string, formato anterior)
         # como "problemas" (lista, formato nuevo multi-problema)
@@ -2120,6 +3376,7 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
         # Construir lista de acciones: una por cada problema que tenga regla en el grafo
         acciones_col = []
         fallbacks_col = []
+        omitidos_col = []
 
         for problema in problemas_lista:
             _, tgt = _map_tipo_problema(tipo, problema)
@@ -2130,17 +3387,29 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             if src is not None and kg.has_edge(src, tgt):
                 for key, data in kg[src][tgt].items():
                     edges_data.append(data)
-            if not edges_data and tgt in ESQUEMA_GENERAL_TARGETS and kg.has_edge("Esquema_General", tgt):
+            if not edges_data and kg.has_edge(NODO_ESQUEMA_GENERAL, tgt):
                 # Problemas estructurales (duplicados, filas/columnas vacías,
                 # valores constantes, encoding) no dependen del tipo de variable:
                 # la regla vive bajo el nodo origen "Esquema_General".
-                for key, data in kg["Esquema_General"][tgt].items():
+                for key, data in kg[NODO_ESQUEMA_GENERAL][tgt].items():
                     edges_data.append(data)
             if not edges_data:
                 fallbacks_col.append(problema)
                 continue
-            best = max(edges_data, key=lambda x: x.get("confianza", 0.0))
-            acciones_col.append({
+            en_modo = [d for d in edges_data if _arista_aplica_en_modo(d, modo)]
+            if not en_modo:
+                # Hay reglas, pero todas son de otro modo de salida: el problema
+                # se omite a propósito y NO va al fallback del LLM.
+                omitido = {
+                    "columna": col_name, "problema": problema, "modo": modo,
+                    "estado": ESTADO_OMITIDO_POR_MODO,
+                    "acciones_omitidas": sorted({d.get("accion") for d in edges_data}),
+                }
+                omitidos_col.append(omitido)
+                omitidos.append(omitido)
+                continue
+            best = max(en_modo, key=lambda x: x.get("confianza", 0.0))
+            accion_col = {
                 "problema": problema,
                 "accion": best.get("accion"),
                 "confianza": best.get("confianza"),
@@ -2148,9 +3417,12 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
                 "justificacion_es": best.get("justificacion_es"),
                 "justificacion_en": best.get("justificacion_en"),
                 "fuente_decision": "knowledge_graph",
-            })
+            }
+            accion_col = _ajustar_por_skewness(accion_col, skewness)
+            accion_col = _ajustar_por_negativos(accion_col, diag.get("negativos"))
+            acciones_col.append(_aplicar_fechas_centinela(accion_col))
 
-        if not acciones_col and not fallbacks_col:
+        if not acciones_col and not fallbacks_col and not omitidos_col:
             # No se encontró ningún problema reconocible
             fallbacks_col.append(problema_principal or "ninguno")
 
@@ -2159,22 +3431,26 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             "acciones":           acciones_col,        # lista de acciones del grafo
             "requiere_llm_fallback": len(fallbacks_col) > 0,
             "problemas_fallback": fallbacks_col,       # problemas sin regla en el grafo
+            "omitidos_por_modo":  omitidos_col,        # reglas solo de otro modo de salida
             "diagnostico_original": diag,
         }
 
-    return {"acciones_grafo": acciones}
+    if omitidos:
+        print(f"   🎛️ Modo {modo}: {len(omitidos)} problema(s) omitidos por modo de salida: "
+              f"{[(o['columna'], o['problema']) for o in omitidos]}")
+    return {"acciones_grafo": acciones, "modo_salida": modo, "omitidos_por_modo": omitidos}
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. NODE 4 — PLANIFICAR (Groq resuelve fallbacks + ordena)
+# 7. NODE 4 — PLANIFICAR (acciones del grafo + respaldo del LLM; ordena y explica)
 # ═══════════════════════════════════════════════════════════════
 
-PLANIFICAR_PROMPT = """Eres el planificador técnico de DataPulse. Recibes el análisis multi-problema por columna del grafo de conocimiento.
+PLANIFICAR_PROMPT = """Eres el planificador técnico de DataPulse. Recibes las acciones que el grafo de conocimiento eligió por columna (multi-problema) y los problemas que no tienen regla en el grafo.
 
 Tu trabajo:
-A) Cada columna puede tener MÚLTIPLES acciones (una por problema). Incluye TODAS en el plan, no solo la primera.
+A) Cada columna puede tener MÚLTIPLES acciones (una por problema). Incluye TODAS en el plan, no solo la primera. Las acciones del grafo NO se modifican: misma acción y mismos parámetros; solo decides su orden (por su id).
 B) Para problemas_fallback (sin regla en el grafo), decide la acción más apropiada. Máx. confianza: 0.70. fuente_decision: "llm_fallback".
-C) Trata centinelas correctamente: si ves nulos_disfrazados con valores como -999, la acción es REEMPLAZAR ese valor por NaN (no winsorizar).
+C) Trata centinelas correctamente: si ves nulos_disfrazados con valores como -999 (o cadenas como "N/A" en texto), la acción es REEMPLAZAR ese valor por NaN (no winsorizar). EXCEPCIÓN — fechas: las fechas centinela (marcar_fecha_centinela) SOLO se marcan con un flag; NUNCA se reemplazan ni se imputan.
 D) Trata negativos correctamente: si ves valores_negativos_inesperados en edad/precio/cantidad, la acción es FLAG + reemplazar por NaN (no recortar a 0 sin revisar).
 E) Ordena las acciones por prioridad:
    1. drop_duplicates (primero siempre)
@@ -2182,8 +3458,9 @@ E) Ordena las acciones por prioridad:
    3. Limpieza de strings (strip, lower, validación formato)
    4. Conversión de tipos
    5. Imputaciones (fillna, interpolate)
-   6. Outliers (winsorize, clip) — SOLO si NO son centinelas
-   7. Encoding / Escalado
+   6. Outliers (winsorize, clip) — SOLO si NO son centinelas y SOLO en modo ml (en bi se marcan con flag)
+   7. Encoding / Escalado — SOLO en modo ml
+F) MODO DE SALIDA: "{modo_salida}". {reglas_modo}
 
 El brief_tecnico debe ser DETALLADO y específico por columna, indicando exactamente:
 - Qué problema tiene cada columna (con valores concretos si se conocen)
@@ -2192,37 +3469,257 @@ El brief_tecnico debe ser DETALLADO y específico por columna, indicando exactam
 
 Devuelve UN SOLO JSON con esta estructura exacta:
 {{
-  "plan_acciones": [
+  "orden": ["a1", "f1", "a2"],
+  "acciones_fallback": [
     {{
+      "id": "f1",
       "columna": "nombre",
-      "problema": "el problema que resuelve esta accion",
+      "problema": "el problema sin regla que resuelve esta accion",
       "accion": "snake_case_funcion",
-      "confianza": 0.88,
-      "fuente_decision": "knowledge_graph" | "llm_fallback",
+      "confianza": 0.65,
       "parametros": {{...}},
       "justificacion": "..."
     }}
   ],
   "brief_tecnico": "instrucciones detalladas y específicas para OpenHands..."
 }}
+"orden" lista los ids de TODAS las acciones (las del grafo "aN" y las tuyas "fN") en el orden de ejecución.
 
-Análisis del grafo (multi-problema):
+Acciones del grafo (no modificables):
 {acciones_json}
+
+Problemas sin regla en el grafo (problemas_fallback):
+{sin_regla_json}
 
 Responde SOLO con el JSON. Sin markdown."""
 
+MAX_CONFIANZA_FALLBACK = 0.70
+
+REGLAS_MODO_PROMPT = {
+    "bi": ("La salida es para análisis/BI: conserva los valores reales y legibles. PROHIBIDO "
+           "proponer, en acciones_fallback y en el brief, codificar (one-hot, get_dummies, label, "
+           "ordinal o hash encoding), escalar o normalizar (min-max, z-score, robust), transformar la "
+           "distribución (log, log1p, sqrt, Box-Cox, Yeo-Johnson, cuantiles), reducir dimensiones "
+           "(PCA) o recortar valores reales (winsorize, clip). Los outliers se marcan con un flag y "
+           "no se recortan. Si un problema solo se resuelve con una de esas transformaciones, no "
+           "propongas acción: queda sin acción y se informa."),
+    "ml": ("La salida es para modelos: se permiten encoding, escalado y transformaciones de "
+           "distribución cuando el problema lo requiera."),
+}
+
+# Acciones que codifican, escalan, transforman la distribución, reducen
+# dimensiones o recortan valores reales: en modo "bi" se descartan si el LLM
+# las propone como respaldo. Se comparan por palabra (token) del nombre o de
+# los parámetros strategy/method, y por fragmentos del nombre sin guiones.
+TOKENS_ACCION_ML = {"encode", "encoder", "dummies", "onehot", "log", "log1p", "log2", "log10", "ln",
+                    "logaritmo", "logaritmica", "logaritmico", "sqrt", "pca", "boxcox", "quantile",
+                    "cuantiles", "minmax", "zscore"}
+PREFIJOS_TOKEN_ML = ("scal", "rescal", "escal", "standardiz", "estandariz", "winsor", "clip",
+                     "recort", "codific", "yeo", "johnson")
+FRAGMENTOS_ACCION_ML = ("onehot", "getdummies", "labelencod", "ordinalencod", "hashencod",
+                        "targetencod", "minmax", "zscore", "boxcox", "yeojohnson",
+                        "powertransform", "quantiletransform", "np_log", "log1p")
+
+
+def es_accion_ml(accion: Any, parametros: Any = None) -> bool:
+    """True si la acción (o su strategy/method) es propia del modo "ml"."""
+    textos = [str(accion or "")]
+    if isinstance(parametros, dict):
+        textos += [str(parametros.get(k)) for k in ("strategy", "method", "metodo", "transform")
+                   if parametros.get(k) is not None]
+    for texto in textos:
+        texto = texto.strip().lower()
+        tokens = [t for t in re.split(r"[^a-z0-9]+", texto) if t]
+        compacto = texto.replace("_", "").replace("-", "").replace(" ", "")
+        if (any(t in TOKENS_ACCION_ML or t.startswith(PREFIJOS_TOKEN_ML) for t in tokens)
+                or any(f in compacto or f in texto for f in FRAGMENTOS_ACCION_ML)):
+            return True
+    return False
+
+
+def _acciones_y_sin_regla(acciones_grafo: Dict[str, Any]) -> tuple:
+    """Lista de acciones del grafo (con id) y lista de problemas sin regla."""
+    acciones, sin_regla = [], []
+    for columna, info in (acciones_grafo or {}).items():
+        for accion in info.get("acciones", []):
+            acciones.append({
+                "id": f"a{len(acciones) + 1}",
+                "columna": columna,
+                "problema": accion.get("problema"),
+                "accion": accion.get("accion"),
+                "parametros": accion.get("parametros", {}),
+                "confianza": accion.get("confianza"),
+                "justificacion": accion.get("justificacion_es"),
+            })
+        for problema in info.get("problemas_fallback", []):
+            if problema and problema != "ninguno":
+                sin_regla.append({"columna": columna, "problema": problema})
+    return acciones, sin_regla
+
+
+def _ordenar_plan(acciones: List[Dict[str, Any]], orden: Any) -> List[Dict[str, Any]]:
+    """
+    Aplica el orden propuesto por el LLM sin dejarle cambiar el contenido: ids
+    desconocidos se ignoran y las acciones que no ordenó se añaden al final.
+    """
+    por_id = {a["id"]: a for a in acciones}
+    vistos, plan = set(), []
+    for item in orden if isinstance(orden, list) else []:
+        clave = str(item)
+        if clave in por_id and clave not in vistos:
+            plan.append(por_id[clave])
+            vistos.add(clave)
+        elif clave not in por_id:
+            print(f"   ⚠️ Planificador: se ignora '{clave}', no es una acción del grafo.")
+    faltan = [a for a in acciones if a["id"] not in vistos]
+    if faltan and orden:
+        print(f"   ⚠️ Planificador: acciones del grafo sin ordenar, se añaden al final: "
+              f"{[a['id'] for a in faltan]}")
+    return plan + faltan
+
+
+def _acciones_fallback(propuestas: Any, sin_regla: List[Dict[str, Any]], modo: str = "ml",
+                       descartadas_por_modo: Optional[List[Dict[str, Any]]] = None
+                       ) -> List[Dict[str, Any]]:
+    """
+    Acciones del LLM para problemas sin regla en el grafo. Solo se aceptan para
+    pares (columna, problema) que de verdad no tienen regla; la confianza se
+    limita a MAX_CONFIANZA_FALLBACK y la fuente es siempre "llm_fallback".
+    En modo "bi" se descartan las acciones propias de "ml" (es_accion_ml) y se
+    anotan en descartadas_por_modo con estado "omitido_por_modo".
+    """
+    pendientes = {(p["columna"], p["problema"]) for p in sin_regla}
+    aceptadas, usados = [], set()
+    for prop in propuestas if isinstance(propuestas, list) else []:
+        if not isinstance(prop, dict):
+            continue
+        par = (str(prop.get("columna")), str(prop.get("problema", "")).strip().lower())
+        accion = prop.get("accion")
+        if par not in pendientes or par in usados or not isinstance(accion, str) or not accion.strip():
+            print(f"   ⚠️ Planificador: se descarta la acción del LLM {prop.get('accion')!r} "
+                  f"para {par}: solo puede resolver problemas sin regla en el grafo.")
+            continue
+        if modo == "bi" and es_accion_ml(accion, prop.get("parametros")):
+            print(f"   ⚠️ Planificador: se descarta la acción del LLM {accion!r} para {par}: "
+                  "codifica, escala, transforma la distribución o recorta valores y el modo es bi.")
+            usados.add(par)
+            if descartadas_por_modo is not None:
+                descartadas_por_modo.append({
+                    "columna": par[0], "problema": par[1], "modo": modo,
+                    "estado": ESTADO_OMITIDO_POR_MODO, "acciones_omitidas": [accion.strip()],
+                    "origen": "llm_fallback",
+                })
+            continue
+        try:
+            confianza = float(prop.get("confianza", MAX_CONFIANZA_FALLBACK))
+        except (TypeError, ValueError):
+            confianza = MAX_CONFIANZA_FALLBACK
+        usados.add(par)
+        aceptadas.append({
+            "id": str(prop.get("id") or f"f{len(aceptadas) + 1}"),
+            "columna": par[0],
+            "problema": par[1],
+            "accion": accion.strip(),
+            "parametros": prop.get("parametros") if isinstance(prop.get("parametros"), dict) else {},
+            "confianza": max(0.0, min(confianza, MAX_CONFIANZA_FALLBACK)),
+            "justificacion": prop.get("justificacion"),
+            "fuente_decision": "llm_fallback",
+        })
+    return aceptadas
+
+
+def _seccion_obligatoria(plan: List[Dict[str, Any]], sin_regla: List[Dict[str, Any]],
+                        decisiones_negativos: Optional[Dict[str, Any]] = None,
+                        modo: Optional[str] = None,
+                        omitidos_por_modo: Optional[List[Dict[str, Any]]] = None) -> str:
+    """
+    Bloque determinista del brief: las acciones exactas del plan, lo que queda
+    sin regla, qué columnas no pueden ver modificados sus negativos y el modo
+    de salida con los problemas omitidos por modo.
+    """
+    acciones = [{k: a[k] for k in ("columna", "problema", "accion", "parametros", "fuente_decision")}
+                for a in plan]
+    texto = ("\n\n## ACCIONES DEL PLAN (obligatorias, en este orden; las del grafo no se modifican)\n"
+             + json.dumps(acciones, ensure_ascii=False, indent=2))
+    if sin_regla:
+        texto += ("\n\n## PROBLEMAS SIN REGLA NI ACCIÓN (no tratarlos; se informan)\n"
+                  + json.dumps(sin_regla, ensure_ascii=False, indent=2))
+    protegidas = {col: d["decision"] for col, d in (decisiones_negativos or {}).items()
+                  if d.get("decision") in ("validos", "incierto")}
+    if protegidas:
+        texto += ("\n\n## NEGATIVOS QUE NO SE MODIFICAN (obligatorio)\n"
+                  "Ninguna acción puede cambiar, recortar, imputar ni eliminar los valores "
+                  "negativos de estas columnas; solo se modifican negativos 'invalidos':\n"
+                  + json.dumps(protegidas, ensure_ascii=False, indent=2))
+    if modo:
+        texto += f"\n\n## MODO DE SALIDA: {modo} (obligatorio)\n" + REGLAS_MODO_PROMPT[modo]
+        if modo == "bi":
+            texto += ("\nNo añadas por tu cuenta encoding, escalado, transformaciones de distribución "
+                      "(log, log1p, Box-Cox...), PCA ni recortes de valores reales.")
+    if omitidos_por_modo:
+        texto += ("\n\n## PROBLEMAS OMITIDOS POR MODO DE SALIDA (no tratarlos; se informan)\n"
+                  + json.dumps([{k: o[k] for k in ("columna", "problema", "acciones_omitidas")}
+                                for o in omitidos_por_modo], ensure_ascii=False, indent=2))
+    return texto
+
+
 def node_planificar(state: DataPulseState) -> DataPulseState:
-    llm = get_groq_llm()
-    prompt = PLANIFICAR_PROMPT.format(
-        acciones_json=json.dumps(state["acciones_grafo"], ensure_ascii=False, indent=2)
-    )
-    response = llm.invoke([HumanMessage(content=prompt)])
-    parsed = extract_json_from_markdown(response.content)
+    """
+    Plan = acciones del grafo (no modificables) + respaldo del LLM para los
+    problemas sin regla (confianza ≤ 0.70, fuente_decision "llm_fallback").
+    El LLM ordena todas las acciones y redacta el brief para OpenHands.
+    """
+    acciones, sin_regla = _acciones_y_sin_regla(state.get("acciones_grafo", {}))
+    modo = state.get("modo_salida") or modo_salida_vigente()
+    omitidos = list(state.get("omitidos_por_modo") or [])
+    descartadas = []
+    orden, brief, fallback = None, "", []
+    if acciones or sin_regla:
+        try:
+            llm = get_llm()
+            prompt = PLANIFICAR_PROMPT.format(
+                acciones_json=json.dumps(acciones, ensure_ascii=False, indent=2),
+                sin_regla_json=json.dumps(sin_regla, ensure_ascii=False, indent=2),
+                modo_salida=modo,
+                reglas_modo=REGLAS_MODO_PROMPT[modo],
+            )
+            parsed = extract_json_from_markdown(llm.invoke([HumanMessage(content=prompt)]).content)
+            orden = parsed.get("orden")
+            brief = str(parsed.get("brief_tecnico") or "")
+            fallback = _acciones_fallback(parsed.get("acciones_fallback"), sin_regla, modo,
+                                          descartadas)
+        except Exception as exc:
+            print(f"   ⚠️ Planificador sin respuesta válida ({type(exc).__name__}): "
+                  "se usa el orden del grafo y solo sus acciones.")
+    else:
+        brief = "No hay problemas que tratar."
 
-    plan = parsed.get("plan_acciones", [])
-    brief = parsed.get("brief_tecnico", "")
+    for accion in acciones:
+        accion["fuente_decision"] = "knowledge_graph"
+    resueltos = {(f["columna"], f["problema"]) for f in fallback + descartadas}
+    sin_resolver = [p for p in sin_regla if (p["columna"], p["problema"]) not in resueltos]
+    omitidos += descartadas
 
-    return {"plan_acciones": plan, "brief_tecnico": brief}
+    plan = [
+        {
+            "columna": a["columna"],
+            "problema": a["problema"],
+            "accion": a["accion"],
+            "confianza": a["confianza"],
+            "fuente_decision": a["fuente_decision"],
+            "parametros": a["parametros"],
+            "justificacion": a["justificacion"],
+        }
+        for a in _ordenar_plan(acciones + fallback, orden)
+    ]
+    return {
+        "plan_acciones": plan,
+        "sin_regla": sin_resolver,
+        "omitidos_por_modo": omitidos,
+        "brief_tecnico": brief + _seccion_obligatoria(plan, sin_resolver,
+                                                      state.get("decisiones_negativos"),
+                                                      modo, omitidos),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2234,7 +3731,9 @@ LOCAL_GENERATION_PROMPT = """Eres un ingeniero de datos senior. Escribe el scrip
 {brief}
 
 ## ARCHIVO DE DATOS
-- Ruta: {data_path}
+- La ruta del dataset NO es fija: el script DEBE leerla de sys.argv[1]
+  (por ejemplo: data_path = sys.argv[1]). No escribas rutas absolutas en el código.
+- Nombre original: {filename}
 - Formato: {file_ext}
 - Filas: {filas}
 - Columnas: {columnas}
@@ -2247,37 +3746,83 @@ LOCAL_GENERATION_PROMPT = """Eres un ingeniero de datos senior. Escribe el scrip
    - cleaning_log.json con la lista de decisiones aplicadas (columna, accion, justificacion)
    - processed_data.csv con el dataset limpio
 3. Debe imprimir al final: print('"score":', score_after)
-
+{errores_previos}
 Devuelve ÚNICAMENTE el código Python, sin markdown ni explicaciones."""
+
+
+def _seccion_errores_previos(state: DataPulseState, max_errores: int = 2) -> str:
+    """Bloque de texto con los últimos errores para que el reintento los corrija."""
+    prev_errs = (state.get("error_history") or [])[-max_errores:]
+    if not prev_errs:
+        return ""
+    texto = "\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
+    for e in prev_errs:
+        texto += f"- {e[:500]}\n"
+    return texto
+
+
+def _leer_score_reportado(contenido: str) -> Optional[int]:
+    """Extrae el score que declara el propio script en quality_report.json."""
+    try:
+        qr = json.loads(contenido)
+    except Exception:
+        return None
+    if not isinstance(qr, dict):
+        return None
+    for clave in ("score", "score_after", "score_despues"):
+        s = qr.get(clave)
+        if isinstance(s, (int, float)) and not isinstance(s, bool):
+            return int(s)
+    return None
+
+
+def _entorno_minimo_subproceso() -> Dict[str, str]:
+    """Variables de entorno mínimas para ejecutar código generado (sin secretos)."""
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": os.environ.get("HOME", os.path.expanduser("~")),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "PYTHONIOENCODING": "utf-8",
+    }
+
+
+def _etiqueta_intento(numero) -> str:
+    """Prefijo de los mensajes de error_history: indica de qué intento son."""
+    return f"[intento {numero}] "
 
 
 def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     """
-    Fallback sin OPENHANDS_API_KEY: usa ChatGroq para generar el pipeline,
-    lo ejecuta localmente con subprocess y lee los reportes reales generados.
-    Permite probar el flujo completo solo con GROQ_API_KEY.
+    Fallback sin OPENHANDS_API_KEY: usa el LLM configurado (Claude o Groq)
+    para generar el pipeline, lo ejecuta localmente con subprocess y lee los
+    reportes reales generados. Permite probar el flujo completo sin OpenHands.
     """
     run_dir = os.path.join("outputs", datetime.now().strftime("%Y%m%d-%H%M%S") + "-local")
     os.makedirs(run_dir, exist_ok=True)
 
-    llm = get_groq_llm()
     prompt = LOCAL_GENERATION_PROMPT.format(
         brief=state.get("brief_tecnico", ""),
-        data_path=os.path.abspath(state["filename_path"]),
+        filename=state.get("filename", os.path.basename(state["filename_path"])),
         file_ext=state.get("file_ext", ""),
         filas=state["metadata"].get("filas", "?"),
         columnas=state["metadata"].get("columnas", "?"),
+        errores_previos=_seccion_errores_previos(state),
     )
     try:
+        llm = get_llm()
         response = llm.invoke([HumanMessage(content=prompt)])
     except Exception as exc:
-        msg = f"Groq no pudo generar el pipeline: {type(exc).__name__}: {str(exc)[:300]}"
+        msg = (f"{_etiqueta_intento(state.get('intentos', 0) + 1)}{describir_llm()} no pudo "
+               f"generar el pipeline: {type(exc).__name__}: {str(exc)[:300]}")
         print(f"   ❌ {msg}")
         return {
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": "error",
             "error_history": [msg],
-            "score_despues": 0,
+            "score_reportado": None,
+            "ruta_processed": None,
+            "processed_esperado": False,
+            "directorio_salida": run_dir,
             "codigo": "",
             "archivos_generados": {},
         }
@@ -2293,20 +3838,33 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
 
     archivos_generados = {"datapulse_pipeline.py": codigo}
     status = "finished"
+    stderr_tail = ""
 
     try:
+        # El script recibe la ruta del dataset como argumento: así es
+        # reproducible en otra máquina sin editar rutas.
+        # El código generado por el LLM corre con un entorno mínimo, SIN claves
+        # (GROQ_API_KEY, GITHUB_TOKEN, OPENHANDS_API_KEY). El aislamiento
+        # completo (contenedor sin red ni acceso al disco) queda para la fase 2.
         proc = subprocess.run(
-            [sys.executable, "datapulse_pipeline.py"],
+            [sys.executable, "datapulse_pipeline.py", os.path.abspath(state["filename_path"])],
             cwd=run_dir, capture_output=True, text=True, timeout=OH_TIMEOUT_SEG,
+            env=_entorno_minimo_subproceso(),
         )
         stdout = proc.stdout or ""
         if proc.returncode != 0:
             status = "error"
+            # Sin stderr (p. ej. sys.exit(1)) el fallo también debe quedar en
+            # error_history: el reintento y el informe necesitan saber qué pasó.
+            stderr_tail = (proc.stderr or "")[-500:] or (
+                f"terminó con código {proc.returncode} sin mensaje de error; última salida: "
+                f"{stdout[-300:].strip() or '(vacía)'}")
             print(f"   ⚠️ Pipeline local terminó con código {proc.returncode}")
-            print((proc.stderr or "")[-500:])
+            print(stderr_tail)
     except subprocess.TimeoutExpired:
-        status = "error"
+        status = "timeout"
         stdout = ""
+        stderr_tail = f"El script superó el tiempo máximo de ejecución ({OH_TIMEOUT_SEG}s)."
         print(f"   ⚠️ Pipeline local excedió {OH_TIMEOUT_SEG}s")
 
     # Leer los reportes reales generados localmente
@@ -2317,44 +3875,161 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
                 archivos_generados[fname] = f.read()
 
     if status == "finished" and not any(
-        name in archivos_generados for name in ("quality_report.json", "cleaning_log.json")
+        name in archivos_generados
+        for name in ("processed_data.csv", "quality_report.json", "cleaning_log.json")
     ):
         status = "error"
-        print("   ⚠️ El pipeline local no generó quality_report.json ni cleaning_log.json")
+        stderr_tail = "El script no generó processed_data.csv ni reportes."
+        print("   ⚠️ El pipeline local no generó processed_data.csv ni reportes")
 
-    score = 0
+    # Score declarado por el script: solo informativo. El score que decide el
+    # commit lo recalcula node_validar_score sobre processed_data.csv.
+    score_reportado = None
     if "quality_report.json" in archivos_generados:
-        try:
-            qr = json.loads(archivos_generados["quality_report.json"])
-            s = qr.get("score") or qr.get("score_after") or qr.get("score_despues")
-            if isinstance(s, (int, float)):
-                score = int(s)
-        except Exception:
-            pass
-    if score == 0:
+        score_reportado = _leer_score_reportado(archivos_generados["quality_report.json"])
+    if score_reportado is None:
         m = re.search(r'"score"\s*[:\s]+(\d+)', stdout)
         if m:
-            score = int(m.group(1))
+            score_reportado = int(m.group(1))
 
-    print(f"   📈 Score (local Groq): {score}")
+    print(f"   📝 Score reportado por el script (informativo): {score_reportado}")
 
-    return {
+    ruta_processed = os.path.join(run_dir, "processed_data.csv")
+    resultado = {
         "intentos": state.get("intentos", 0) + 1,
         "openhands_status": status,
-        "score_despues": score,
+        "mensaje_ejecucion": (stderr_tail or stdout[-500:] or None),
+        "score_reportado": score_reportado,
+        "ruta_processed": os.path.abspath(ruta_processed) if os.path.exists(ruta_processed) else None,
+        # El script local siempre debe escribir processed_data.csv en run_dir
+        "processed_esperado": status == "finished",
+        "directorio_salida": os.path.abspath(run_dir),
         "codigo": codigo,
         "archivos_generados": archivos_generados,
     }
+    if status != "finished" and stderr_tail:
+        resultado["error_history"] = [
+            f"{_etiqueta_intento(resultado['intentos'])}El script falló: {stderr_tail}"]
+    return resultado
+
+
+def _rechazo_openhands(state: DataPulseState, msg: str) -> dict:
+    """Resultado de node_ejecutar cuando la configuración o la política impiden arrancar."""
+    return {
+        "intentos": state.get("intentos", 0) + 1,
+        "openhands_status": "rechazado",
+        "error_history": [_etiqueta_intento(state.get("intentos", 0) + 1) + msg],
+        "score_reportado": None,
+        "ruta_processed": None,
+        "processed_esperado": False,
+        "archivos_generados": {},
+    }
+
+
+# Salidas que el agente debe dejar commiteadas en la rama de trabajo
+SALIDAS_OPENHANDS = (
+    "datapulse_pipeline.py",
+    "quality_report.json",
+    "cleaning_log.json",
+    "processed_data.csv",
+)
+
+
+def _construir_brief_openhands(state: DataPulseState, data_path: str, rama: str) -> str:
+    """Arma el mensaje para OpenHands con la ruta real del dataset y los entregables."""
+    salidas = SALIDAS_OPENHANDS
+    mensaje = state["brief_tecnico"]
+    mensaje += (
+        f"\n\n## ARCHIVO DE DATOS"
+        f"\n- Ruta en el repo: {data_path}"
+        f"\n- Formato: {state['file_ext'].upper()}"
+        f"\n- Filas: {state['metadata'].get('filas', '?')}"
+        f"\n- Columnas: {state['metadata'].get('columnas', '?')}"
+        f"\n\n## ENTREGABLES OBLIGATORIOS (todos en la raíz del repo)"
+        f"\n1. datapulse_pipeline.py — script ejecutable de limpieza. Debe leer la ruta"
+        f"\n   del dataset de sys.argv[1]; ejecútalo así: python datapulse_pipeline.py {data_path}"
+        f"\n2. Al ejecutarse debe escribir processed_data.csv (dataset limpio),"
+        f"\n   cleaning_log.json y quality_report.json con EXACTAMENTE este formato:"
+        f'\n   {{"score_before": <int 0-100>, "score_after": <int 0-100>, "score": <mismo que score_after>}}'
+        f"\n3. Ejecuta datapulse_pipeline.py al finalizar para validar que corre sin errores."
+        f"\n4. Al final del script, imprime en consola: print('\"score\":', score_after)"
+        f"\n5. Haz commit y push en la rama `{rama}` (no en otra) de estos archivos:"
+        f"\n   {', '.join(salidas)}."
+    )
+    prev_errs = (state.get("error_history") or [])[-2:]
+    if prev_errs:
+        mensaje += "\n\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
+        for e in prev_errs:
+            mensaje += f"- {e[:300]}\n"
+    return mensaje
+
+
+def _leer_contenido_github(repo, path: str, ref: str) -> bytes:
+    """Lee un archivo de una rama; usa la API de blobs si supera 1 MB."""
+    contents = repo.get_contents(path, ref=ref)
+    if isinstance(contents, list):
+        raise IsADirectoryError(path)
+    data = b""
+    try:
+        data = contents.decoded_content or b""
+    except Exception:
+        data = b""
+    if not data and getattr(contents, "size", 0):
+        blob = repo.get_git_blob(contents.sha)
+        data = base64.b64decode(blob.content)
+    return data
+
+
+def _es_no_encontrado(exc: Exception) -> bool:
+    """True si la excepción de PyGithub es un 404 (el archivo no existe en la rama)."""
+    return getattr(exc, "status", None) == 404 or "404" in str(exc)
+
+
+def _leer_salidas_rama(repo, rama: str, run_dir: str, nombres) -> tuple:
+    """
+    Descarga de la rama de trabajo las salidas indicadas y las guarda en
+    ``run_dir``. Devuelve ({nombre: bytes} leídos, {nombre: error} de los que
+    existían o podían existir pero NO se pudieron leer — distinto de un 404).
+    """
+    leidos: Dict[str, bytes] = {}
+    errores: Dict[str, str] = {}
+    for nombre in nombres:
+        try:
+            data = _leer_contenido_github(repo, nombre, rama)
+        except Exception as exc:
+            if _es_no_encontrado(exc):
+                print(f"   ⚠️ {nombre} no está en la rama {rama}")
+            else:
+                errores[nombre] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                print(f"   ⚠️ {nombre} no se pudo leer de {rama} ({errores[nombre]})")
+            continue
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, nombre), "wb") as f:
+            f.write(data)
+        leidos[nombre] = data
+        print(f"   📥 {nombre} leído de {rama} ({len(data):,} bytes)")
+    return leidos, errores
 
 
 def node_ejecutar(state: DataPulseState) -> DataPulseState:
     """
     OpenHands Cloud API — sube archivo a GitHub + flujo real de 5 pasos.
-    Sin OPENHANDS_API_KEY, genera y ejecuta el pipeline localmente con Groq.
+    Sin OPENHANDS_API_KEY, genera y ejecuta el pipeline localmente con el LLM configurado.
     """
     if not OPENHANDS_API_KEY:
-        print("   ℹ️ OPENHANDS_API_KEY vacío — generando pipeline local con Groq...")
+        print(f"   ℹ️ OPENHANDS_API_KEY vacío — generando pipeline local con {describir_llm()}...")
         return _run_local_groq_pipeline(state)
+
+    falta = _falta_repo_github()
+    if not GITHUB_TOKEN:
+        # Sin token PyGithub lanza un AssertionError vacío; mejor un mensaje claro.
+        falta = (f"{falta} " if falta else "") + (
+            "Falta GITHUB_TOKEN: OpenHands trabaja sobre una rama del repositorio."
+        )
+    if falta:
+        msg = f"Modo OpenHands no disponible. {falta} Usa el modo local (deja OPENHANDS_API_KEY vacío)."
+        print(f"   ❌ {msg}")
+        return _rechazo_openhands(state, msg)
 
     headers = {
         "Authorization": f"Bearer {OPENHANDS_API_KEY}",
@@ -2363,24 +4038,47 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
     base = "https://app.all-hands.dev/api/v1"
 
     try:
-        try:
-            from github import Auth as GithubAuth
-            g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
-        except ImportError:
-            g = Github(GITHUB_TOKEN)
-        repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+        repo = _get_github_repo()
 
-        # ── PASO 0: Preparar rama con el archivo de datos ──────
+        # ── Política de subida de datos ─────────────────────────
+        subir_datos, motivo = _subida_datos_permitida(repo)
+        archivo_en_github = bool(
+            state.get("github_source_branch") and state.get("github_source_path")
+        )
+        if not subir_datos:
+            # Sin permiso no se puede subir el dataset NI leer de vuelta
+            # processed_data.csv: el resultado nunca se podría validar, así
+            # que no se crea rama ni sandbox.
+            que_falla = (
+                "los resultados (processed_data.csv) no se podrían leer de vuelta para "
+                "validarlos"
+                if archivo_en_github
+                else "habría que subir el dataset a GitHub y los resultados no se podrían leer de vuelta"
+            )
+            msg = (
+                f"Modo OpenHands no arranca: {que_falla}, porque la subida de datos no está "
+                f"permitida ({motivo}). Usa el modo local (deja OPENHANDS_API_KEY vacío) o, "
+                "si el repo es privado y aceptas subir los datos, define "
+                "DATAPULSE_PERMITIR_SUBIDA_DATOS=1."
+            )
+            print(f"   ❌ {msg}")
+            return _rechazo_openhands(state, msg)
+        print(f"   🔐 Subida de datos: sí ({motivo})")
+
+        # ── PASO 0: Preparar rama de trabajo con el archivo de datos ──
+        # Siempre se crea una rama nueva: el agente hace commit de sus salidas
+        # ahí y nunca directamente en main ni en la rama de origen.
+        fecha = datetime.now().strftime("%Y%m%d-%H%M%S")
+        rama  = f"data/datapulse-{fecha}"
         if state.get("github_source_branch") and state.get("github_source_path"):
-            # El archivo YA está en GitHub — usar la rama/path indicados, sin subir nada
-            rama      = state["github_source_branch"]
+            # El archivo YA está en GitHub — se ramifica desde su rama, sin subir nada
+            base_sha  = repo.get_branch(state["github_source_branch"]).commit.sha
             data_path = state["github_source_path"]
-            print(f"   ✅ Usando archivo del repo: {data_path} (branch: {rama})")
+            repo.create_git_ref(ref=f"refs/heads/{rama}", sha=base_sha)
+            print(f"   ✅ Usando archivo del repo: {data_path} (rama de trabajo: {rama})")
         else:
             # Archivo local — crear rama temporal y subir
             print(f"   📤 Subiendo {state['filename']} a GitHub...")
-            fecha = datetime.now().strftime("%Y%m%d-%H%M%S")
-            rama  = f"data/datapulse-{fecha}"
             try:
                 base_sha = repo.get_branch("main").commit.sha
             except Exception:
@@ -2449,27 +4147,7 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         print(f"   ✅ READY: {conv_id[:16]}...")
 
         # ── PASO 3: Enviar brief con referencia al archivo ──────
-        mensaje = state["brief_tecnico"]
-        mensaje += (
-            f"\n\n## ARCHIVO DE DATOS"
-            f"\n- Ruta en el repo: data/{state['filename']}"
-            f"\n- Formato: {state['file_ext'].upper()}"
-            f"\n- Filas: {state['metadata'].get('filas', '?')}"
-            f"\n- Columnas: {state['metadata'].get('columnas', '?')}"
-            f"\n\n## ENTREGABLES OBLIGATORIOS (todos en la raíz del repo)"
-            f"\n1. datapulse_pipeline.py — script ejecutable de limpieza"
-            f"\n2. quality_report.json — con EXACTAMENTE este formato:"
-            f'\n   {{"score_before": <int 0-100>, "score_after": <int 0-100>, "score": <mismo que score_after>}}'
-            f"\n   El score_after debe reflejar la calidad real del dataset limpio (0=sin limpiar, 100=perfecto)."
-            f"\n3. Ejecuta datapulse_pipeline.py al finalizar para validar que corre sin errores."
-            f"\n4. Al final del script, imprime en consola: print('\"score\":', score_after)"
-        )
-
-        prev_errs = state.get("error_history", [])[-2:]
-        if prev_errs:
-            mensaje += "\n\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
-            for e in prev_errs:
-                mensaje += f"- {e[:300]}\n"
+        mensaje = _construir_brief_openhands(state, data_path, rama)
 
         r = requests.post(
             f"{base}/app-conversations/{conv_id}/send-message",
@@ -2601,53 +4279,65 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         for p in archivos:
             print(f"      - {p.split('/')[-1]} ({len(archivos[p])} chars)")
 
-        # Buscar score
-        score = 0
+        # Score declarado por el agente: solo informativo (sin fallback fijo).
+        # El score real lo calcula node_validar_score sobre processed_data.csv.
+        score_reportado = None
         for path, content in archivos.items():
             if "quality" in path.lower() and path.endswith(".json"):
-                try:
-                    qr = json.loads(content)
-                    s = qr.get("score") or qr.get("score_despues")
-                    if isinstance(s, (int, float)):
-                        score = int(s)
-                        break
-                except Exception:
-                    pass
+                score_reportado = _leer_score_reportado(content)
+                if score_reportado is not None:
+                    break
 
-        if score == 0:
+        if score_reportado is None:
             for out in terminal_outputs:
                 m = re.search(r'"score"\s*[:\s]+(\d+)', out)
                 if m:
-                    score = int(m.group(1))
+                    score_reportado = int(m.group(1))
                     break
-
-        # Fallback: si OpenHands terminó con éxito y generó al menos un .py,
-        # el pipeline funcionó — asignar score de paso mínimo.
-        # Esto evita el loop infinito de reintentos cuando OpenHands no escribe
-        # quality_report.json pero sí ejecutó el trabajo correctamente.
-        if score == 0 and final_status == "finished" and py_files:
-            score = MIN_SCORE_PASS + 5  # 75 — por encima del umbral de 70
-            print(f"   ⚡ Score fallback: OpenHands finalizó OK + {len(py_files)} script(s) → {score}")
 
         if finish_msg:
             print(f"   💬 {finish_msg[:150]}")
-        print(f"   📈 Score: {score}")
+        print(f"   📝 Score reportado por OpenHands (informativo): {score_reportado}")
 
+        # ── PASO 6: Leer de la rama de trabajo lo que escribió el script ──
+        # Los eventos solo traen lo editado con FileEditorAction; lo que el
+        # script escribe al ejecutarse (processed_data.csv, reportes) se lee
+        # del commit que el agente hizo en la rama.
+        run_dir = os.path.join("outputs", fecha + "-openhands")
+        leidos, errores_lectura = _leer_salidas_rama(repo, rama, run_dir, SALIDAS_OPENHANDS)
+        for nombre, contenido in leidos.items():
+            archivos.setdefault(nombre, contenido.decode("utf-8", errors="replace"))
+        if "datapulse_pipeline.py" in leidos and not py_files:
+            codigo = archivos["datapulse_pipeline.py"]
+        if score_reportado is None and "quality_report.json" in archivos:
+            score_reportado = _leer_score_reportado(archivos["quality_report.json"])
+
+        ruta_processed = os.path.join(run_dir, "processed_data.csv")
         return {
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": final_status,
-            "score_despues": score,
+            "mensaje_ejecucion": finish_msg[:1000] or None,
+            "score_reportado": score_reportado,
+            "ruta_processed": os.path.abspath(ruta_processed) if "processed_data.csv" in leidos else None,
+            # Debía existir salvo que la rama no se pudiera leer (no es un 404):
+            # en ese caso reintentar el sandbox no lo arreglaría.
+            "processed_esperado": "processed_data.csv" not in errores_lectura,
+            "directorio_salida": os.path.abspath(run_dir) if leidos else None,
             "codigo": codigo if codigo else "# OpenHands no generó .py",
             "archivos_generados": archivos,
         }
 
     except Exception as e:
-        err_msg = f"{type(e).__name__}: {str(e)[:300]}"
+        err_msg = (f"{_etiqueta_intento(state.get('intentos', 0) + 1)}"
+                   f"{type(e).__name__}: {str(e)[:300]}")
         print(f"   ❌ {err_msg}")
         return {
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": "error",
             "error_history": [err_msg],
+            "score_reportado": None,
+            "ruta_processed": None,
+            "processed_esperado": False,
             "archivos_generados": {},
         }
 
@@ -2657,27 +4347,264 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
 # ═══════════════════════════════════════════════════════════════
 
 def router_validar_score(state: DataPulseState) -> str:
-    score = state.get("score_despues", 0)
-    intentos = state.get("intentos", 0)
+    """
+    Decide la transición tras validar. ``intentos`` es el número de intentos
+    YA realizados (node_ejecutar lo incrementa), y los límites son totales:
+    se reintenta mientras ``intentos < límite``.
+    """
+    score = state.get("score_despues") or 0
+    intentos = state.get("intentos") or 0
     status = state.get("openhands_status", "")
 
-    # Fallo de infraestructura: presupuesto corto para no re-lanzar sandboxes.
-    if status == "error":
-        return "retry" if intentos < OH_MAX_RETRIES else "end_no_commit"
+    # Rechazo por configuración o política (sin usuario/repo, subida de datos
+    # no permitida): reintentar no cambia nada.
+    if status == "rechazado":
+        return "end_no_commit"
 
-    if score >= MIN_SCORE_PASS:
+    # El validador falló: no hay medición fiable; ni commit ni reintento.
+    if status == "error_validador":
+        return "end_no_commit"
+
+    # Fallo de infraestructura: presupuesto corto para no re-lanzar sandboxes.
+    if status in OH_ESTADOS_INFRA:
+        return "retry" if intentos < OH_MAX_INTENTOS_INFRA else "end_no_commit"
+
+    puede_reintentar = OH_RETRY_ON_LOW_SCORE and intentos < OH_MAX_INTENTOS_SCORE
+
+    # Sin validar: nunca commit. Solo se reintenta si processed_data.csv debía
+    # existir y no apareció; si no se podía leer, reintentar no lo arregla.
+    if status == "sin_validar":
+        return "retry" if state.get("processed_esperado") and puede_reintentar else "end_no_commit"
+
+    # El commit exige superar el umbral Y no empeorar respecto del original;
+    # si empeora se trata como score bajo.
+    if score >= MIN_SCORE_PASS and not _score_empeora(state):
         return "commit"
 
-    # Autocorrección: un score bajo con ejecución correcta sí merece reintento,
-    # con su propio presupuesto para no entrar en bucle.
-    if OH_RETRY_ON_LOW_SCORE and intentos < OH_MAX_SCORE_RETRIES:
-        return "retry"
-    return "end_no_commit"
+    # Autocorrección: un score bajo (o que empeora) con ejecución correcta sí
+    # merece reintento, con su propio presupuesto.
+    return "retry" if puede_reintentar else "end_no_commit"
+
+
+def _score_empeora(state: Dict[str, Any]) -> bool:
+    """True si score_despues quedó por debajo de score_antes (si ambos se conocen)."""
+    antes, despues = state.get("score_antes"), state.get("score_despues")
+    return antes is not None and despues is not None and despues < antes
+
+MAX_RESIDUALES = 40
+MAX_EJEMPLOS_RESIDUALES = 3
+
+
+def _problemas_residuales(df: pd.DataFrame, reporte: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Tabla de lo que quedó sin limpiar en processed_data.csv: una fila por
+    columna y problema, con la cantidad y hasta 3 ejemplos (enmascarados con
+    las mismas reglas que la metadata).
+    """
+    meta = serialize_metadata(df, "processed_data.csv")
+    enmascarar = _enmascarado_activo()
+    filas: List[Dict[str, Any]] = []
+
+    def fila(columna, problema, cantidad, ejemplos=()):
+        filas.append({"columna": str(columna), "problema": problema, "cantidad": int(cantidad),
+                      "ejemplos": [str(e) for e in list(ejemplos)[:MAX_EJEMPLOS_RESIDUALES]]})
+
+    dup = reporte.get("duplicate_analysis", {})
+    if dup.get("count"):
+        fila("(filas)", "filas duplicadas", dup["count"])
+
+    negativos = reporte.get("negative_values", {})
+    extremos = reporte.get("outlier_analysis", {})
+    texto = reporte.get("text_inconsistencies", {})
+    for col, info in meta["columnas_info"].items():
+        if info.get("es_indice"):
+            continue
+        clave = str(col)
+        mascara = _enmascarador(col, info["lectura"]) if enmascarar else (lambda v: v)
+        if info["null_count"]:
+            fila(col, "nulos", info["null_count"])
+        no_num = info.get("no_numericos") or {}
+        if no_num.get("conteo"):
+            fila(col, "valores no numéricos", no_num["conteo"], no_num.get("ejemplos", []))
+        if info.get("fechas_imposibles"):
+            fila(col, "fechas imposibles", info["fechas_imposibles"], info.get("muestra_anomala", []))
+        if len(info.get("formatos_fecha", {})) > 1:
+            fila(col, "formatos de fecha mezclados", len(info["formatos_fecha"]),
+                 list(info["formatos_fecha"]))
+        if negativos.get(clave, {}).get("penalizado"):
+            fila(col, "negativos", negativos[clave]["count"])
+        if clave in extremos:
+            fila(col, "valores extremos (IQR)", extremos[clave]["count"],
+                 info.get("muestra_anomala", []))
+        if clave in texto:
+            variantes = next(iter(texto[clave].get("case_variations", {}).values()), [])
+            cantidad = (texto[clave].get("case_variations_count", 0)
+                        + texto[clave].get("whitespace_issues", 0))
+            fila(col, "texto inconsistente", cantidad, [mascara(repr(v)) for v in variantes])
+
+    relaciones = reporte.get("column_relationships", {})
+    for rel in relaciones.get("product_relationships", []):
+        fila(rel["expected"], "relación entre columnas rota", rel["mismatches"])
+    for col, info in relaciones.get("percentage_out_of_range", {}).items():
+        fila(col, "porcentaje fuera de 0-100", info["out_of_range_count"])
+    return filas[:MAX_RESIDUALES]
+
+
+def _resumir_residuales(residuales: Optional[List[Dict[str, Any]]], max_items: int = 8) -> str:
+    """
+    Resumen en una línea de la tabla de residuales, para error_history: así el
+    siguiente intento sabe qué columnas y valores quedaron sin limpiar.
+    """
+    if not residuales:
+        return "sin problemas detectados"
+    partes = []
+    for fila in residuales[:max_items]:
+        detalle = str(fila["cantidad"])
+        if fila.get("ejemplos"):
+            detalle += f"; ej.: {', '.join(fila['ejemplos'])}"
+        partes.append(f"{fila['columna']}: {fila['problema']} ({detalle})")
+    extra = len(residuales) - max_items
+    return "; ".join(partes) + (f"; y {extra} más" if extra > 0 else "")
+
+
+def _solo_columnas_originales(state: Dict[str, Any], df: pd.DataFrame) -> tuple:
+    """
+    El score se calcula solo con las columnas del dataset original: las nuevas
+    (flags, dummies) no se evalúan y las originales eliminadas se listan.
+    Devuelve (df a evaluar, columnas nuevas, columnas eliminadas). Sin metadata
+    del original se evalúan todas.
+    """
+    originales = [str(c) for c in ((state.get("metadata") or {}).get("columnas_info") or {})]
+    if not originales:
+        return df, [], []
+    presentes = [c for c in df.columns if str(c) in originales]
+    nuevas = [str(c) for c in df.columns if str(c) not in originales]
+    eliminadas = [c for c in originales if c not in {str(x) for x in df.columns}]
+    return df[presentes], nuevas, eliminadas
+
+
+def _error_validador(etiqueta: str, sobre: str, exc: Exception) -> Dict[str, Any]:
+    """
+    El validador (quality_checker) lanzó una excepción: estado
+    "error_validador", sin commit y sin reintento (el router termina).
+    """
+    msg = (f"{etiqueta}El validador falló sobre {sobre} ({type(exc).__name__}: "
+           f"{str(exc)[:200]}). No se hace commit ni se reintenta.")
+    print(f"   ❌ {msg}")
+    return {"openhands_status": "error_validador", "score_despues": 0, "error_history": [msg]}
+
 
 def node_validar_score(state: DataPulseState) -> DataPulseState:
-    # Nodo passthrough: el router lee el estado para decidir la transición.
-    # No modifica ninguna clave, por eso retorna un diccionario vacío.
-    return {}
+    """
+    Validación independiente: recalcula el score con quality_checker en vez de
+    confiar en el quality_report.json que escribe el propio script generado.
+
+    - score_antes: sobre el dataset original (se calcula una sola vez).
+    - score_despues: sobre el processed_data.csv real del intento, solo con las
+      columnas que existían en el original (las nuevas y las eliminadas se
+      listan, no se evalúan).
+    - Sin processed_data.csv → openhands_status = "sin_validar" (no hay
+      commit). El router solo reintenta si debía existir y no apareció
+      (``processed_esperado``).
+    - processed_data.csv presente pero inválido (vacío, ilegible) → score 0:
+      se validó y la limpieza falló.
+    - El validador lanza una excepción → "error_validador": sin commit y sin
+      reintento.
+    - Score bajo el umbral → resumen del reporte en error_history para que el
+      reintento sepa qué corregir.
+    """
+    # residuales se recalcula en cada intento (None = no se pudo validar)
+    salida: Dict[str, Any] = {"residuales": None}
+    etiqueta = _etiqueta_intento(state.get("intentos") or 0)
+
+    if state.get("score_antes") is None and state.get("filename_path"):
+        try:
+            df_original = load_dataset(state["filename_path"])
+            salida["score_antes"] = generate_report_df(
+                df_original, state.get("filename", "original"),
+                decisiones_negativos=state.get("decisiones_negativos"),
+            )["quality_score"]
+            print(f"   📏 Score antes (dataset original): {salida['score_antes']}")
+        except Exception as exc:
+            return {**salida, **_error_validador(etiqueta, "el dataset original", exc)}
+
+    status = state.get("openhands_status", "")
+    if status in OH_ESTADOS_INFRA or status == "rechazado":
+        # Fallo de infraestructura/script o rechazo: no hay nada que validar y
+        # el estado no se toca, para que el router aplique su propia política.
+        salida["score_despues"] = 0
+        return salida
+
+    ruta = state.get("ruta_processed")
+    if not ruta or not os.path.exists(ruta):
+        if state.get("processed_esperado"):
+            msg = (
+                f"{etiqueta}Validación independiente imposible: processed_data.csv debía existir y no "
+                "apareció. El script debe escribir processed_data.csv con el dataset limpio "
+                "(y, en OpenHands, hacer commit de él en la rama de trabajo)."
+            )
+        else:
+            msg = (
+                f"{etiqueta}Validación independiente imposible: los resultados de este intento no se "
+                "pudieron leer, así que no se puede validar processed_data.csv."
+            )
+        print(f"   ⚠️ {msg}")
+        salida.update({
+            "openhands_status": "sin_validar",
+            "score_despues": 0,
+            "error_history": [msg],
+        })
+        return salida
+
+    try:
+        df_processed, nuevas, eliminadas = _solo_columnas_originales(state, load_dataset(ruta))
+        salida.update({"columnas_nuevas": nuevas, "columnas_eliminadas": eliminadas})
+        if df_processed.empty:
+            raise ValueError("dataset vacío o sin ninguna columna del original")
+    except Exception as exc:
+        # El archivo apareció pero no es un dataset válido: la limpieza falló.
+        msg = (
+            f"{etiqueta}Validación independiente: processed_data.csv no es un dataset válido "
+            f"({type(exc).__name__}: {str(exc)[:200]}); score 0."
+        )
+        print(f"   ⚠️ {msg}")
+        salida.update({"score_despues": 0, "error_history": [msg]})
+        return salida
+
+    try:
+        reporte = generate_report_df(df_processed, "processed_data.csv",
+                                     decisiones_negativos=state.get("decisiones_negativos"))
+        residuales = _problemas_residuales(df_processed, reporte)
+    except Exception as exc:
+        # El fallo es del validador, no de los datos: no se reintenta ni se publica
+        return {**salida, **_error_validador(etiqueta, "processed_data.csv", exc)}
+
+    score = reporte["quality_score"]
+    salida["score_despues"] = score
+    salida["residuales"] = residuales
+    if nuevas or eliminadas:
+        print(f"   🧮 Score sobre las columnas originales; nuevas sin evaluar: {nuevas}; "
+              f"eliminadas: {eliminadas}")
+    print(
+        f"   📈 Score independiente: {score} "
+        f"(reportado por el script: {state.get('score_reportado')})"
+    )
+
+    antes = salida.get("score_antes", state.get("score_antes"))
+    if score < MIN_SCORE_PASS:
+        # La tabla de residuales va al historial para el siguiente intento
+        salida["error_history"] = [
+            f"{etiqueta}Validación independiente: score {score}/100 (< {MIN_SCORE_PASS}). "
+            f"Problemas que quedan en processed_data.csv: {_resumir_residuales(salida['residuales'])}"
+        ]
+    elif antes is not None and score < antes:
+        # Pasa el umbral pero empeora el original: también se reintenta
+        salida["error_history"] = [
+            f"{etiqueta}Validación independiente: el score empeoró ({score} < {antes} del "
+            f"original). Problemas que quedan en processed_data.csv: "
+            f"{_resumir_residuales(salida['residuales'])}"
+        ]
+    return salida
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2692,7 +4619,9 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
     audit = {
         "timestamp": ts,
         "filename_original": state["filename"],
-        "score_despues": state["score_despues"],
+        "score_antes": state.get("score_antes"),
+        "score_despues": state.get("score_despues"),
+        "score_reportado": state.get("score_reportado"),
         "decisiones_knowledge_graph": sum(
             1 for a in state.get("plan_acciones", [])
             if a.get("fuente_decision") == "knowledge_graph"
@@ -2701,6 +4630,15 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
             1 for a in state.get("plan_acciones", [])
             if a.get("fuente_decision") == "llm_fallback"
         ),
+        "problemas_sin_regla": state.get("sin_regla", []),
+        "modo_salida": state.get("modo_salida"),
+        "omitidos_por_modo": state.get("omitidos_por_modo", []),
+        "decisiones_negativos": state.get("decisiones_negativos", {}),
+        "discrepancias_negativos": state.get("discrepancias_negativos", []),
+        "columnas_nuevas_no_evaluadas": state.get("columnas_nuevas", []),
+        "columnas_originales_eliminadas": state.get("columnas_eliminadas", []),
+        "avisos_diagnostico": state.get("avisos_diagnostico", []),
+        "respuesta_cruda_diagnostico": state.get("respuesta_cruda_diagnostico"),
         "plan_acciones": state.get("plan_acciones", [])
     }
     files_to_commit.append((f"outputs/{ts}/audit_log.json", json.dumps(audit, ensure_ascii=False, indent=2)))
@@ -2764,13 +4702,29 @@ def node_commit(state: DataPulseState) -> DataPulseState:
         _save_outputs_locally(files_to_commit, ts)
         return {"github_url": f"local://outputs/{ts}"}
 
+    falta = _falta_repo_github()
+    if falta:
+        print(f"   ⚠️ {falta}")
+        print("   ℹ️ Guardando salidas localmente en outputs/.")
+        _save_outputs_locally(files_to_commit, ts)
+        return {"github_url": f"local://outputs/{ts}"}
+
     try:
-        try:
-            from github import Auth as GithubAuth
-            g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
-        except ImportError:
-            g = Github(GITHUB_TOKEN)  # fallback para PyGitHub < 1.58
-        repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+        repo = _get_github_repo()
+
+        # Política de datos: sin permiso solo se suben el script, los reportes
+        # y audit_log.json. Todo se conserva igualmente en local.
+        subir_datos, motivo = _subida_datos_permitida(repo)
+        if not subir_datos:
+            omitidos = [p for p, _ in files_to_commit if _es_archivo_datos(p)]
+            if omitidos:
+                print(f"   🔐 Subida de datos no permitida ({motivo}); se guardan solo en local:")
+                for p in omitidos:
+                    print(f"      - {p}")
+                _save_outputs_locally(
+                    [(p, c) for p, c in files_to_commit if _es_archivo_datos(p)], ts
+                )
+            files_to_commit = [(p, c) for p, c in files_to_commit if not _es_archivo_datos(p)]
 
         try:
             base = repo.get_branch("main")
@@ -2814,6 +4768,179 @@ def node_commit(state: DataPulseState) -> DataPulseState:
         print("   ℹ️ Guardando salidas localmente en outputs/.")
         _save_outputs_locally(files_to_commit, ts)
         return {"github_url": f"local://outputs/{ts}"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 10b. INFORME FINAL (función determinista; no es un nodo del grafo)
+# ═══════════════════════════════════════════════════════════════
+
+def _medir_resultado_parcial(state: DataPulseState) -> tuple:
+    """
+    Score y residuales del último processed_data.csv. Si la validación no lo
+    midió (p. ej. timeout con resultado parcial de OpenHands), se mide aquí.
+    """
+    residuales, score = state.get("residuales"), state.get("score_despues")
+    ruta = state.get("ruta_processed")
+    if residuales is None and ruta and os.path.exists(ruta):
+        try:
+            df, _, _ = _solo_columnas_originales(state, load_dataset(ruta))
+            reporte = generate_report_df(df, "processed_data.csv",
+                                         decisiones_negativos=state.get("decisiones_negativos"))
+            return reporte["quality_score"], _problemas_residuales(df, reporte), True
+        except Exception as exc:
+            print(f"   ⚠️ No se pudo medir el resultado parcial: {type(exc).__name__}: {exc}")
+    return (score if residuales is not None else None), (residuales or []), residuales is not None
+
+
+def _resumen_determinista(tabla: Dict[str, Any]) -> str:
+    """Resumen del informe, construido solo con los datos medidos (sin LLM)."""
+    partes = [f"La ejecución terminó en estado '{tabla['estado']}' tras {tabla['intentos']} intento(s)."]
+    if tabla["score_despues"] is not None:
+        partes.append(f"Score: {tabla['score_antes']} antes y {tabla['score_despues']} después "
+                      f"(umbral {tabla['umbral']}).")
+    else:
+        partes.append("No hubo un processed_data.csv que medir.")
+    if tabla["valores_sin_limpiar"]:
+        partes.append(f"Quedan {len(tabla['valores_sin_limpiar'])} problemas sin limpiar.")
+    if tabla["problemas_sin_regla"]:
+        partes.append(f"{len(tabla['problemas_sin_regla'])} problemas no tienen regla en el grafo.")
+    if tabla.get("omitidos_por_modo"):
+        partes.append(f"{len(tabla['omitidos_por_modo'])} problema(s) omitidos por el modo de salida "
+                      f"'{tabla.get('modo_salida')}'.")
+    decisiones = tabla.get("decisiones_negativos") or {}
+    if decisiones:
+        conteo = {}
+        for d in decisiones.values():
+            conteo[d["decision"]] = conteo.get(d["decision"], 0) + 1
+        partes.append("Negativos: " + ", ".join(f"{n} columna(s) {k}" for k, n in sorted(conteo.items()))
+                      + ".")
+    if tabla.get("discrepancias_negativos"):
+        partes.append(f"{len(tabla['discrepancias_negativos'])} discrepancia(s) con la lista de control "
+                      "de negativos (solo informativas).")
+    if tabla.get("avisos_diagnostico"):
+        partes.append(f"{len(tabla['avisos_diagnostico'])} aviso(s) del diagnóstico.")
+    if tabla["estado"] == "error_validador":
+        partes.append("El validador falló: no hubo commit ni reintento.")
+    if tabla.get("score_empeoro") and not tabla.get("destino"):
+        partes.append(f"Terminó sin commit porque el score empeoró respecto del original "
+                      f"({tabla['score_despues']} < {tabla['score_antes']}).")
+    if tabla["errores"]:
+        ultimo = tabla["errores"][-1]
+        m = re.match(r"^\[intento (\d+)\] (.*)$", ultimo, re.DOTALL)
+        if m:
+            partes.append(f"Último error (intento {m.group(1)}): {m.group(2)[:200]}")
+        else:
+            partes.append(f"Último error: {ultimo[:200]}")
+    return " ".join(partes)
+
+
+def _informe_markdown(tabla: Dict[str, Any], resumen: str) -> str:
+    """Informe legible: resumen + tabla de valores sin limpiar + problemas sin regla."""
+    destino = tabla["destino"] or "no se publicó (sin commit)"
+    lineas = [
+        "# Informe final DataPulse", "",
+        f"- **Estado:** {tabla['estado']} · **Modo:** {tabla['modo']} · **Intentos:** {tabla['intentos']}",
+        f"- **Score:** {tabla['score_antes']} → {tabla['score_despues']} (umbral {tabla['umbral']}); "
+        f"declarado por el script: {tabla['score_reportado']}",
+        f"- **Resultado:** {destino} · **Modo de salida:** {tabla.get('modo_salida') or '—'}", "",
+        "## Resumen", "", resumen, "",
+        "## Valores que no se pudieron limpiar", "",
+    ]
+    if tabla["valores_sin_limpiar"]:
+        lineas += ["| Columna | Problema | Cantidad | Ejemplos |", "|---|---|---|---|"]
+        for f in tabla["valores_sin_limpiar"]:
+            ejemplos = ", ".join(f["ejemplos"]).replace("|", "\\|")
+            lineas.append(f"| {f['columna']} | {f['problema']} | {f['cantidad']} | {ejemplos} |")
+    else:
+        lineas.append("Ninguno medido.")
+    lineas += ["", "## Problemas sin regla en el Grafo de Conocimiento", ""]
+    if tabla["problemas_sin_regla"]:
+        lineas += ["| Columna | Problema |", "|---|---|"]
+        lineas += [f"| {p['columna']} | {p['problema']} |" for p in tabla["problemas_sin_regla"]]
+    else:
+        lineas.append("Ninguno.")
+    lineas += ["", "## Omitidos por modo de salida", ""]
+    if tabla.get("omitidos_por_modo"):
+        lineas += ["| Columna | Problema | Acciones omitidas | Origen |", "|---|---|---|---|"]
+        lineas += [f"| {o['columna']} | {o['problema']} | {', '.join(o['acciones_omitidas'])} | "
+                   f"{o.get('origen', 'knowledge_graph')} |" for o in tabla["omitidos_por_modo"]]
+    else:
+        lineas.append("Ninguno.")
+    lineas += ["", "## Columnas que no entran en el score", ""]
+    lineas.append("- Nuevas (flags, dummies), no evaluadas: "
+                  + (", ".join(tabla.get("columnas_nuevas_no_evaluadas") or []) or "ninguna"))
+    lineas.append("- Originales eliminadas: "
+                  + (", ".join(tabla.get("columnas_originales_eliminadas") or []) or "ninguna"))
+    lineas += ["", "## Decisiones sobre negativos", ""]
+    decisiones = tabla.get("decisiones_negativos") or {}
+    if decisiones:
+        lineas += ["| Columna | Decisión | Razón | Fuente |", "|---|---|---|---|"]
+        for col, d in decisiones.items():
+            razon = str(d.get("razon", "")).replace("|", "\\|")
+            lineas.append(f"| {col} | {d['decision']} | {razon} | {d['fuente']} |")
+    else:
+        lineas.append("Ninguna columna con negativos.")
+    lineas += ["", "## Avisos del diagnóstico", ""]
+    if tabla.get("avisos_diagnostico"):
+        lineas += [f"- {a}" for a in tabla["avisos_diagnostico"]]
+        if tabla.get("respuesta_cruda_diagnostico"):
+            lineas.append(f"- Respuesta cruda del LLM: `{tabla['respuesta_cruda_diagnostico']}`")
+    else:
+        lineas.append("Ninguno.")
+    lineas += ["", "## Discrepancias con la lista de control de negativos", ""]
+    if tabla.get("discrepancias_negativos"):
+        lineas += [f"- {d['detalle']} (fuente: {d['fuente']})" for d in tabla["discrepancias_negativos"]]
+    else:
+        lineas.append("Ninguna.")
+    return "\n".join(lineas) + "\n"
+
+
+def generar_informe_final(estado: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Informe final determinista (sin LLM y fuera del grafo LangGraph):
+    run_datapulse lo llama después de app.invoke. Tabla medida por DataPulse
+    con el score y los valores que no se pudieron limpiar; si la validación no
+    midió el último processed_data.csv (p. ej. timeout con resultado parcial),
+    se mide aquí. Se guarda solo en local, en outputs/<ts>-informe/.
+    """
+    score, residuales, medido = _medir_resultado_parcial(estado)
+    tabla = {
+        "estado": estado.get("openhands_status"),
+        "modo": "OpenHands" if OPENHANDS_API_KEY else "local",
+        "intentos": estado.get("intentos"),
+        "score_antes": estado.get("score_antes"),
+        "score_despues": score,
+        "umbral": MIN_SCORE_PASS,
+        "score_reportado": estado.get("score_reportado"),
+        "destino": estado.get("github_url"),
+        "valores_sin_limpiar": residuales,
+        "problemas_sin_regla": estado.get("sin_regla", []),
+        "modo_salida": estado.get("modo_salida"),
+        "omitidos_por_modo": estado.get("omitidos_por_modo", []),
+        "decisiones_negativos": estado.get("decisiones_negativos", {}),
+        "discrepancias_negativos": estado.get("discrepancias_negativos", []),
+        "columnas_nuevas_no_evaluadas": estado.get("columnas_nuevas", []),
+        "columnas_originales_eliminadas": estado.get("columnas_eliminadas", []),
+        "score_empeoro": (score is not None and estado.get("score_antes") is not None
+                          and score < estado["score_antes"]),
+        "avisos_diagnostico": estado.get("avisos_diagnostico", []),
+        "respuesta_cruda_diagnostico": estado.get("respuesta_cruda_diagnostico"),
+        "errores": [e[:300] for e in (estado.get("error_history") or [])[-3:]],
+        "mensaje_ejecucion": (estado.get("mensaje_ejecucion") or "")[:500],
+        "resultado_medido": medido,
+    }
+    resumen = _resumen_determinista(tabla)
+
+    carpeta = os.path.join("outputs", datetime.now().strftime("%Y%m%d-%H%M%S") + "-informe")
+    os.makedirs(carpeta, exist_ok=True)
+    markdown = _informe_markdown(tabla, resumen)
+    with open(os.path.join(carpeta, "informe_final.json"), "w", encoding="utf-8") as f:
+        json.dump({**tabla, "resumen": resumen}, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(carpeta, "informe_final.md"), "w", encoding="utf-8") as f:
+        f.write(markdown)
+    print("\n" + markdown)
+    print(f"   🗂️ Informe guardado en {carpeta}/")
+    return {**tabla, "resumen": resumen, "ruta": os.path.abspath(carpeta)}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2867,12 +4994,10 @@ def build_datapulse_graph():
 
 def _download_github_file(repo_path: str, branch: str, local_dest: str) -> None:
     """Descarga un archivo del repo de GitHub a una ruta local temporal."""
-    try:
-        from github import Auth as GithubAuth
-        g = Github(auth=GithubAuth.Token(GITHUB_TOKEN))
-    except ImportError:
-        g = Github(GITHUB_TOKEN)
-    repo = g.get_repo(f"{GITHUB_USERNAME}/{GITHUB_REPO}")
+    falta = _falta_repo_github()
+    if falta:
+        raise ValueError(f"No se puede leer '{repo_path}' de GitHub. {falta}")
+    repo = _get_github_repo()
     contents = repo.get_contents(repo_path, ref=branch)
     with open(local_dest, "wb") as f:
         f.write(contents.decoded_content)
@@ -2900,6 +5025,9 @@ def run_datapulse(
     global kg
     if kg is None:
         kg = KNOWLEDGE_GRAPH
+    aplicar_dominios_activos()
+    validar_grafo(kg)                     # también las ediciones en caliente (dp.kg.add_edge...)
+    modo_salida = modo_salida_vigente()   # falla aquí, antes de llamar al LLM, si no es válido
 
     # Resolver fuente del archivo
     gh_file   = github_file   or GITHUB_DATA_FILE
@@ -2933,15 +5061,31 @@ def run_datapulse(
         "file_ext":             file_ext,
         "metadata":             {},
         "diagnostico":          {},
+        "decisiones_negativos": {},
+        "discrepancias_negativos": [],
+        "avisos_diagnostico":   [],
+        "respuesta_cruda_diagnostico": None,
         "acciones_grafo":       {},
+        "modo_salida":          modo_salida,
+        "omitidos_por_modo":    [],
         "plan_acciones":        [],
+        "sin_regla":            [],
         "brief_tecnico":        "",
         "codigo":               "",
         "intentos":             0,
         "error_history":        [],
         "github_source_branch": source_branch,
         "github_source_path":   source_path,
+        "score_antes":        None,
         "score_despues":      0,
+        "score_reportado":    None,
+        "ruta_processed":     None,
+        "processed_esperado": False,
+        "residuales":         None,
+        "columnas_nuevas":    [],
+        "columnas_eliminadas": [],
+        "mensaje_ejecucion":  None,
+        "directorio_salida":  None,
         "archivos_generados": {},
         "openhands_status":   "",
         "github_url":         None,
@@ -2949,6 +5093,13 @@ def run_datapulse(
 
     app = build_datapulse_graph()
     final_state = app.invoke(initial_state)
+
+    # Informe final determinista, fuera del grafo (no es un nodo)
+    try:
+        final_state["informe_final"] = generar_informe_final(final_state)
+    except Exception as exc:
+        print(f"   ⚠️ No se pudo generar el informe final: {type(exc).__name__}: {exc}")
+        final_state["informe_final"] = None
     return final_state
 
 
@@ -2957,9 +5108,16 @@ def _print_results(final_state: dict) -> None:
     print("📊 RESULTADO FINAL DATAPULSE")
     print("=" * 60)
     print(f"Status OpenHands : {final_state['openhands_status']}")
-    print(f"Score calidad    : {final_state['score_despues']}/100")
+    print(f"Score antes      : {final_state.get('score_antes')}/100")
+    print(f"Score calidad    : {final_state['score_despues']}/100 (validación independiente)")
+    print(f"Score reportado  : {final_state.get('score_reportado')} (informativo)")
     print(f"Intentos usados  : {final_state['intentos']}")
     print(f"GitHub URL       : {final_state.get('github_url', 'N/A')}")
+    informe = final_state.get("informe_final") or {}
+    if informe:
+        print(f"Informe final    : {informe.get('ruta')}")
+        print(f"Sin limpiar      : {len(informe.get('valores_sin_limpiar') or [])} problemas | "
+              f"sin regla en el grafo: {len(informe.get('problemas_sin_regla') or [])}")
 
     archivos = final_state.get("archivos_generados", {})
     if archivos:
@@ -3023,12 +5181,23 @@ def main() -> None:
     _print_results(final_state)
 
     # ── Descarga en Colab ─────────────────────────────────────────
+    _descargar_en_colab(final_state)
+
+
+def _descargar_en_colab(final_state: dict) -> None:
+    """Descarga processed_data.csv desde la ruta real del intento (solo en Colab)."""
     try:
         from google.colab import files
-        if "processed_data.csv" in final_state.get("archivos_generados", {}):
-            files.download("/content/processed_data.csv")
     except ImportError:
-        pass
+        return
+    ruta = final_state.get("ruta_processed")
+    if not ruta:
+        print("ℹ️ No hay processed_data.csv que descargar.")
+        return
+    try:
+        files.download(ruta)
+    except FileNotFoundError:
+        print(f"⚠️ No se encontró {ruta}; no se pudo descargar.")
 
 
 if __name__ == "__main__":
