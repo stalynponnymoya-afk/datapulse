@@ -489,6 +489,28 @@ PALABRAS_FECHA = {
 _PATRON_FECHA = r"\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4}"
 
 
+def quitar_zona_horaria(fechas):
+    """
+    Fechas con zona horaria → UTC sin zona, para poder compararlas con
+    Timestamp sin zona (antes: TypeError con datetime64[us, UTC]). Las fechas
+    sin zona se devuelven igual.
+    """
+    if isinstance(fechas, pd.Series):
+        if isinstance(fechas.dtype, pd.DatetimeTZDtype):
+            return fechas.dt.tz_convert("UTC").dt.tz_localize(None)
+        return fechas
+    if getattr(fechas, "tz", None) is not None:
+        return fechas.tz_convert("UTC").tz_localize(None)
+    return fechas
+
+
+def _a_fechas(valores, **kwargs) -> pd.Series:
+    """pd.to_datetime tolerante a zonas mezcladas: todo a UTC y sin zona."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return quitar_zona_horaria(pd.to_datetime(valores, errors="coerce", utc=True, **kwargs))
+
+
 def _parsear_fechas(values: pd.Series) -> pd.Series:
     """
     Parsea fechas probando mes-primero y día-primero; devuelve el resultado
@@ -496,9 +518,7 @@ def _parsear_fechas(values: pd.Series) -> pd.Series:
     """
     mejor = None
     for dayfirst in (False, True):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            parsed = pd.to_datetime(values, errors="coerce", dayfirst=dayfirst)
+        parsed = _a_fechas(values, dayfirst=dayfirst)
         if mejor is None or parsed.isna().sum() < mejor.isna().sum():
             mejor = parsed
     return mejor
@@ -570,19 +590,16 @@ _RE_ANIO_PRIMERO = re.compile(r"^\d{4}[/\-.]")
 
 def _parsear_grupo(unicos: pd.Series, dia_primero: bool) -> pd.Series:
     """Parsea valores únicos: inferencia rápida y, para los que fallan, uno a uno."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        pref = pd.to_datetime(unicos, errors="coerce", dayfirst=dia_primero)
-        otra = pd.to_datetime(unicos, errors="coerce", dayfirst=not dia_primero)
-        mejor, resto = (otra, pref) if otra.isna().sum() < pref.isna().sum() else (pref, otra)
-        parsed = mejor.fillna(resto)
+    pref = _a_fechas(unicos, dayfirst=dia_primero)
+    otra = _a_fechas(unicos, dayfirst=not dia_primero)
+    mejor, resto = (otra, pref) if otra.isna().sum() < pref.isna().sum() else (pref, otra)
+    parsed = mejor.fillna(resto)
+    faltan = parsed.isna()
+    for dayfirst in (dia_primero, not dia_primero):
+        if not faltan.any():
+            break
+        parsed = parsed.fillna(_a_fechas(unicos[faltan], format="mixed", dayfirst=dayfirst))
         faltan = parsed.isna()
-        for dayfirst in (dia_primero, not dia_primero):
-            if not faltan.any():
-                break
-            parsed = parsed.fillna(pd.to_datetime(unicos[faltan], errors="coerce",
-                                                  format="mixed", dayfirst=dayfirst))
-            faltan = parsed.isna()
     return parsed
 
 
@@ -630,7 +647,7 @@ def es_mayormente_fecha(serie: pd.Series, umbral: float = UMBRAL_MAYORMENTE) -> 
 def fechas_imposibles(serie: pd.Series) -> pd.Series:
     """Valores que no son una fecha válida en ningún formato o están fuera de 1900..hoy+5 años."""
     if pd.api.types.is_datetime64_any_dtype(serie):
-        fechas = serie.dropna()
+        fechas = quitar_zona_horaria(serie.dropna())
         valores = fechas
     else:
         valores = serie.dropna().astype(str)

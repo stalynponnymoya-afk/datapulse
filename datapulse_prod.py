@@ -3252,6 +3252,11 @@ def _entorno_minimo_subproceso() -> Dict[str, str]:
     }
 
 
+def _etiqueta_intento(numero) -> str:
+    """Prefijo de los mensajes de error_history: indica de qué intento son."""
+    return f"[intento {numero}] "
+
+
 def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     """
     Fallback sin OPENHANDS_API_KEY: usa el LLM configurado (Claude o Groq)
@@ -3273,8 +3278,8 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         llm = get_llm()
         response = llm.invoke([HumanMessage(content=prompt)])
     except Exception as exc:
-        msg = (f"{describir_llm()} no pudo generar el pipeline: "
-               f"{type(exc).__name__}: {str(exc)[:300]}")
+        msg = (f"{_etiqueta_intento(state.get('intentos', 0) + 1)}{describir_llm()} no pudo "
+               f"generar el pipeline: {type(exc).__name__}: {str(exc)[:300]}")
         print(f"   ❌ {msg}")
         return {
             "intentos": state.get("intentos", 0) + 1,
@@ -3365,7 +3370,8 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         "archivos_generados": archivos_generados,
     }
     if status != "finished" and stderr_tail:
-        resultado["error_history"] = [f"El script falló: {stderr_tail}"]
+        resultado["error_history"] = [
+            f"{_etiqueta_intento(resultado['intentos'])}El script falló: {stderr_tail}"]
     return resultado
 
 
@@ -3374,7 +3380,7 @@ def _rechazo_openhands(state: DataPulseState, msg: str) -> dict:
     return {
         "intentos": state.get("intentos", 0) + 1,
         "openhands_status": "rechazado",
-        "error_history": [msg],
+        "error_history": [_etiqueta_intento(state.get("intentos", 0) + 1) + msg],
         "score_reportado": None,
         "ruta_processed": None,
         "processed_esperado": False,
@@ -3784,7 +3790,8 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         }
 
     except Exception as e:
-        err_msg = f"{type(e).__name__}: {str(e)[:300]}"
+        err_msg = (f"{_etiqueta_intento(state.get('intentos', 0) + 1)}"
+                   f"{type(e).__name__}: {str(e)[:300]}")
         print(f"   ❌ {err_msg}")
         return {
             "intentos": state.get("intentos", 0) + 1,
@@ -3814,6 +3821,10 @@ def router_validar_score(state: DataPulseState) -> str:
     # Rechazo por configuración o política (sin usuario/repo, subida de datos
     # no permitida): reintentar no cambia nada.
     if status == "rechazado":
+        return "end_no_commit"
+
+    # El validador falló: no hay medición fiable; ni commit ni reintento.
+    if status == "error_validador":
         return "end_no_commit"
 
     # Fallo de infraestructura: presupuesto corto para no re-lanzar sandboxes.
@@ -3910,6 +3921,17 @@ def _resumir_residuales(residuales: Optional[List[Dict[str, Any]]], max_items: i
     return "; ".join(partes) + (f"; y {extra} más" if extra > 0 else "")
 
 
+def _error_validador(etiqueta: str, sobre: str, exc: Exception) -> Dict[str, Any]:
+    """
+    El validador (quality_checker) lanzó una excepción: estado
+    "error_validador", sin commit y sin reintento (el router termina).
+    """
+    msg = (f"{etiqueta}El validador falló sobre {sobre} ({type(exc).__name__}: "
+           f"{str(exc)[:200]}). No se hace commit ni se reintenta.")
+    print(f"   ❌ {msg}")
+    return {"openhands_status": "error_validador", "score_despues": 0, "error_history": [msg]}
+
+
 def node_validar_score(state: DataPulseState) -> DataPulseState:
     """
     Validación independiente: recalcula el score con quality_checker en vez de
@@ -3922,11 +3944,14 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
       (``processed_esperado``).
     - processed_data.csv presente pero inválido (vacío, ilegible) → score 0:
       se validó y la limpieza falló.
+    - El validador lanza una excepción → "error_validador": sin commit y sin
+      reintento.
     - Score bajo el umbral → resumen del reporte en error_history para que el
       reintento sepa qué corregir.
     """
     # residuales se recalcula en cada intento (None = no se pudo validar)
     salida: Dict[str, Any] = {"residuales": None}
+    etiqueta = _etiqueta_intento(state.get("intentos") or 0)
 
     if state.get("score_antes") is None and state.get("filename_path"):
         try:
@@ -3937,7 +3962,7 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
             )["quality_score"]
             print(f"   📏 Score antes (dataset original): {salida['score_antes']}")
         except Exception as exc:
-            print(f"   ⚠️ No se pudo calcular el score del original: {type(exc).__name__}: {exc}")
+            return {**salida, **_error_validador(etiqueta, "el dataset original", exc)}
 
     status = state.get("openhands_status", "")
     if status in OH_ESTADOS_INFRA or status == "rechazado":
@@ -3950,13 +3975,13 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
     if not ruta or not os.path.exists(ruta):
         if state.get("processed_esperado"):
             msg = (
-                "Validación independiente imposible: processed_data.csv debía existir y no "
+                f"{etiqueta}Validación independiente imposible: processed_data.csv debía existir y no "
                 "apareció. El script debe escribir processed_data.csv con el dataset limpio "
                 "(y, en OpenHands, hacer commit de él en la rama de trabajo)."
             )
         else:
             msg = (
-                "Validación independiente imposible: los resultados de este intento no se "
+                f"{etiqueta}Validación independiente imposible: los resultados de este intento no se "
                 "pudieron leer, así que no se puede validar processed_data.csv."
             )
         print(f"   ⚠️ {msg}")
@@ -3969,21 +3994,29 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
 
     try:
         df_processed = load_dataset(ruta)
-        reporte = generate_report_df(df_processed, "processed_data.csv",
-                                     decisiones_negativos=state.get("decisiones_negativos"))
+        if df_processed.empty:
+            raise ValueError("dataset vacío")
     except Exception as exc:
         # El archivo apareció pero no es un dataset válido: la limpieza falló.
         msg = (
-            "Validación independiente: processed_data.csv no es un dataset válido "
+            f"{etiqueta}Validación independiente: processed_data.csv no es un dataset válido "
             f"({type(exc).__name__}: {str(exc)[:200]}); score 0."
         )
         print(f"   ⚠️ {msg}")
         salida.update({"score_despues": 0, "error_history": [msg]})
         return salida
 
+    try:
+        reporte = generate_report_df(df_processed, "processed_data.csv",
+                                     decisiones_negativos=state.get("decisiones_negativos"))
+        residuales = _problemas_residuales(df_processed, reporte)
+    except Exception as exc:
+        # El fallo es del validador, no de los datos: no se reintenta ni se publica
+        return {**salida, **_error_validador(etiqueta, "processed_data.csv", exc)}
+
     score = reporte["quality_score"]
     salida["score_despues"] = score
-    salida["residuales"] = _problemas_residuales(df_processed, reporte)
+    salida["residuales"] = residuales
     print(
         f"   📈 Score independiente: {score} "
         f"(reportado por el script: {state.get('score_reportado')})"
@@ -3992,7 +4025,7 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
     if score < MIN_SCORE_PASS:
         # La tabla de residuales va al historial para el siguiente intento
         salida["error_history"] = [
-            f"Validación independiente: score {score}/100 (< {MIN_SCORE_PASS}). "
+            f"{etiqueta}Validación independiente: score {score}/100 (< {MIN_SCORE_PASS}). "
             f"Problemas que quedan en processed_data.csv: {_resumir_residuales(salida['residuales'])}"
         ]
     return salida
@@ -4199,8 +4232,15 @@ def _resumen_determinista(tabla: Dict[str, Any]) -> str:
     if tabla.get("discrepancias_negativos"):
         partes.append(f"{len(tabla['discrepancias_negativos'])} discrepancia(s) con la lista de control "
                       "de negativos (solo informativas).")
+    if tabla["estado"] == "error_validador":
+        partes.append("El validador falló: no hubo commit ni reintento.")
     if tabla["errores"]:
-        partes.append(f"Último error: {tabla['errores'][-1][:200]}")
+        ultimo = tabla["errores"][-1]
+        m = re.match(r"^\[intento (\d+)\] (.*)$", ultimo, re.DOTALL)
+        if m:
+            partes.append(f"Último error (intento {m.group(1)}): {m.group(2)[:200]}")
+        else:
+            partes.append(f"Último error: {ultimo[:200]}")
     return " ".join(partes)
 
 
