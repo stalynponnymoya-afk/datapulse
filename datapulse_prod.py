@@ -2014,6 +2014,8 @@ class DataPulseState(TypedDict):
     diagnostico: Dict[str, Any]
     decisiones_negativos: Dict[str, Dict[str, Any]]   # {columna: {decision, razon, fuente}}
     discrepancias_negativos: List[Dict[str, Any]]     # vs. PALABRAS_NO_NEGATIVAS (solo informe/audit)
+    avisos_diagnostico: List[str]                     # avisos de la normalización del diagnóstico
+    respuesta_cruda_diagnostico: Optional[str]        # ruta en outputs/ si hubo avisos
     acciones_grafo: Dict[str, Any]
 
     # Planificación (acciones del grafo + respaldo del LLM)
@@ -2686,6 +2688,13 @@ def contexto_dataset() -> str:
     return (CONTEXTO_DATASET or "").strip() or os.environ.get("DATAPULSE_CONTEXTO", "").strip()
 
 
+def _avisar(avisos: Optional[List[str]], mensaje: str) -> None:
+    """Imprime un aviso del diagnóstico y lo guarda (estado, audit_log, informe)."""
+    print(f"   ⚠️ {mensaje}")
+    if avisos is not None:
+        avisos.append(mensaje)
+
+
 _CLAVES_ENVOLTORIO = ("diagnostico", "diagnóstico", "diagnosis", "columnas", "columns",
                       "diagnostico_por_columna", "resultado", "result")
 _CLAVES_NOMBRE_COLUMNA = ("columna", "column", "nombre_columna", "nombre", "name")
@@ -2693,7 +2702,8 @@ _CLAVES_NOMBRE_COLUMNA = ("columna", "column", "nombre_columna", "nombre", "name
 
 def _normalizar_diagnostico(crudo: Any, columnas: List[str],
                             columnas_info: Optional[Dict[str, Any]] = None,
-                            decisiones_usuario: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                            decisiones_usuario: Optional[Dict[str, Any]] = None,
+                            avisos: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Deja el diagnóstico del LLM como {columna_real: {diagnóstico}}.
 
@@ -2727,7 +2737,7 @@ def _normalizar_diagnostico(crudo: Any, columnas: List[str],
             if isinstance(interno, (dict, list)):
                 try:
                     return _normalizar_diagnostico(interno, columnas, columnas_info,
-                                                   decisiones_usuario)
+                                                   decisiones_usuario, avisos)
                 except ValueError:
                     continue
 
@@ -2739,10 +2749,10 @@ def _normalizar_diagnostico(crudo: Any, columnas: List[str],
         else:
             ignoradas.append(clave)
     if ignoradas:
-        print(f"   ⚠️ Diagnóstico: se ignoran claves que no son el diagnóstico de una columna: {ignoradas}")
+        _avisar(avisos, f"Diagnóstico: se ignoran claves que no son el diagnóstico de una columna: {ignoradas}")
     faltan = [c for c in columnas if c not in normalizado]
     if faltan:
-        print(f"   ⚠️ Diagnóstico: columnas sin diagnóstico del LLM: {faltan}")
+        _avisar(avisos, f"Diagnóstico: columnas sin diagnóstico del LLM: {faltan}")
     if not normalizado:
         raise ValueError(
             "El diagnóstico del LLM no contiene ninguna columna del dataset "
@@ -2750,7 +2760,8 @@ def _normalizar_diagnostico(crudo: Any, columnas: List[str],
         )
     for col, info in (columnas_info or {}).items():
         if str(col) in normalizado and (info or {}).get("negativos", 0) > 0:
-            _aplicar_decision_negativos(str(col), normalizado[str(col)], decisiones_usuario or {})
+            _aplicar_decision_negativos(str(col), normalizado[str(col)], decisiones_usuario or {},
+                                        avisos)
     return normalizado
 
 
@@ -2759,7 +2770,8 @@ PROBLEMA_NEGATIVOS_INCIERTOS = "negativos_inciertos"
 
 
 def _aplicar_decision_negativos(col: str, diag: Dict[str, Any],
-                                decisiones_usuario: Dict[str, Any]) -> None:
+                                decisiones_usuario: Dict[str, Any],
+                                avisos: Optional[List[str]] = None) -> None:
     """
     Fija la decisión sobre los negativos de una columna y la refleja en sus
     problemas:
@@ -2775,7 +2787,7 @@ def _aplicar_decision_negativos(col: str, diag: Dict[str, Any],
     usuario = {str(k): v for k, v in decisiones_usuario.items()}.get(col)
     decision_usuario = normalizar_decision_negativos(usuario) if usuario is not None else None
     if usuario is not None and decision_usuario not in ("validos", "invalidos"):
-        print(f"   ⚠️ DECISIONES_NEGATIVOS['{col}']={usuario!r} no es 'validos' ni 'invalidos': se ignora.")
+        _avisar(avisos, f"DECISIONES_NEGATIVOS['{col}']={usuario!r} no es 'validos' ni 'invalidos': se ignora.")
         decision_usuario = None
 
     problemas = diag.get("problemas") or diag.get("problema") or []
@@ -2798,20 +2810,20 @@ def _aplicar_decision_negativos(col: str, diag: Dict[str, Any],
         decision, fuente = campo, "llm"
         razon = str(diag.get("razon_negativos") or "").strip() or "Sin razón indicada por el LLM."
         if por_etiqueta and por_etiqueta != campo:
-            print(f"   ⚠️ Diagnóstico: en '{col}' el campo 'negativos' ({campo!r}) contradice la "
-                  f"etiqueta {etiqueta!r}; manda el campo.")
+            _avisar(avisos, f"Diagnóstico: en '{col}' el campo 'negativos' ({campo!r}) contradice "
+                            f"la etiqueta {etiqueta!r}; manda el campo.")
     elif por_etiqueta:
         decision, fuente = por_etiqueta, "llm"
         razon = (str(diag.get("razon_negativos") or "").strip()
                  or f"Deducido de la etiqueta {etiqueta!r} del LLM.")
-        print(f"   ⚠️ Diagnóstico: '{col}' tiene negativos y el LLM no devolvió el campo "
-              f"'negativos' ({diag.get('negativos')!r}); se deduce {por_etiqueta!r} de la "
-              f"etiqueta {etiqueta!r}.")
+        _avisar(avisos, f"Diagnóstico: '{col}' tiene negativos y el LLM no devolvió el campo "
+                        f"'negativos' ({diag.get('negativos')!r}); se deduce {por_etiqueta!r} de la "
+                        f"etiqueta {etiqueta!r}.")
     else:
         decision, fuente = "incierto", "llm"
         razon = "El LLM no devolvió una decisión sobre los negativos ni ninguna señal."
-        print(f"   ⚠️ Diagnóstico: '{col}' tiene negativos y el LLM no devolvió una decisión "
-              f"válida ({diag.get('negativos')!r}) ni ninguna señal: se trata como 'incierto'.")
+        _avisar(avisos, f"Diagnóstico: '{col}' tiene negativos y el LLM no devolvió una decisión "
+                        f"válida ({diag.get('negativos')!r}) ni ninguna señal: se trata como 'incierto'.")
 
     problemas = [p for p in problemas
                  if p not in (PROBLEMA_NEGATIVOS_INVALIDOS, PROBLEMA_NEGATIVOS_INCIERTOS)]
@@ -2843,21 +2855,69 @@ def _decisiones_y_discrepancias(diagnostico: Dict[str, Any]) -> tuple:
     return decisiones, discrepancias
 
 
+def _guardar_respuestas_diagnostico(respuestas: List[tuple], avisos: List[str]) -> str:
+    """Guarda en outputs/ la respuesta cruda del LLM y los avisos (solo en local)."""
+    carpeta = os.path.join("outputs", datetime.now().strftime("%Y%m%d-%H%M%S") + "-diagnostico")
+    os.makedirs(carpeta, exist_ok=True)
+    ruta = os.path.join(carpeta, "respuesta_llm_diagnostico.txt")
+    with open(ruta, "w", encoding="utf-8") as f:
+        f.write("# Avisos del diagnóstico\n" + "\n".join(f"- {a}" for a in avisos) + "\n")
+        for titulo, texto in respuestas:
+            f.write(f"\n# Respuesta cruda del LLM ({titulo})\n{texto}\n")
+    print(f"   🗂️ Respuesta cruda del diagnóstico guardada en {ruta}")
+    return os.path.abspath(ruta)
+
+
 def node_diagnosticar(state: DataPulseState) -> DataPulseState:
+    """
+    El LLM diagnostica todas las columnas. La respuesta se normaliza y los
+    avisos se guardan en el estado. Si faltaron columnas, se hace un único
+    reintento pidiendo solo esas; las que sigan faltando quedan sin tocar y
+    registradas. Con avisos, la respuesta cruda se guarda en outputs/.
+    """
+    avisos: List[str] = []
+    respuestas: List[tuple] = []
+    metadata = state["metadata"]
     llm = get_llm()
-    prompt = construir_prompt_diagnostico(state["metadata"])
-    response = llm.invoke([HumanMessage(content=prompt)])
-    crudo = extract_json_from_markdown(response.content)
-    columnas_info = (state.get("metadata") or {}).get("columnas_info", {})
+    respuesta = llm.invoke([HumanMessage(content=construir_prompt_diagnostico(metadata))]).content
+    respuestas.append(("diagnóstico completo", respuesta))
+    crudo = extract_json_from_markdown(respuesta)
+    columnas_info = (metadata or {}).get("columnas_info", {})
     diagnostico = _normalizar_diagnostico(crudo, list(columnas_info), columnas_info,
-                                          DECISIONES_NEGATIVOS)
+                                          DECISIONES_NEGATIVOS, avisos)
+
+    faltan = [str(c) for c in columnas_info if str(c) not in diagnostico]
+    if faltan:
+        sub_info = {c: v for c, v in columnas_info.items() if str(c) in faltan}
+        prompt = (construir_prompt_diagnostico({**metadata, "columnas_info": sub_info,
+                                                "columnas": len(sub_info)})
+                  + f"\n\nIMPORTANTE: diagnostica SOLO estas columnas, que faltaron en la "
+                    f"respuesta anterior: {json.dumps(faltan, ensure_ascii=False)}")
+        try:
+            respuesta = llm.invoke([HumanMessage(content=prompt)]).content
+            respuestas.append(("reintento de columnas faltantes", respuesta))
+            extra = _normalizar_diagnostico(extract_json_from_markdown(respuesta), faltan,
+                                            sub_info, DECISIONES_NEGATIVOS, avisos)
+            diagnostico.update({c: d for c, d in extra.items() if c in faltan})
+        except Exception as exc:
+            _avisar(avisos, f"Diagnóstico: el reintento de las columnas que faltaron falló "
+                            f"({type(exc).__name__}: {str(exc)[:150]}).")
+        siguen = [c for c in faltan if c not in diagnostico]
+        if siguen:
+            _avisar(avisos, f"Diagnóstico: tras el reintento siguen sin diagnóstico (quedan sin "
+                            f"tocar): {siguen}")
+        else:
+            _avisar(avisos, f"Diagnóstico: el reintento completó las columnas que faltaban: {faltan}")
+
+    ruta_cruda = _guardar_respuestas_diagnostico(respuestas, avisos) if avisos else None
     decisiones, discrepancias = _decisiones_y_discrepancias(diagnostico)
     for col, d in decisiones.items():
         print(f"   ➖ Negativos en '{col}': {d['decision']} ({d['fuente']}) — {d['razon'][:120]}")
     for d in discrepancias:
         print(f"   ↔️ Discrepancia con la lista de control: {d['detalle']}")
     return {"diagnostico": diagnostico, "decisiones_negativos": decisiones,
-            "discrepancias_negativos": discrepancias}
+            "discrepancias_negativos": discrepancias, "avisos_diagnostico": avisos,
+            "respuesta_cruda_diagnostico": ruta_cruda}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4171,6 +4231,8 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
         "discrepancias_negativos": state.get("discrepancias_negativos", []),
         "columnas_nuevas_no_evaluadas": state.get("columnas_nuevas", []),
         "columnas_originales_eliminadas": state.get("columnas_eliminadas", []),
+        "avisos_diagnostico": state.get("avisos_diagnostico", []),
+        "respuesta_cruda_diagnostico": state.get("respuesta_cruda_diagnostico"),
         "plan_acciones": state.get("plan_acciones", [])
     }
     files_to_commit.append((f"outputs/{ts}/audit_log.json", json.dumps(audit, ensure_ascii=False, indent=2)))
@@ -4346,6 +4408,8 @@ def _resumen_determinista(tabla: Dict[str, Any]) -> str:
     if tabla.get("discrepancias_negativos"):
         partes.append(f"{len(tabla['discrepancias_negativos'])} discrepancia(s) con la lista de control "
                       "de negativos (solo informativas).")
+    if tabla.get("avisos_diagnostico"):
+        partes.append(f"{len(tabla['avisos_diagnostico'])} aviso(s) del diagnóstico.")
     if tabla["estado"] == "error_validador":
         partes.append("El validador falló: no hubo commit ni reintento.")
     if tabla.get("score_empeoro") and not tabla.get("destino"):
@@ -4400,6 +4464,13 @@ def _informe_markdown(tabla: Dict[str, Any], resumen: str) -> str:
             lineas.append(f"| {col} | {d['decision']} | {razon} | {d['fuente']} |")
     else:
         lineas.append("Ninguna columna con negativos.")
+    lineas += ["", "## Avisos del diagnóstico", ""]
+    if tabla.get("avisos_diagnostico"):
+        lineas += [f"- {a}" for a in tabla["avisos_diagnostico"]]
+        if tabla.get("respuesta_cruda_diagnostico"):
+            lineas.append(f"- Respuesta cruda del LLM: `{tabla['respuesta_cruda_diagnostico']}`")
+    else:
+        lineas.append("Ninguno.")
     lineas += ["", "## Discrepancias con la lista de control de negativos", ""]
     if tabla.get("discrepancias_negativos"):
         lineas += [f"- {d['detalle']} (fuente: {d['fuente']})" for d in tabla["discrepancias_negativos"]]
@@ -4434,6 +4505,8 @@ def generar_informe_final(estado: Dict[str, Any]) -> Dict[str, Any]:
         "columnas_originales_eliminadas": estado.get("columnas_eliminadas", []),
         "score_empeoro": (score is not None and estado.get("score_antes") is not None
                           and score < estado["score_antes"]),
+        "avisos_diagnostico": estado.get("avisos_diagnostico", []),
+        "respuesta_cruda_diagnostico": estado.get("respuesta_cruda_diagnostico"),
         "errores": [e[:300] for e in (estado.get("error_history") or [])[-3:]],
         "mensaje_ejecucion": (estado.get("mensaje_ejecucion") or "")[:500],
         "resultado_medido": medido,
@@ -4569,6 +4642,8 @@ def run_datapulse(
         "diagnostico":          {},
         "decisiones_negativos": {},
         "discrepancias_negativos": [],
+        "avisos_diagnostico":   [],
+        "respuesta_cruda_diagnostico": None,
         "acciones_grafo":       {},
         "plan_acciones":        [],
         "sin_regla":            [],

@@ -74,7 +74,8 @@ def test_consultar_grafo_no_se_rompe_con_entradas_mal_formadas(capsys):
     assert "resumen_general" in capsys.readouterr().out
 
 
-def test_node_diagnosticar_normaliza_la_respuesta_del_llm(monkeypatch):
+def test_node_diagnosticar_normaliza_la_respuesta_del_llm(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     respuesta = {c: dict(DIAG) for c in COLUMNAS}
     respuesta["resumen_general"] = "texto"
     llm = SimpleNamespace(invoke=lambda m: SimpleNamespace(content=json.dumps(respuesta)))

@@ -54,8 +54,9 @@ DIAG_LLM = {
 
 
 @pytest.fixture
-def diagnostico(monkeypatch):
+def diagnostico(monkeypatch, tmp_path):
     """Ejecuta node_diagnosticar con el LLM falso y la metadata real del fixture."""
+    monkeypatch.chdir(tmp_path)             # los avisos guardan la respuesta cruda en outputs/
     monkeypatch.setattr(dp, "DECISIONES_NEGATIVOS", {})
     monkeypatch.setattr(dp, "CONTEXTO_DATASET", "")
     monkeypatch.delenv("DATAPULSE_CONTEXTO", raising=False)
