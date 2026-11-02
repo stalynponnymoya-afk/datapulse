@@ -275,7 +275,7 @@ def test_rechazado_se_conserva_tras_validar(entorno):
     configurar(RepoFalso(private=False), OpenHandsFalso())
     res = dp.node_ejecutar(estado)
     val = dp.node_validar_score({**estado, **res})
-    assert val == {"score_antes": val["score_antes"], "score_despues": 0}
+    assert val == {"score_antes": val["score_antes"], "score_despues": 0, "residuales": None}
     assert dp.router_validar_score({**estado, **res, **val}) == "end_no_commit"
 
 

@@ -2000,6 +2000,13 @@ class DataPulseState(TypedDict):
     score_reportado: Optional[int]   # lo que dijo el script generado (informativo)
     ruta_processed: Optional[str]    # ruta local de processed_data.csv del intento
     processed_esperado: bool         # True si el intento debía dejar un processed_data.csv legible
+    residuales: Optional[List[Dict[str, Any]]]  # problemas que quedan en processed_data.csv
+    mensaje_ejecucion: Optional[str]            # mensaje final de OpenHands o salida del script
+
+    # Revisión del LLM sobre el resultado del intento
+    veredicto_revision: Optional[str]           # aprobado | corregir | terminar
+    revision: Optional[Dict[str, Any]]
+    instrucciones_correccion: Optional[str]     # para el siguiente intento
     directorio_salida: Optional[str] # carpeta local con las salidas del intento
 
     # Fuente del archivo (None = archivo local subido; str = path en repo)
@@ -2982,12 +2989,21 @@ Devuelve ÚNICAMENTE el código Python, sin markdown ni explicaciones."""
 def _seccion_errores_previos(state: DataPulseState, max_errores: int = 2) -> str:
     """Bloque de texto con los últimos errores para que el reintento los corrija."""
     prev_errs = (state.get("error_history") or [])[-max_errores:]
-    if not prev_errs:
+    texto = ""
+    if prev_errs:
+        texto += "\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
+        for e in prev_errs:
+            texto += f"- {e[:500]}\n"
+    return texto + _seccion_correcciones(state)
+
+
+def _seccion_correcciones(state: DataPulseState) -> str:
+    """Instrucciones del revisor (LLM) para el siguiente intento, si las hay."""
+    correcciones = (state.get("instrucciones_correccion") or "").strip()
+    if not correcciones:
         return ""
-    texto = "\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
-    for e in prev_errs:
-        texto += f"- {e[:500]}\n"
-    return texto
+    return ("\n## CORRECCIONES DEL REVISOR (aplican solo a las acciones del grafo):\n"
+            f"{correcciones[:2000]}\n")
 
 
 def _leer_score_reportado(contenido: str) -> Optional[int]:
@@ -3117,6 +3133,7 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
     resultado = {
         "intentos": state.get("intentos", 0) + 1,
         "openhands_status": status,
+        "mensaje_ejecucion": (stderr_tail or stdout[-500:] or None),
         "score_reportado": score_reportado,
         "ruta_processed": os.path.abspath(ruta_processed) if os.path.exists(ruta_processed) else None,
         # El script local siempre debe escribir processed_data.csv en run_dir
@@ -3178,7 +3195,7 @@ def _construir_brief_openhands(state: DataPulseState, data_path: str, rama: str)
         mensaje += "\n\n## ERRORES INTENTOS PREVIOS — CORREGIR:\n"
         for e in prev_errs:
             mensaje += f"- {e[:300]}\n"
-    return mensaje
+    return mensaje + _seccion_correcciones(state)
 
 
 def _leer_contenido_github(repo, path: str, ref: str) -> bytes:
@@ -3533,6 +3550,7 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         return {
             "intentos": state.get("intentos", 0) + 1,
             "openhands_status": final_status,
+            "mensaje_ejecucion": finish_msg[:1000] or None,
             "score_reportado": score_reportado,
             "ruta_processed": os.path.abspath(ruta_processed) if "processed_data.csv" in leidos else None,
             # Debía existir salvo que la rama no se pudiera leer (no es un 404):
@@ -3561,11 +3579,96 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
 # 9. NODE 6 — VALIDAR SCORE + ROUTER
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# 9b. NODE — REVISAR RESULTADO (el LLM revisa lo que hizo OpenHands)
+# ═══════════════════════════════════════════════════════════════
+
+REVISION_PROMPT = """Eres el revisor de DataPulse. OpenHands (o, en modo local, el script generado) ejecutó la limpieza siguiendo SOLO las acciones del plan, que salen del Grafo de Conocimiento. DataPulse midió el resultado de forma independiente sobre el processed_data.csv real.
+
+Decide un veredicto:
+- "aprobado": las acciones del plan se aplicaron y lo que queda es aceptable o corresponde a problemas sin regla en el grafo.
+- "corregir": alguna acción del plan no se aplicó o se aplicó mal (quedan problemas en columnas con acción planificada) y otro intento puede arreglarlo.
+- "terminar": otro intento no lo arreglaría (lo que queda no tiene regla en el grafo, o el script no puede producir el resultado).
+
+Reglas:
+- No inventes reglas: las correcciones solo pueden pedir aplicar, o aplicar bien, acciones del plan con sus parámetros.
+- Los problemas sin regla en el grafo NO son motivo para corregir.
+- Basa el veredicto en lo medido (score_despues, problemas_residuales), no en el score que declaró el script.
+
+Devuelve UN SOLO JSON:
+{{"veredicto": "aprobado | corregir | terminar", "analisis": "qué se aplicó bien y qué no, en pocas frases", "correcciones": "instrucciones concretas para el siguiente intento (vacío si no hay)"}}
+
+Resultado del intento:
+{resultado_json}
+
+Responde SOLO con el JSON. Sin markdown."""
+
+VEREDICTOS = ("aprobado", "corregir", "terminar")
+
+
+def _contexto_resultado(state: DataPulseState) -> Dict[str, Any]:
+    """Datos del intento que ven el revisor y el informe final (sin datos crudos)."""
+    return {
+        "estado": state.get("openhands_status"),
+        "intento": state.get("intentos"),
+        "max_intentos": OH_MAX_INTENTOS_SCORE,
+        "score_antes": state.get("score_antes"),
+        "score_despues": state.get("score_despues"),
+        "umbral": MIN_SCORE_PASS,
+        "score_reportado_por_el_script": state.get("score_reportado"),
+        "plan": [{k: a.get(k) for k in ("columna", "problema", "accion")}
+                 for a in state.get("plan_acciones", [])],
+        "sin_regla": state.get("sin_regla", []),
+        "problemas_residuales": state.get("residuales"),
+        "errores_recientes": [e[:300] for e in (state.get("error_history") or [])[-3:]],
+        "mensaje_ejecucion": (state.get("mensaje_ejecucion") or "")[:500],
+    }
+
+
+def node_revisar_resultado(state: DataPulseState) -> DataPulseState:
+    """
+    El LLM revisa el resultado medido frente al plan del grafo y decide si se
+    aprueba, se corrige (con instrucciones para el siguiente intento) o se
+    termina. Si no hubo nada que medir, o el LLM no responde bien, no decide:
+    el router aplica solo la validación independiente.
+    """
+    salida: Dict[str, Any] = {"veredicto_revision": None, "revision": None}
+    if state.get("residuales") is None:
+        return salida
+    try:
+        prompt = REVISION_PROMPT.format(
+            resultado_json=json.dumps(_contexto_resultado(state), ensure_ascii=False, indent=2))
+        parsed = extract_json_from_markdown(get_llm().invoke([HumanMessage(content=prompt)]).content)
+    except Exception as exc:
+        print(f"   ⚠️ Revisión del LLM no disponible ({type(exc).__name__}): "
+              "decide la validación independiente.")
+        return salida
+
+    veredicto = str(parsed.get("veredicto", "")).strip().lower()
+    if veredicto not in VEREDICTOS:
+        print(f"   ⚠️ Veredicto del revisor no válido ({veredicto!r}): se ignora.")
+        veredicto = None
+    revision = {
+        "veredicto": veredicto,
+        "analisis": str(parsed.get("analisis") or "").strip(),
+        "correcciones": str(parsed.get("correcciones") or "").strip(),
+    }
+    print(f"   🧐 Revisión del LLM: {veredicto} — {revision['analisis'][:200]}")
+    salida.update({
+        "veredicto_revision": veredicto,
+        "revision": revision,
+        "instrucciones_correccion": revision["correcciones"] if veredicto == "corregir" else None,
+    })
+    return salida
+
+
 def router_validar_score(state: DataPulseState) -> str:
     """
-    Decide la transición tras validar. ``intentos`` es el número de intentos
-    YA realizados (node_ejecutar lo incrementa), y los límites son totales:
-    se reintenta mientras ``intentos < límite``.
+    Decide la transición tras validar y revisar. ``intentos`` es el número de
+    intentos YA realizados (node_ejecutar lo incrementa), y los límites son
+    totales: se reintenta mientras ``intentos < límite``. El veredicto del
+    revisor puede pedir otro intento o terminar antes, pero no aprobar un
+    score por debajo del umbral.
     """
     score = state.get("score_despues") or 0
     intentos = state.get("intentos") or 0
@@ -3587,8 +3690,15 @@ def router_validar_score(state: DataPulseState) -> str:
     if status == "sin_validar":
         return "retry" if state.get("processed_esperado") and puede_reintentar else "end_no_commit"
 
+    # Veredicto del revisor (LLM). El umbral del score independiente sigue
+    # mandando: el LLM no puede aprobar algo que no pasa la medición.
+    veredicto = state.get("veredicto_revision")
     if score >= MIN_SCORE_PASS:
+        if veredicto == "corregir" and puede_reintentar:
+            return "retry"
         return "commit"
+    if veredicto == "terminar":
+        return "end_no_commit"
 
     # Autocorrección: un score bajo con ejecución correcta sí merece reintento,
     # con su propio presupuesto.
@@ -3624,6 +3734,65 @@ def _resumir_reporte(reporte: dict, max_items: int = 8) -> str:
     return texto + (f"; y {extra} más" if extra > 0 else "")
 
 
+MAX_RESIDUALES = 40
+MAX_EJEMPLOS_RESIDUALES = 3
+
+
+def _problemas_residuales(df: pd.DataFrame, reporte: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Tabla de lo que quedó sin limpiar en processed_data.csv: una fila por
+    columna y problema, con la cantidad y hasta 3 ejemplos (enmascarados con
+    las mismas reglas que la metadata).
+    """
+    meta = serialize_metadata(df, "processed_data.csv")
+    enmascarar = _enmascarado_activo()
+    filas: List[Dict[str, Any]] = []
+
+    def fila(columna, problema, cantidad, ejemplos=()):
+        filas.append({"columna": str(columna), "problema": problema, "cantidad": int(cantidad),
+                      "ejemplos": [str(e) for e in list(ejemplos)[:MAX_EJEMPLOS_RESIDUALES]]})
+
+    dup = reporte.get("duplicate_analysis", {})
+    if dup.get("count"):
+        fila("(filas)", "filas duplicadas", dup["count"])
+
+    negativos = reporte.get("negative_values", {})
+    extremos = reporte.get("outlier_analysis", {})
+    texto = reporte.get("text_inconsistencies", {})
+    for col, info in meta["columnas_info"].items():
+        if info.get("es_indice"):
+            continue
+        clave = str(col)
+        mascara = _enmascarador(col, info["lectura"]) if enmascarar else (lambda v: v)
+        if info["null_count"]:
+            fila(col, "nulos", info["null_count"])
+        no_num = info.get("no_numericos") or {}
+        if no_num.get("conteo"):
+            fila(col, "valores no numéricos", no_num["conteo"], no_num.get("ejemplos", []))
+        if info.get("fechas_imposibles"):
+            fila(col, "fechas imposibles", info["fechas_imposibles"], info.get("muestra_anomala", []))
+        if len(info.get("formatos_fecha", {})) > 1:
+            fila(col, "formatos de fecha mezclados", len(info["formatos_fecha"]),
+                 list(info["formatos_fecha"]))
+        if negativos.get(clave, {}).get("penalizado"):
+            fila(col, "negativos", negativos[clave]["count"])
+        if clave in extremos:
+            fila(col, "valores extremos (IQR)", extremos[clave]["count"],
+                 info.get("muestra_anomala", []))
+        if clave in texto:
+            variantes = next(iter(texto[clave].get("case_variations", {}).values()), [])
+            cantidad = (texto[clave].get("case_variations_count", 0)
+                        + texto[clave].get("whitespace_issues", 0))
+            fila(col, "texto inconsistente", cantidad, [mascara(repr(v)) for v in variantes])
+
+    relaciones = reporte.get("column_relationships", {})
+    for rel in relaciones.get("product_relationships", []):
+        fila(rel["expected"], "relación entre columnas rota", rel["mismatches"])
+    for col, info in relaciones.get("percentage_out_of_range", {}).items():
+        fila(col, "porcentaje fuera de 0-100", info["out_of_range_count"])
+    return filas[:MAX_RESIDUALES]
+
+
 def node_validar_score(state: DataPulseState) -> DataPulseState:
     """
     Validación independiente: recalcula el score con quality_checker en vez de
@@ -3639,7 +3808,8 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
     - Score bajo el umbral → resumen del reporte en error_history para que el
       reintento sepa qué corregir.
     """
-    salida: Dict[str, Any] = {}
+    # residuales se recalcula en cada intento (None = no se pudo validar)
+    salida: Dict[str, Any] = {"residuales": None}
 
     if state.get("score_antes") is None and state.get("filename_path"):
         try:
@@ -3680,7 +3850,8 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
         return salida
 
     try:
-        reporte = generate_report_df(load_dataset(ruta), "processed_data.csv")
+        df_processed = load_dataset(ruta)
+        reporte = generate_report_df(df_processed, "processed_data.csv")
     except Exception as exc:
         # El archivo apareció pero no es un dataset válido: la limpieza falló.
         msg = (
@@ -3693,6 +3864,7 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
 
     score = reporte["quality_score"]
     salida["score_despues"] = score
+    salida["residuales"] = _problemas_residuales(df_processed, reporte)
     print(
         f"   📈 Score independiente: {score} "
         f"(reportado por el script: {state.get('score_reportado')})"
@@ -3871,6 +4043,7 @@ def build_datapulse_graph():
     workflow.add_node("planificar", node_planificar)
     workflow.add_node("ejecutar", node_ejecutar)
     workflow.add_node("validar_score", node_validar_score)
+    workflow.add_node("revisar_resultado", node_revisar_resultado)
     workflow.add_node("commit", node_commit)
 
     # Edges secuenciales principales
@@ -3880,10 +4053,11 @@ def build_datapulse_graph():
     workflow.add_edge("consultar_grafo", "planificar")
     workflow.add_edge("planificar", "ejecutar")
     workflow.add_edge("ejecutar", "validar_score")
+    workflow.add_edge("validar_score", "revisar_resultado")
 
-    # Edges condicionales desde validar_score
+    # Edges condicionales tras la revisión del LLM
     workflow.add_conditional_edges(
-        "validar_score",
+        "revisar_resultado",
         router_validar_score,
         {
             "retry": "ejecutar",
@@ -3986,6 +4160,11 @@ def run_datapulse(
         "score_reportado":    None,
         "ruta_processed":     None,
         "processed_esperado": False,
+        "residuales":         None,
+        "mensaje_ejecucion":  None,
+        "veredicto_revision": None,
+        "revision":           None,
+        "instrucciones_correccion": None,
         "directorio_salida":  None,
         "archivos_generados": {},
         "openhands_status":   "",

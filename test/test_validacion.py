@@ -175,7 +175,7 @@ def test_error_de_ejecucion_no_valida(tmp_path):
         "openhands_status": "error",
         "ruta_processed": None,
     })
-    assert out == {"score_despues": 0}
+    assert out == {"score_despues": 0, "residuales": None}
 
 
 def test_min_score_pass_configurable(monkeypatch):
