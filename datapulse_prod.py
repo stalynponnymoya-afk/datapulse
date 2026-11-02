@@ -2767,7 +2767,10 @@ def _aplicar_decision_negativos(col: str, diag: Dict[str, Any],
     - "incierto"  → añade negativos_inciertos (regla de Negativos_Inciertos);
     - "validos"   → no son un problema.
     DECISIONES_NEGATIVOS del usuario reemplaza la decisión del LLM (fuente
-    "usuario"). Sin decisión válida del LLM se usa "incierto", con aviso.
+    "usuario"). Si el LLM no devolvió el campo "negativos" (o no es válido):
+    con la etiqueta valores_negativos_inesperados la decisión es "invalidos";
+    con negativos_inciertos, "incierto"; sin ninguna señal, "incierto". Si el
+    campo y la etiqueta se contradicen, manda el campo. Todo con aviso.
     """
     usuario = {str(k): v for k, v in decisiones_usuario.items()}.get(col)
     decision_usuario = normalizar_decision_negativos(usuario) if usuario is not None else None
@@ -2775,23 +2778,41 @@ def _aplicar_decision_negativos(col: str, diag: Dict[str, Any],
         print(f"   ⚠️ DECISIONES_NEGATIVOS['{col}']={usuario!r} no es 'validos' ni 'invalidos': se ignora.")
         decision_usuario = None
 
-    if decision_usuario:
-        decision, fuente = decision_usuario, "usuario"
-        razon = f"Decisión del usuario (DECISIONES_NEGATIVOS); el LLM dijo: {diag.get('negativos')!r}."
-    else:
-        decision, fuente = normalizar_decision_negativos(diag.get("negativos")), "llm"
-        razon = str(diag.get("razon_negativos") or "").strip()
-        if decision is None:
-            print(f"   ⚠️ Diagnóstico: '{col}' tiene negativos y el LLM no devolvió una decisión "
-                  f"válida ({diag.get('negativos')!r}): se trata como 'incierto'.")
-            decision = "incierto"
-            razon = "El LLM no devolvió una decisión válida sobre los negativos."
-        razon = razon or "Sin razón indicada por el LLM."
-
     problemas = diag.get("problemas") or diag.get("problema") or []
     if isinstance(problemas, str):
         problemas = [problemas]
     problemas = [str(p).strip().lower() for p in problemas if p]
+    # Decisión que implican las etiquetas del propio LLM (su señal)
+    if PROBLEMA_NEGATIVOS_INVALIDOS in problemas:
+        por_etiqueta, etiqueta = "invalidos", PROBLEMA_NEGATIVOS_INVALIDOS
+    elif PROBLEMA_NEGATIVOS_INCIERTOS in problemas:
+        por_etiqueta, etiqueta = "incierto", PROBLEMA_NEGATIVOS_INCIERTOS
+    else:
+        por_etiqueta, etiqueta = None, None
+
+    campo = normalizar_decision_negativos(diag.get("negativos"))
+    if decision_usuario:
+        decision, fuente = decision_usuario, "usuario"
+        razon = f"Decisión del usuario (DECISIONES_NEGATIVOS); el LLM dijo: {diag.get('negativos')!r}."
+    elif campo:
+        decision, fuente = campo, "llm"
+        razon = str(diag.get("razon_negativos") or "").strip() or "Sin razón indicada por el LLM."
+        if por_etiqueta and por_etiqueta != campo:
+            print(f"   ⚠️ Diagnóstico: en '{col}' el campo 'negativos' ({campo!r}) contradice la "
+                  f"etiqueta {etiqueta!r}; manda el campo.")
+    elif por_etiqueta:
+        decision, fuente = por_etiqueta, "llm"
+        razon = (str(diag.get("razon_negativos") or "").strip()
+                 or f"Deducido de la etiqueta {etiqueta!r} del LLM.")
+        print(f"   ⚠️ Diagnóstico: '{col}' tiene negativos y el LLM no devolvió el campo "
+              f"'negativos' ({diag.get('negativos')!r}); se deduce {por_etiqueta!r} de la "
+              f"etiqueta {etiqueta!r}.")
+    else:
+        decision, fuente = "incierto", "llm"
+        razon = "El LLM no devolvió una decisión sobre los negativos ni ninguna señal."
+        print(f"   ⚠️ Diagnóstico: '{col}' tiene negativos y el LLM no devolvió una decisión "
+              f"válida ({diag.get('negativos')!r}) ni ninguna señal: se trata como 'incierto'.")
+
     problemas = [p for p in problemas
                  if p not in (PROBLEMA_NEGATIVOS_INVALIDOS, PROBLEMA_NEGATIVOS_INCIERTOS)]
     if decision == "invalidos":

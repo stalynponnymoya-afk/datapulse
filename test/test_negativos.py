@@ -248,3 +248,38 @@ def test_discrepancias_en_informe_y_audit_pero_no_en_error_history(tmp_path, mon
     assert audit["decisiones_negativos"]["x7_val"]["decision"] == "incierto"
     assert audit["discrepancias_negativos"][0]["columna"] == "edad"
     assert not glob.glob(str(tmp_path / "outputs" / "*" / "audit_log.json"))
+
+
+# ── Punto 6: campo "negativos" ausente o contradictorio ─────────────────────
+
+def test_sin_campo_con_etiqueta_es_invalidos(diagnostico, capsys):
+    respuesta = json.loads(json.dumps(DIAG_LLM))
+    respuesta["x7_val"] = {"tipo_inferido": "numerica_continua",
+                           "problemas": ["valores_negativos_inesperados"]}
+    out = diagnostico(respuesta)
+    d = out["decisiones_negativos"]["x7_val"]
+    assert (d["decision"], d["fuente"]) == ("invalidos", "llm")
+    assert "Deducido de la etiqueta" in d["razon"]
+    assert "set_nan_y_flag" in _accion(out, "x7_val")
+    assert "se deduce 'invalidos'" in capsys.readouterr().out
+
+
+def test_sin_campo_ni_senal_es_incierto(diagnostico, capsys):
+    respuesta = json.loads(json.dumps(DIAG_LLM))
+    respuesta["x7_val"] = {"tipo_inferido": "numerica_continua", "problemas": ["nulos_bajos"]}
+    out = diagnostico(respuesta)
+    assert out["decisiones_negativos"]["x7_val"]["decision"] == "incierto"
+    assert "ni ninguna señal" in capsys.readouterr().out
+
+
+def test_campo_y_etiqueta_contradictorios_manda_el_campo(diagnostico, capsys):
+    respuesta = json.loads(json.dumps(DIAG_LLM))
+    respuesta["edad"]["problemas"] = ["negativos_inciertos"]        # etiqueta: incierto
+    respuesta["edad"]["negativos"] = "invalidos"                     # campo: invalidos
+    out = diagnostico(respuesta)
+    assert out["decisiones_negativos"]["edad"]["decision"] == "invalidos"
+    assert out["diagnostico"]["edad"]["problemas"] == ["valores_negativos_inesperados"]
+    salida = capsys.readouterr().out
+    assert "contradice la etiqueta 'negativos_inciertos'; manda el campo" in salida
+    # Y la contradicción de temperatura (validos + valores_negativos_inesperados) también avisa
+    assert "'temperatura' el campo 'negativos' ('validos') contradice" in salida
