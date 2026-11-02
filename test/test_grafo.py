@@ -80,8 +80,8 @@ def test_conteo_de_reglas():
     kg = dp.construir_grafo_conocimiento()
     base = kg.number_of_edges()
     kg = dp.agregar_reglas_dominio(kg)
-    assert (base, kg.number_of_edges() - base) == (113, 26)
-    assert dp.kg.number_of_edges() == 139
+    assert (base, kg.number_of_edges() - base) == (116, 26)
+    assert dp.kg.number_of_edges() == 142
     confianzas = [d["confianza"] for _, _, d in dp.kg.edges(data=True)]
     assert min(confianzas) == 0.78 and max(confianzas) == 1.0
 
@@ -157,7 +157,7 @@ def test_rango_invalido_set_nan_y_flag_sin_recorte():
         assert "NaN" in d["justificacion_es"] and "inventa un valor" in d["justificacion_es"]
     # Variable_Financiera no cambia
     assert por_origen["Variable_Financiera"]["accion"] == "flag_y_nan"
-    assert dp.kg.number_of_edges() == 139
+    assert dp.kg.number_of_edges() == 142
 
 
 def test_rango_invalido_cubre_negativos_y_fuera_de_rango():

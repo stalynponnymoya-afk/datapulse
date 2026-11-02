@@ -315,26 +315,78 @@ def admite_negativos(nombre) -> bool:
     return not _nombre_contiene(nombre, PALABRAS_NO_NEGATIVAS)
 
 
-def check_negative_values(df):
+DECISIONES_NEGATIVOS_VALIDAS = ("validos", "invalidos", "incierto")
+
+
+def normalizar_decision_negativos(valor) -> Optional[str]:
+    """'validos' | 'invalidos' | 'incierto' (sin tildes ni mayúsculas) o None."""
+    if isinstance(valor, dict):
+        valor = valor.get("decision")
+    if not isinstance(valor, str):
+        return None
+    valor = _normalizar_palabra(valor.strip())
+    return valor if valor in DECISIONES_NEGATIVOS_VALIDAS else None
+
+
+def discrepancia_negativos(col, decision) -> Optional[str]:
+    """
+    Control cruzado con PALABRAS_NO_NEGATIVAS: texto de la discrepancia si la
+    lista y una decisión firme ("validos" / "invalidos") no coinciden. Una
+    decisión "incierto" no se contrasta (no afirma nada).
+    """
+    decision = normalizar_decision_negativos(decision)
+    if decision not in ("validos", "invalidos"):
+        return None
+    lista_invalidos = not admite_negativos(col)
+    if (decision == "invalidos") == lista_invalidos:
+        return None
+    if lista_invalidos:
+        return (f"La lista de control considera que '{col}' no admite negativos, "
+                f"pero la decisión es '{decision}'.")
+    return (f"La lista de control no incluye '{col}' entre las columnas sin negativos, "
+            f"pero la decisión es '{decision}'.")
+
+
+def check_negative_values(df, decisiones: Optional[Dict[str, Any]] = None):
     """
     Detecta valores negativos en columnas numéricas.
 
-    Reporta todas las columnas con negativos, pero marca ``penalizado=True``
-    solo en las que, por su nombre, no deberían tener negativos
+    Sin decisiones (API, línea de comandos): marca ``penalizado=True`` solo en
+    las columnas que, por su nombre, no deberían tener negativos
     (``PALABRAS_NO_NEGATIVAS`` salvo ``PALABRAS_NEGATIVOS_PERMITIDOS``).
-    Solo esas restan puntos en el score.
+
+    Con las decisiones del diagnóstico ({columna: "validos" | "invalidos" |
+    "incierto"} o {columna: {"decision": ..., "fuente": ...}}): "invalidos"
+    penaliza, "validos" e "incierto" no; la lista queda solo como control
+    cruzado (``discrepancia``, que no afecta al score). Las columnas sin
+    decisión siguen el criterio de la lista.
     """
+    decisiones = {str(k): v for k, v in (decisiones or {}).items()} if decisiones is not None else None
     negatives = {}
     for col in df.select_dtypes(include=[np.number]).columns:
         if pd.api.types.is_bool_dtype(df[col]):
             continue
         neg_count = (df[col] < 0).sum()
         if neg_count > 0:
-            negatives[col] = {
+            entrada = {
                 "count": int(neg_count),
                 "pct": round(neg_count / len(df) * 100, 2),
                 "penalizado": not admite_negativos(col),
             }
+            if decisiones is not None:
+                bruto = decisiones.get(str(col))
+                decision = normalizar_decision_negativos(bruto)
+                if decision:
+                    entrada.update({
+                        "decision": decision,
+                        "fuente": bruto.get("fuente") if isinstance(bruto, dict) else None,
+                        "criterio": "diagnostico",
+                        "penalizado": decision == "invalidos",
+                        "discrepancia": discrepancia_negativos(col, decision),
+                    })
+                else:
+                    entrada["criterio"] = "lista"
+            negatives[col] = entrada
     return negatives
 
 
@@ -876,7 +928,8 @@ def analyze_variable_types(df):
 # REPORTE PRINCIPAL
 # =====================================================
 
-def generate_report_df(df: pd.DataFrame, nombre: str = "dataset") -> Dict[str, Any]:
+def generate_report_df(df: pd.DataFrame, nombre: str = "dataset",
+                       decisiones_negativos: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Genera el reporte completo de calidad de un DataFrame con score 0-100.
 
@@ -884,7 +937,9 @@ def generate_report_df(df: pd.DataFrame, nombre: str = "dataset") -> Dict[str, A
       - Nulos: hasta -30 pts
       - Duplicados: hasta -20 pts
       - Outliers: -5 pts por columna, máx -25
-      - Negativos: -5 pts por columna penalizada (nombre que sugiere ≥0), máx -15
+      - Negativos: -5 pts por columna penalizada, máx -15. Con
+        ``decisiones_negativos`` (diagnóstico) penalizan solo las "invalidos";
+        sin ellas, las de nombre que sugiere ≥0 (PALABRAS_NO_NEGATIVAS)
       - Texto inconsistente: -3 pts por columna, máx -15
       - Fechas inválidas: -5 pts por columna, máx -15
       - Relaciones rotas: -5 pts por relación, máx -15
@@ -903,7 +958,7 @@ def generate_report_df(df: pd.DataFrame, nombre: str = "dataset") -> Dict[str, A
     nulls = check_nulls(df)
     duplicates = check_duplicates(df)
     outliers = check_outliers(df)
-    negatives = check_negative_values(df)
+    negatives = check_negative_values(df, decisiones_negativos)
     text_issues = check_text_inconsistencies(df)
     date_issues = check_invalid_dates(df)
     relationship_issues = check_column_relationships(df)

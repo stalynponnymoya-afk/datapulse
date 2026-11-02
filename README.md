@@ -22,7 +22,7 @@ DataPulse combines four technologies in a single orchestrated pipeline:
 |---|---|---|
 | **Orchestrator** | LangGraph | State machine with 7 nodes, conditional retry logic |
 | **Reasoning** | Claude Sonnet 5.5 (Anthropic) by default; Groq-hosted LLM as fallback | Diagnoses column types, detects problems, reads the Knowledge Graph decisions and writes the cleaning brief that OpenHands receives |
-| **Decision Rules** | NetworkX (Knowledge Graph) | 139 rules: 113 base statistical/structural rules + 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) |
+| **Decision Rules** | NetworkX (Knowledge Graph) | 142 rules: 116 base statistical/structural rules + 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) |
 | **Autonomous Agent** | OpenHands Cloud API | Writes, executes, and validates the cleaning code autonomously |
 
 ### Pipeline Architecture
@@ -60,7 +60,7 @@ node): see `informe_final.md` below.
 
 ### Knowledge Graph
 
-The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **139 rules (edges)**: 113 base statistical/structural rules organized in 6 categories, plus 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA). The 113 base rules are the 106 original ones plus 7 `Valores_Centinela` rules added in phase 1: `reemplazar_centinela_por_nan` for numeric/financial columns, `replace_to_na` for categorical and text columns (same string list as the empty-string rule), and `marcar_fecha_centinela` for dates, which only **flags** the sentinel dates listed in `DATAPULSE_FECHAS_CENTINELA` (empty by default) and never imputes them:
+The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **142 rules (edges)**: 116 base statistical/structural rules organized in 6 categories, plus 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA). The 116 base rules are the 106 original ones plus 3 `Negativos_Inciertos` rules (`flag_sin_modificar`: flag without changing values) and 7 `Valores_Centinela` rules added in phase 1: `reemplazar_centinela_por_nan` for numeric/financial columns, `replace_to_na` for categorical and text columns (same string list as the empty-string rule), and `marcar_fecha_centinela` for dates, which only **flags** the sentinel dates listed in `DATAPULSE_FECHAS_CENTINELA` (empty by default) and never imputes them:
 
 1. **Structural Integrity** — duplicates, empty rows/columns, column name normalization
 2. **String Cleaning** — whitespace, line breaks, case normalization, email/phone validation
@@ -72,6 +72,19 @@ The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **139 rules (edges)**: 1
 Each rule contains: action, confidence score (between 0.78 and 1.0), parameters, and bilingual justification.
 
 The rules live only in `datapulse_prod.py` (`construir_grafo_conocimiento()` and `agregar_reglas_dominio()`). The labels the LLM can use in its diagnosis are generated from the graph itself (every node is offered, with its aliases or its own name), so any rule added there is reachable without touching prompts. Graph actions reach the plan unchanged (action, parameters and confidence); the only adjustment is for skewed variables: if |skewness| > 1 and the action is `fillna_mean`, `fillna_median` is used and noted in the justification. When the graph has no rule for a specific case, the decision falls back to the LLM with a maximum confidence of 0.70 (`fuente_decision: "llm_fallback"`); whatever the LLM does not resolve is listed in the final report.
+
+**Negative values are decided by context.** For each column with negatives, the diagnosis returns
+`negativos`: `validos` (they make sense for what the column measures, e.g. temperatures),
+`invalidos` (they do not, e.g. ages) or `incierto` (name, samples and context do not allow a
+decision), plus `razon_negativos`. A missing or invalid value is treated as `incierto` with a
+warning. `invalidos` adds `valores_negativos_inesperados` (rule `Rango_Invalido` →
+`set_nan_y_flag`); `incierto` adds `negativos_inciertos` (rule `Negativos_Inciertos` →
+`flag_sin_modificar`). In the configuration block of `datapulse_prod.py`, `CONTEXTO_DATASET` (or
+the `DATAPULSE_CONTEXTO` environment variable) adds free-text context to the diagnosis prompt, and
+`DECISIONES_NEGATIVOS = {"column": "validos" | "invalidos"}` overrides the LLM for a column
+(source `usuario`). With a diagnosis, the analyzer penalizes only `invalidos`; `PALABRAS_NO_NEGATIVAS`
+is kept as a cross-check, and any mismatch goes to the final report and `audit_log.json`, never to
+the error history. Without a diagnosis (API, command line) the list is used as before.
 
 ### What It Produces
 
@@ -177,6 +190,7 @@ Attempt limits are **total attempts**, the first one included:
 | `DATAPULSE_PERMITIR_SUBIDA_DATOS` | unset | `1` allows uploading data files to GitHub (only if the repo is private) |
 | `DATAPULSE_ENMASCARAR` | `1` | `0` disables masking of the samples sent to the LLM |
 | `DATAPULSE_FECHAS_CENTINELA` | empty | Comma-separated sentinel dates (`1900-01-01,9999-12-31`) to **flag** (never impute) |
+| `DATAPULSE_CONTEXTO` | empty | Free-text context of the dataset for the diagnosis (used when `CONTEXTO_DATASET` is empty) |
 | `DATAPULSE_API_MAX_MB` | `100` | Max upload size per file in the API (413 if exceeded) |
 
 > In Colab, the API keys, `GROQ_MODEL`, `CLAUDE_MODEL`, `DATAPULSE_LLM`, `DATAPULSE_CLAUDE_EFFORT`,
@@ -326,7 +340,7 @@ DataPulse combina cuatro tecnologías en un pipeline orquestado:
 |---|---|---|
 | **Orquestador** | LangGraph | Máquina de estados con 7 nodos y lógica de retry condicional |
 | **Razonamiento** | Claude Sonnet 5.5 (Anthropic) por defecto; LLM alojado en Groq como respaldo | Diagnostica tipos de columnas, detecta problemas, lee las decisiones del Grafo de Conocimiento y redacta el brief de limpieza que recibe OpenHands |
-| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | 139 reglas: 113 reglas estadísticas/estructurales base + 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) |
+| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | 142 reglas: 116 reglas estadísticas/estructurales base + 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) |
 | **Agente Autónomo** | OpenHands Cloud API | Escribe, ejecuta y valida el código de limpieza de forma autónoma |
 
 ### Arquitectura del Pipeline
@@ -364,7 +378,7 @@ un nodo): ver `informe_final.md` más abajo.
 
 ### Grafo de Conocimiento
 
-El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **139 reglas (aristas)**: 113 reglas estadísticas/estructurales base organizadas en 6 categorías, más 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA). Las 113 base son las 106 originales más 7 reglas de `Valores_Centinela` añadidas en la fase 1: `reemplazar_centinela_por_nan` en columnas numéricas y financieras, `replace_to_na` en categóricas y texto (con la misma lista de cadenas que la regla de cadenas vacías) y `marcar_fecha_centinela` en fechas, que solo **marca con un flag** las fechas centinela definidas en `DATAPULSE_FECHAS_CENTINELA` (vacía por defecto) y nunca las imputa:
+El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **142 reglas (aristas)**: 116 reglas estadísticas/estructurales base organizadas en 6 categorías, más 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA). Las 116 base son las 106 originales más 3 reglas de `Negativos_Inciertos` (`flag_sin_modificar`: marca sin cambiar valores) y 7 reglas de `Valores_Centinela` añadidas en la fase 1: `reemplazar_centinela_por_nan` en columnas numéricas y financieras, `replace_to_na` en categóricas y texto (con la misma lista de cadenas que la regla de cadenas vacías) y `marcar_fecha_centinela` en fechas, que solo **marca con un flag** las fechas centinela definidas en `DATAPULSE_FECHAS_CENTINELA` (vacía por defecto) y nunca las imputa:
 
 1. **Integridad Estructural** — duplicados, filas/columnas vacías, normalización de nombres
 2. **Limpieza de Texto** — espacios, saltos de línea, normalización de caja, validación email/teléfono
@@ -376,6 +390,20 @@ El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **139 reglas (arist
 Cada regla contiene: acción, confianza (entre 0,78 y 1,0), parámetros y justificación bilingüe.
 
 Las reglas viven solo en `datapulse_prod.py` (`construir_grafo_conocimiento()` y `agregar_reglas_dominio()`). Las etiquetas que el LLM puede usar en el diagnóstico se generan desde el propio grafo (se ofrece cada nodo, con sus alias o su propio nombre), así que cualquier regla que se agregue ahí es alcanzable sin tocar los prompts. Las acciones del grafo llegan al plan sin cambios (acción, parámetros y confianza); el único ajuste es para variables sesgadas: si |skewness| > 1 y la acción es `fillna_mean`, se usa `fillna_median` y se anota en la justificación. Cuando el grafo no tiene regla para un caso específico, la decisión cae al LLM con confianza máxima de 0,70 (`fuente_decision: "llm_fallback"`); lo que el LLM no resuelve aparece en el informe final.
+
+**Los negativos se deciden por contexto.** Para cada columna con negativos, el diagnóstico devuelve
+`negativos`: `validos` (tienen sentido por lo que mide la columna, p. ej. temperaturas),
+`invalidos` (no lo tienen, p. ej. edades) o `incierto` (el nombre, las muestras y el contexto no
+permiten decidir), junto con `razon_negativos`. Si falta o no es válido, se trata como `incierto`,
+con aviso. `invalidos` añade `valores_negativos_inesperados` (regla `Rango_Invalido` →
+`set_nan_y_flag`); `incierto` añade `negativos_inciertos` (regla `Negativos_Inciertos` →
+`flag_sin_modificar`). En el bloque de configuración de `datapulse_prod.py`, `CONTEXTO_DATASET` (o
+la variable de entorno `DATAPULSE_CONTEXTO`) añade contexto en texto libre al prompt de
+diagnóstico, y `DECISIONES_NEGATIVOS = {"columna": "validos" | "invalidos"}` reemplaza la decisión
+del LLM para esa columna (fuente `usuario`). Con diagnóstico, el analizador solo penaliza los
+`invalidos`; `PALABRAS_NO_NEGATIVAS` queda como control cruzado y las discrepancias van al informe
+final y a `audit_log.json`, nunca al historial de errores. Sin diagnóstico (API, línea de
+comandos) se usa la lista como antes.
 
 ### Qué Produce
 
@@ -481,6 +509,7 @@ Los límites son **intentos totales**, incluido el primero:
 | `DATAPULSE_PERMITIR_SUBIDA_DATOS` | sin definir | `1` permite subir archivos de datos a GitHub (solo si el repo es privado) |
 | `DATAPULSE_ENMASCARAR` | `1` | `0` desactiva el enmascarado de las muestras que se envían al LLM |
 | `DATAPULSE_FECHAS_CENTINELA` | vacía | Fechas centinela separadas por comas (`1900-01-01,9999-12-31`) que se **marcan** (nunca se imputan) |
+| `DATAPULSE_CONTEXTO` | vacía | Contexto del dataset en texto libre para el diagnóstico (se usa si `CONTEXTO_DATASET` está vacío) |
 | `DATAPULSE_API_MAX_MB` | `100` | Tamaño máximo por archivo en la API (413 si se supera) |
 
 > En Colab, las claves de API, `GROQ_MODEL`, `CLAUDE_MODEL`, `DATAPULSE_LLM`,

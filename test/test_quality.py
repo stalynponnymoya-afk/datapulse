@@ -37,7 +37,7 @@ def test_knowledge_graph_construction():
     kg = agregar_reglas_dominio(kg)
     assert kg.number_of_edges() > edges_before, "Domain rules should add edges"
 
-    # 113 base (estadísticas + estructurales + centinelas) + 26 de dominio = 139
+    # 116 base (estadísticas + estructurales + centinelas + negativos inciertos) + 26 de dominio = 142
     assert kg.number_of_edges() > 100, (
         f"Total edges should exceed 100, got {kg.number_of_edges()}"
     )

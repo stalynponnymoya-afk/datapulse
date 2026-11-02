@@ -38,6 +38,7 @@ from src.quality_checker import (  # noqa: E402
     _nombre_contiene,
     check_duplicates,
     columnas_indice,
+    discrepancia_negativos,
     convertir_numerico,
     es_mayormente_fecha,
     es_mayormente_numerica,
@@ -45,6 +46,7 @@ from src.quality_checker import (  # noqa: E402
     fechas_imposibles,
     generate_report_df,
     load_dataset,
+    normalizar_decision_negativos,
     parsear_fechas_flexible,
 )
 
@@ -139,6 +141,14 @@ MIN_SCORE_PASS    = _entero_env("DATAPULSE_MIN_SCORE_PASS", 70)
 # ╚══════════════════════════════════════════════════════════════╝
 GITHUB_DATA_FILE   = ""          # ← ESCRIBE AQUÍ EL NOMBRE DE TU ARCHIVO
 GITHUB_DATA_BRANCH = "main"      # rama donde vive el archivo (normalmente "main")
+
+# Contexto del dataset (texto libre) que se añade al prompt de diagnóstico, p. ej.
+# "Mediciones meteorológicas horarias de 12 estaciones andinas". Si queda vacío
+# se usa la variable de entorno DATAPULSE_CONTEXTO.
+CONTEXTO_DATASET   = ""
+# Decisiones del usuario sobre negativos por columna: {"columna": "validos" |
+# "invalidos"}. Reemplazan la decisión del LLM para esa columna (fuente "usuario").
+DECISIONES_NEGATIVOS: Dict[str, str] = {}
 
 # Claves: cada una por separado (secreto de Colab → variable de entorno → vacía)
 GROQ_API_KEY       = _leer_config("GROQ_API_KEY")
@@ -275,6 +285,7 @@ PROBLEMA_MAP = {
     "colinealidad_alta":               "Colinealidad_Alta",
     "valores_negativos_inesperados":   "Rango_Invalido",
     "rango_invalido":                  "Rango_Invalido",
+    "negativos_inciertos":             "Negativos_Inciertos",
     "ninguno":                         "Ninguno",
     "none":                            "Ninguno",
     "clean":                           "Ninguno",
@@ -341,9 +352,10 @@ def _fechas_centinela_config() -> List[str]:
 
 def construir_grafo_conocimiento() -> nx.DiGraph:
     """
-    Construye el grafo base: 113 reglas estadísticas y estructurales (106
-    originales + 7 de Valores_Centinela añadidas en la fase 1). Las 26 reglas
-    de dominio se agregan después con agregar_reglas_dominio().
+    Construye el grafo base: 116 reglas estadísticas y estructurales (106
+    originales + 7 de Valores_Centinela + 3 de Negativos_Inciertos, añadidas
+    en la fase 1). Las 26 reglas de dominio se agregan después con
+    agregar_reglas_dominio().
     """
     kg = nx.MultiDiGraph()
 
@@ -1239,6 +1251,22 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
         justificacion_es="Fechas centinela (p. ej. 1900-01-01) configuradas por el usuario: se marcan con un flag y NUNCA se imputan ni se reemplazan, porque inventar una fecha falsea el análisis temporal. Con la lista vacía (por defecto) no se marca nada.",
         justificacion_en="User-configured sentinel dates (e.g. 1900-01-01): flag them and NEVER impute or replace them, since fabricating a date corrupts temporal analysis. With the list empty (default) nothing is flagged.")
 
+    # ── NEGATIVOS INCIERTOS ──────────────────────────────────
+    # El diagnóstico no pudo decidir si los negativos son válidos: se marcan
+    # para revisión y NO se modifican.
+    kg.add_node("Negativos_Inciertos", node_type="problema")
+    for _tipo_negativos in (
+        "Variable_Numerica_Continua",
+        "Variable_Numerica_Discreta",
+        "Variable_Financiera",
+    ):
+        kg.add_edge(_tipo_negativos, "Negativos_Inciertos",
+            accion="flag_sin_modificar",
+            parametros={"flag_suffix": "_negativo_incierto", "modifica_valores": False},
+            confianza=0.85,
+            justificacion_es="Negativos que el contexto disponible no permite clasificar como válidos o inválidos: se marcan con un flag para revisión y no se modifican, porque cambiarlos podría borrar datos válidos o inventar valores.",
+            justificacion_en="Negative values that the available context cannot classify as valid or invalid: flagged for review and left unchanged, since changing them could erase valid data or fabricate values.")
+
     # ═══════════════════════════════════════════════════════════
     # FIN REGLAS NUEVAS
     # ═══════════════════════════════════════════════════════════
@@ -1983,6 +2011,8 @@ class DataPulseState(TypedDict):
 
     # Diagnóstico
     diagnostico: Dict[str, Any]
+    decisiones_negativos: Dict[str, Dict[str, Any]]   # {columna: {decision, razon, fuente}}
+    discrepancias_negativos: List[Dict[str, Any]]     # vs. PALABRAS_NO_NEGATIVAS (solo informe/audit)
     acciones_grafo: Dict[str, Any]
 
     # Planificación (acciones del grafo + respaldo del LLM)
@@ -2560,6 +2590,8 @@ Para cada columna, infiere estos campos:
 {vocabulario_problemas}
     Si detectas un problema real que no corresponde a ninguna etiqueta, inclúyelo igualmente con una etiqueta descriptiva en snake_case: quedará registrado como problema sin regla en el grafo (se informa, no se limpia). Si la columna no tiene problemas, usa "ninguno".
 - problema_principal: el problema más crítico de la lista (una sola cadena)
+- negativos: SOLO en columnas con "negativos" > 0 en la metadata. Uno de: "validos" (por lo que mide la columna los negativos tienen sentido, p. ej. temperaturas o variaciones), "invalidos" (no tienen sentido, p. ej. edades o cantidades de artículos) o "incierto" (el nombre, las muestras y el contexto no permiten decidir).
+- razon_negativos: una frase que explique esa decisión según lo que mide la columna.
 - severidad: uno de [baja, media, alta, critica]
 - detalle: descripción concreta de cada problema encontrado. Incluir valores específicos si los ves en la muestra.
 
@@ -2567,7 +2599,7 @@ REGLAS CRÍTICAS DE DIAGNÓSTICO (aplican a CUALQUIER dataset, dominio o idioma)
 1. CENTINELAS: Valores como -999, -1, -9999, 9999, 999, 99, 0 en contextos donde 0 es inválido (edad, ID, presión) → "nulos_disfrazados", NO "outlier_severo". Detectar por: min/max extremos que no tienen sentido en el contexto de la columna. En texto y categorías, cadenas como "N/A", "null", "na", "None" o vacías también son "nulos_disfrazados". En fechas, una fecha marcador repetida (p. ej. 1900-01-01) → "nulos_disfrazados".
 2. FORMATO TEXTO: Si la muestra contiene strings que no cumplen el patrón esperado del dominio (emails sin @, teléfonos con letras, fechas con formato mixto, códigos con longitud incorrecta) → "inconsistencia_formato".
 3. IDENTIFICADORES: Columnas con nombres que contengan id, cod, code, num, key, clave, folio, ticket, cedula, rut, dni, ssn, nit, rfc → tipo "identificador". Si unique_count < total filas → añadir "duplicados".
-4. NEGATIVOS INESPERADOS: usa los campos "negativos" y "min" de la metadata. Si por el significado de la columna un valor negativo no tiene sentido → "valores_negativos_inesperados". Un negativo no es un error por sí mismo: decide según lo que mide la columna.
+4. NEGATIVOS INESPERADOS: usa los campos "negativos" y "min" de la metadata y el CONTEXTO DEL DATASET. Un negativo no es un error por sí mismo: decide según lo que mide la columna y devuelve "negativos" y "razon_negativos". Si decides "invalidos", incluye "valores_negativos_inesperados" en problemas; si "incierto", incluye "negativos_inciertos"; si "validos", no los marques como problema.
 5. MÚLTIPLES PROBLEMAS: Cada columna debe listar TODOS sus problemas. Ejemplos genéricos:
    - Columna numérica con nulo + negativo → ["nulos_bajos", "valores_negativos_inesperados"]
    - Columna de texto con espacios + casing mixto → ["espacios_extra", "inconsistencia_formato"]
@@ -2594,6 +2626,9 @@ CÓMO LEER LA METADATA:
 
 FORMATO DE SALIDA (obligatorio):
 Un objeto JSON cuyas claves son EXACTAMENTE los nombres de columna que aparecen en "columnas_info" de la metadata (todas, escritas igual) y cuyo valor es el objeto de diagnóstico de esa columna. No añadas ninguna otra clave: nada de resúmenes, notas generales ni envoltorios como "diagnostico" o "columnas".
+
+CONTEXTO DEL DATASET (lo indica el usuario; úsalo para decidir qué valores son válidos):
+{contexto_dataset}
 
 Metadata:
 {metadata_json}
@@ -2639,7 +2674,13 @@ def construir_prompt_diagnostico(metadata: dict) -> str:
         metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2),
         vocabulario_tipos=_lineas(vocab["tipos"]),
         vocabulario_problemas=_lineas(vocab["problemas"]),
+        contexto_dataset=contexto_dataset() or "No indicado.",
     )
+
+
+def contexto_dataset() -> str:
+    """CONTEXTO_DATASET si tiene texto; si no, la variable de entorno DATAPULSE_CONTEXTO."""
+    return (CONTEXTO_DATASET or "").strip() or os.environ.get("DATAPULSE_CONTEXTO", "").strip()
 
 
 _CLAVES_ENVOLTORIO = ("diagnostico", "diagnóstico", "diagnosis", "columnas", "columns",
@@ -2647,7 +2688,9 @@ _CLAVES_ENVOLTORIO = ("diagnostico", "diagnóstico", "diagnosis", "columnas", "c
 _CLAVES_NOMBRE_COLUMNA = ("columna", "column", "nombre_columna", "nombre", "name")
 
 
-def _normalizar_diagnostico(crudo: Any, columnas: List[str]) -> Dict[str, Any]:
+def _normalizar_diagnostico(crudo: Any, columnas: List[str],
+                            columnas_info: Optional[Dict[str, Any]] = None,
+                            decisiones_usuario: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Deja el diagnóstico del LLM como {columna_real: {diagnóstico}}.
 
@@ -2655,6 +2698,9 @@ def _normalizar_diagnostico(crudo: Any, columnas: List[str]) -> Dict[str, Any]:
     (texto), envuelve todo en otra clave o devuelve una lista. Se desenvuelve,
     se convierte la lista y se descarta lo que no sea el diagnóstico (dict) de
     una columna real, avisando de lo ignorado y de lo que falta.
+
+    Con ``columnas_info`` (metadata), valida la decisión sobre negativos en
+    las columnas con negativos > 0 (ver ``_aplicar_decision_negativos``).
     """
     columnas = [str(c) for c in columnas]
     reales = set(columnas)
@@ -2677,7 +2723,8 @@ def _normalizar_diagnostico(crudo: Any, columnas: List[str]) -> Dict[str, Any]:
             interno = crudo.get(clave)
             if isinstance(interno, (dict, list)):
                 try:
-                    return _normalizar_diagnostico(interno, columnas)
+                    return _normalizar_diagnostico(interno, columnas, columnas_info,
+                                                   decisiones_usuario)
                 except ValueError:
                     continue
 
@@ -2698,7 +2745,78 @@ def _normalizar_diagnostico(crudo: Any, columnas: List[str]) -> Dict[str, Any]:
             "El diagnóstico del LLM no contiene ninguna columna del dataset "
             f"(claves recibidas: {list(map(str, crudo))[:10]})."
         )
+    for col, info in (columnas_info or {}).items():
+        if str(col) in normalizado and (info or {}).get("negativos", 0) > 0:
+            _aplicar_decision_negativos(str(col), normalizado[str(col)], decisiones_usuario or {})
     return normalizado
+
+
+PROBLEMA_NEGATIVOS_INVALIDOS = "valores_negativos_inesperados"
+PROBLEMA_NEGATIVOS_INCIERTOS = "negativos_inciertos"
+
+
+def _aplicar_decision_negativos(col: str, diag: Dict[str, Any],
+                                decisiones_usuario: Dict[str, Any]) -> None:
+    """
+    Fija la decisión sobre los negativos de una columna y la refleja en sus
+    problemas:
+    - "invalidos" → asegura valores_negativos_inesperados (regla de Rango_Invalido);
+    - "incierto"  → añade negativos_inciertos (regla de Negativos_Inciertos);
+    - "validos"   → no son un problema.
+    DECISIONES_NEGATIVOS del usuario reemplaza la decisión del LLM (fuente
+    "usuario"). Sin decisión válida del LLM se usa "incierto", con aviso.
+    """
+    usuario = {str(k): v for k, v in decisiones_usuario.items()}.get(col)
+    decision_usuario = normalizar_decision_negativos(usuario) if usuario is not None else None
+    if usuario is not None and decision_usuario not in ("validos", "invalidos"):
+        print(f"   ⚠️ DECISIONES_NEGATIVOS['{col}']={usuario!r} no es 'validos' ni 'invalidos': se ignora.")
+        decision_usuario = None
+
+    if decision_usuario:
+        decision, fuente = decision_usuario, "usuario"
+        razon = f"Decisión del usuario (DECISIONES_NEGATIVOS); el LLM dijo: {diag.get('negativos')!r}."
+    else:
+        decision, fuente = normalizar_decision_negativos(diag.get("negativos")), "llm"
+        razon = str(diag.get("razon_negativos") or "").strip()
+        if decision is None:
+            print(f"   ⚠️ Diagnóstico: '{col}' tiene negativos y el LLM no devolvió una decisión "
+                  f"válida ({diag.get('negativos')!r}): se trata como 'incierto'.")
+            decision = "incierto"
+            razon = "El LLM no devolvió una decisión válida sobre los negativos."
+        razon = razon or "Sin razón indicada por el LLM."
+
+    problemas = diag.get("problemas") or diag.get("problema") or []
+    if isinstance(problemas, str):
+        problemas = [problemas]
+    problemas = [str(p).strip().lower() for p in problemas if p]
+    problemas = [p for p in problemas
+                 if p not in (PROBLEMA_NEGATIVOS_INVALIDOS, PROBLEMA_NEGATIVOS_INCIERTOS)]
+    if decision == "invalidos":
+        problemas.append(PROBLEMA_NEGATIVOS_INVALIDOS)
+    elif decision == "incierto":
+        problemas.append(PROBLEMA_NEGATIVOS_INCIERTOS)
+    if len(problemas) > 1 and "ninguno" in problemas:
+        problemas = [p for p in problemas if p != "ninguno"]
+    diag["problemas"] = problemas or ["ninguno"]
+    principal = str(diag.get("problema_principal") or "").strip().lower()
+    if principal not in diag["problemas"]:
+        diag["problema_principal"] = diag["problemas"][0]
+    diag.update({"negativos": decision, "razon_negativos": razon, "fuente_negativos": fuente})
+
+
+def _decisiones_y_discrepancias(diagnostico: Dict[str, Any]) -> tuple:
+    """Decisiones de negativos por columna y discrepancias con la lista de control."""
+    decisiones, discrepancias = {}, []
+    for col, diag in diagnostico.items():
+        if not isinstance(diag, dict) or "fuente_negativos" not in diag:
+            continue
+        decisiones[col] = {"decision": diag["negativos"], "razon": diag["razon_negativos"],
+                           "fuente": diag["fuente_negativos"]}
+        detalle = discrepancia_negativos(col, diag["negativos"])
+        if detalle:
+            discrepancias.append({"columna": col, "decision": diag["negativos"],
+                                  "fuente": diag["fuente_negativos"], "detalle": detalle})
+    return decisiones, discrepancias
 
 
 def node_diagnosticar(state: DataPulseState) -> DataPulseState:
@@ -2706,8 +2824,16 @@ def node_diagnosticar(state: DataPulseState) -> DataPulseState:
     prompt = construir_prompt_diagnostico(state["metadata"])
     response = llm.invoke([HumanMessage(content=prompt)])
     crudo = extract_json_from_markdown(response.content)
-    columnas = list((state.get("metadata") or {}).get("columnas_info", {}))
-    return {"diagnostico": _normalizar_diagnostico(crudo, columnas)}
+    columnas_info = (state.get("metadata") or {}).get("columnas_info", {})
+    diagnostico = _normalizar_diagnostico(crudo, list(columnas_info), columnas_info,
+                                          DECISIONES_NEGATIVOS)
+    decisiones, discrepancias = _decisiones_y_discrepancias(diagnostico)
+    for col, d in decisiones.items():
+        print(f"   ➖ Negativos en '{col}': {d['decision']} ({d['fuente']}) — {d['razon'][:120]}")
+    for d in discrepancias:
+        print(f"   ↔️ Discrepancia con la lista de control: {d['detalle']}")
+    return {"diagnostico": diagnostico, "decisiones_negativos": decisiones,
+            "discrepancias_negativos": discrepancias}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3806,7 +3932,8 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
         try:
             df_original = load_dataset(state["filename_path"])
             salida["score_antes"] = generate_report_df(
-                df_original, state.get("filename", "original")
+                df_original, state.get("filename", "original"),
+                decisiones_negativos=state.get("decisiones_negativos"),
             )["quality_score"]
             print(f"   📏 Score antes (dataset original): {salida['score_antes']}")
         except Exception as exc:
@@ -3842,7 +3969,8 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
 
     try:
         df_processed = load_dataset(ruta)
-        reporte = generate_report_df(df_processed, "processed_data.csv")
+        reporte = generate_report_df(df_processed, "processed_data.csv",
+                                     decisiones_negativos=state.get("decisiones_negativos"))
     except Exception as exc:
         # El archivo apareció pero no es un dataset válido: la limpieza falló.
         msg = (
@@ -3894,6 +4022,8 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
             if a.get("fuente_decision") == "llm_fallback"
         ),
         "problemas_sin_regla": state.get("sin_regla", []),
+        "decisiones_negativos": state.get("decisiones_negativos", {}),
+        "discrepancias_negativos": state.get("discrepancias_negativos", []),
         "plan_acciones": state.get("plan_acciones", [])
     }
     files_to_commit.append((f"outputs/{ts}/audit_log.json", json.dumps(audit, ensure_ascii=False, indent=2)))
@@ -4039,7 +4169,8 @@ def _medir_resultado_parcial(state: DataPulseState) -> tuple:
     if residuales is None and ruta and os.path.exists(ruta):
         try:
             df = load_dataset(ruta)
-            reporte = generate_report_df(df, "processed_data.csv")
+            reporte = generate_report_df(df, "processed_data.csv",
+                                         decisiones_negativos=state.get("decisiones_negativos"))
             return reporte["quality_score"], _problemas_residuales(df, reporte), True
         except Exception as exc:
             print(f"   ⚠️ No se pudo medir el resultado parcial: {type(exc).__name__}: {exc}")
@@ -4058,6 +4189,16 @@ def _resumen_determinista(tabla: Dict[str, Any]) -> str:
         partes.append(f"Quedan {len(tabla['valores_sin_limpiar'])} problemas sin limpiar.")
     if tabla["problemas_sin_regla"]:
         partes.append(f"{len(tabla['problemas_sin_regla'])} problemas no tienen regla en el grafo.")
+    decisiones = tabla.get("decisiones_negativos") or {}
+    if decisiones:
+        conteo = {}
+        for d in decisiones.values():
+            conteo[d["decision"]] = conteo.get(d["decision"], 0) + 1
+        partes.append("Negativos: " + ", ".join(f"{n} columna(s) {k}" for k, n in sorted(conteo.items()))
+                      + ".")
+    if tabla.get("discrepancias_negativos"):
+        partes.append(f"{len(tabla['discrepancias_negativos'])} discrepancia(s) con la lista de control "
+                      "de negativos (solo informativas).")
     if tabla["errores"]:
         partes.append(f"Último error: {tabla['errores'][-1][:200]}")
     return " ".join(partes)
@@ -4088,6 +4229,20 @@ def _informe_markdown(tabla: Dict[str, Any], resumen: str) -> str:
         lineas += [f"| {p['columna']} | {p['problema']} |" for p in tabla["problemas_sin_regla"]]
     else:
         lineas.append("Ninguno.")
+    lineas += ["", "## Decisiones sobre negativos", ""]
+    decisiones = tabla.get("decisiones_negativos") or {}
+    if decisiones:
+        lineas += ["| Columna | Decisión | Razón | Fuente |", "|---|---|---|---|"]
+        for col, d in decisiones.items():
+            razon = str(d.get("razon", "")).replace("|", "\\|")
+            lineas.append(f"| {col} | {d['decision']} | {razon} | {d['fuente']} |")
+    else:
+        lineas.append("Ninguna columna con negativos.")
+    lineas += ["", "## Discrepancias con la lista de control de negativos", ""]
+    if tabla.get("discrepancias_negativos"):
+        lineas += [f"- {d['detalle']} (fuente: {d['fuente']})" for d in tabla["discrepancias_negativos"]]
+    else:
+        lineas.append("Ninguna.")
     return "\n".join(lineas) + "\n"
 
 
@@ -4111,6 +4266,8 @@ def generar_informe_final(estado: Dict[str, Any]) -> Dict[str, Any]:
         "destino": estado.get("github_url"),
         "valores_sin_limpiar": residuales,
         "problemas_sin_regla": estado.get("sin_regla", []),
+        "decisiones_negativos": estado.get("decisiones_negativos", {}),
+        "discrepancias_negativos": estado.get("discrepancias_negativos", []),
         "errores": [e[:300] for e in (estado.get("error_history") or [])[-3:]],
         "mensaje_ejecucion": (estado.get("mensaje_ejecucion") or "")[:500],
         "resultado_medido": medido,
@@ -4244,6 +4401,8 @@ def run_datapulse(
         "file_ext":             file_ext,
         "metadata":             {},
         "diagnostico":          {},
+        "decisiones_negativos": {},
+        "discrepancias_negativos": [],
         "acciones_grafo":       {},
         "plan_acciones":        [],
         "sin_regla":            [],

@@ -11,8 +11,8 @@ rutas permanezcan sincronizadas por construcción: no hay dos copias de las
 reglas estadísticas ni de las reglas de dominio que puedan divergir.
 
 Contenido expuesto:
-- ``construir_grafo_conocimiento``  — 113 reglas estadísticas y estructurales base
-- ``agregar_reglas_dominio``        — +26 reglas deterministas de dominio (139 en total)
+- ``construir_grafo_conocimiento``  — 116 reglas estadísticas y estructurales base
+- ``agregar_reglas_dominio``        — +26 reglas deterministas de dominio (142 en total)
 - ``KNOWLEDGE_GRAPH`` / ``kg``      — grafo completo ya construido
 - ``TIPO_MAP`` / ``PROBLEMA_MAP``   — mapeos tipo/problema → nodos del grafo
 - ``TIPO_MAP_DOMINIO`` / ``PROBLEMA_MAP_DOMINIO``
