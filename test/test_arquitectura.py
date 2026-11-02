@@ -48,6 +48,21 @@ def test_router_tiene_exactamente_3_ramas():
     assert ("commit", "__end__") in {(e.source, e.target) for e in g.edges}
 
 
+def test_modulos_de_acceso_de_src():
+    """src.graph_nodes y el paquete src exponen los 7 nodos (y nada del revisor)."""
+    import importlib
+
+    import src
+    graph_nodes = importlib.import_module("src.graph_nodes")
+    nodos = {n for n in graph_nodes.__all__ if n.startswith("node_")}
+    assert nodos == {f"node_{n}" for n in NODOS}
+    assert graph_nodes.build_datapulse_graph is dp.build_datapulse_graph
+    assert src.generar_informe_final is dp.generar_informe_final
+    for retirado in ("node_revisar_resultado", "node_informe_final"):
+        assert not hasattr(dp, retirado)
+        assert retirado not in src.__dir__()
+
+
 @pytest.mark.parametrize("estado", [
     {}, {"openhands_status": "finished", "score_despues": 95, "intentos": 1},
     {"openhands_status": "finished", "score_despues": 10, "intentos": 1},
