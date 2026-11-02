@@ -266,12 +266,8 @@ def test_openhands_estado_terminal_de_error(entorno, estado_final):
     val = dp.node_validar_score({**estado, **res})
     assert "openhands_status" not in val  # no se convierte en sin_validar
     final = {**estado, **res, **val}
-    if estado_final in dp.OH_ESTADOS_DEMORA:
-        # Tardó demasiado o se atascó: directo al informe final, sin reintento
-        assert dp.router_validar_score({**final, "intentos": 1}) == "end_no_commit"
-    else:
-        assert dp.router_validar_score({**final, "intentos": 1}) == "retry"
-        assert dp.router_validar_score({**final, "intentos": 2}) == "end_no_commit"
+    assert dp.router_validar_score({**final, "intentos": 1}) == "retry"
+    assert dp.router_validar_score({**final, "intentos": 2}) == "end_no_commit"
 
 
 def test_rechazado_se_conserva_tras_validar(entorno):

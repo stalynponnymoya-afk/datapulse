@@ -60,7 +60,10 @@ def test_validacion_usa_processed_real_y_no_el_score_reportado(tmp_path):
     assert len(out["error_history"]) == 1
     msg = out["error_history"][0]
     assert f"score {esperado}/100" in msg
-    assert "negativos en edad" in msg and "texto inconsistente en ciudad" in msg
+    assert "Problemas que quedan en processed_data.csv" in msg
+    assert "edad: negativos" in msg and "ciudad: texto inconsistente" in msg
+    # El mismo resumen sale de la tabla de residuales del intento
+    assert out["residuales"] and dp._resumir_residuales(out["residuales"]) in msg
 
     # El router no hace commit pese al 99 reportado
     estado_router = {**state, **out, "intentos": 1}

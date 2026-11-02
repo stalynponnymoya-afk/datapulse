@@ -1,9 +1,11 @@
 """
-Tests de contrato de la arquitectura: el Grafo de Conocimiento es la única
-fuente de reglas de limpieza, y cualquier grafo del usuario funciona.
+Tests de contrato de la arquitectura:
 
-Se usa un grafo mínimo inventado para comprobar que el pipeline transporta
-sus decisiones sin cambiarlas, sea cual sea su contenido.
+- El grafo LangGraph tiene exactamente los 7 nodos originales y el router
+  exactamente 3 ramas (retry | commit | end_no_commit).
+- El vocabulario del diagnóstico sale del Grafo de Conocimiento y las
+  acciones del grafo llegan al plan sin cambios, sea cual sea su contenido
+  (se usa un grafo mínimo inventado).
 """
 
 import json
@@ -17,6 +19,44 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import datapulse_prod as dp  # noqa: E402
+
+
+NODOS = {"ingestar", "diagnosticar", "consultar_grafo", "planificar", "ejecutar",
+         "validar_score", "commit"}
+SECUENCIA = [("__start__", "ingestar"), ("ingestar", "diagnosticar"),
+             ("diagnosticar", "consultar_grafo"), ("consultar_grafo", "planificar"),
+             ("planificar", "ejecutar"), ("ejecutar", "validar_score"), ("commit", "__end__")]
+RAMAS_ROUTER = {"retry": "ejecutar", "commit": "commit", "end_no_commit": "__end__"}
+
+
+def test_grafo_langgraph_tiene_exactamente_7_nodos():
+    g = dp.build_datapulse_graph().get_graph()
+    assert {n for n in g.nodes if not n.startswith("__")} == NODOS
+    simples = {(e.source, e.target) for e in g.edges if not e.conditional}
+    assert simples == set(SECUENCIA)
+
+
+def test_router_tiene_exactamente_3_ramas():
+    g = dp.build_datapulse_graph().get_graph()
+    condicionales = [e for e in g.edges if e.conditional]
+    assert all(e.source == "validar_score" for e in condicionales)
+    ramas = {(e.data or e.target): e.target for e in condicionales}
+    assert ramas == RAMAS_ROUTER
+    # commit y end_no_commit terminan en END; retry vuelve a ejecutar
+    assert ("commit", "__end__") in {(e.source, e.target) for e in g.edges}
+
+
+@pytest.mark.parametrize("estado", [
+    {}, {"openhands_status": "finished", "score_despues": 95, "intentos": 1},
+    {"openhands_status": "finished", "score_despues": 10, "intentos": 1},
+    {"openhands_status": "finished", "score_despues": 10, "intentos": 9},
+    {"openhands_status": "rechazado"},
+    {"openhands_status": "sin_validar", "processed_esperado": True, "intentos": 1},
+    {"openhands_status": "sin_validar", "processed_esperado": False, "intentos": 1},
+] + [{"openhands_status": s, "intentos": n}
+     for s in ("error", "timeout", "stuck", "stopped") for n in (1, 2)])
+def test_router_solo_devuelve_esas_3_ramas(estado):
+    assert dp.router_validar_score(estado) in RAMAS_ROUTER
 
 
 def _grafo_minimo():
