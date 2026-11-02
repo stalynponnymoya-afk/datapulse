@@ -1094,12 +1094,14 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     # ── RANGO INVÁLIDO ────────────────────────────────────────
 
+    # Rango_Invalido recibe valores_negativos_inesperados y rango_invalido:
+    # la acción cubre ambos casos.
     kg.add_edge("Variable_Numerica_Continua", "Rango_Invalido",
-        accion="clip_to_valid_range",
-        parametros={"strategy": "clip_or_nan"},
+        accion="set_nan_y_flag",
+        parametros={"aplica_a": ["negativos_inesperados", "fuera_de_rango_logico"], "flag_suffix": "_rango_invalido"},
         confianza=0.83,
-        justificacion_es="Valores fuera de rango lógico (ej: edad=-5, precio=-999) recortados o NaN.",
-        justificacion_en="Values outside logical range (e.g. age=-5, price=-999) clipped or NaN.")
+        justificacion_es="Valores fuera de rango lógico o negativos inesperados según el contexto de la columna (p. ej. edad=-5, cantidad=-2): se marcan con un flag y se reemplazan por NaN para tratarlos como nulos. No se recortan, porque recortar inventa un valor.",
+        justificacion_en="Values outside the logical range or unexpected negatives given the column's context (e.g. age=-5, quantity=-2): flagged and replaced with NaN so they are treated as missing. They are not clipped, because clipping fabricates a value.")
 
     # ── NULOS EN FINANCIERA ───────────────────────────────────
 
@@ -1187,11 +1189,11 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
         justificacion_en="1-99% winsorization controls extreme count values without dropping records.")
 
     kg.add_edge("Variable_Numerica_Discreta", "Rango_Invalido",
-        accion="clip_to_valid_range",
+        accion="set_nan_y_flag",
         confianza=0.85,
-        parametros={"strategy": "clip_or_nan"},
-        justificacion_es="Valores negativos o imposibles en conteos/edades convertidos a NaN.",
-        justificacion_en="Negative or impossible values in counts/ages converted to NaN.")
+        parametros={"aplica_a": ["negativos_inesperados", "fuera_de_rango_logico"], "flag_suffix": "_rango_invalido"},
+        justificacion_es="Valores fuera de rango lógico o negativos inesperados según el contexto de la columna (p. ej. edad=-5, cantidad=-2): se marcan con un flag y se reemplazan por NaN para tratarlos como nulos. No se recortan, porque recortar inventa un valor.",
+        justificacion_en="Values outside the logical range or unexpected negatives given the column's context (e.g. age=-5, quantity=-2): flagged and replaced with NaN so they are treated as missing. They are not clipped, because clipping fabricates a value.")
 
     # ── VALORES CENTINELA (nulos disfrazados) ─────────────────
     # -999, 9999, -1… son marcadores de "sin dato", no valores reales ni

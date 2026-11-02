@@ -137,3 +137,34 @@ def test_prompt_del_planificador_restaura_reglas_c_d_e_y_respaldo():
     assert "1. drop_duplicates (primero siempre)" in plan            # E: prioridad
     assert "Máx. confianza: 0.70" in plan and '"llm_fallback"' in plan  # B: respaldo del LLM
     assert "NO se modifican" in plan
+
+
+def test_rango_invalido_set_nan_y_flag_sin_recorte():
+    """Rango_Invalido: nunca se recorta (recortar inventa un valor)."""
+    reglas = [(u, d) for u, v, d in dp.kg.edges(data=True) if v == "Rango_Invalido"]
+    assert reglas
+    assert all(d["accion"] != "clip_to_valid_range" for _, d in reglas)
+
+    esperados = {"aplica_a": ["negativos_inesperados", "fuera_de_rango_logico"],
+                 "flag_suffix": "_rango_invalido"}
+    por_origen = {u: d for u, d in reglas}
+    for origen, confianza in (("Variable_Numerica_Continua", 0.83),
+                              ("Variable_Numerica_Discreta", 0.85)):
+        d = por_origen[origen]
+        assert d["accion"] == "set_nan_y_flag"
+        assert d["parametros"] == esperados
+        assert d["confianza"] == confianza
+        assert "NaN" in d["justificacion_es"] and "inventa un valor" in d["justificacion_es"]
+    # Variable_Financiera no cambia
+    assert por_origen["Variable_Financiera"]["accion"] == "flag_y_nan"
+    assert dp.kg.number_of_edges() == 139
+
+
+def test_rango_invalido_cubre_negativos_y_fuera_de_rango():
+    """Las dos etiquetas que llegan a Rango_Invalido producen la misma acción."""
+    for tipo in ("numerica_continua", "numerica_discreta"):
+        for etiqueta in ("valores_negativos_inesperados", "rango_invalido"):
+            accion = _consultar(tipo, etiqueta)["acciones"][0]
+            assert accion["accion"] == "set_nan_y_flag", (tipo, etiqueta)
+            assert set(accion["parametros"]["aplica_a"]) == {
+                "negativos_inesperados", "fuera_de_rango_logico"}
