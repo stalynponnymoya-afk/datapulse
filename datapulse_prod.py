@@ -1983,9 +1983,9 @@ class DataPulseState(TypedDict):
     diagnostico: Dict[str, Any]
     acciones_grafo: Dict[str, Any]
 
-    # Planificación (solo acciones del grafo)
+    # Planificación (acciones del grafo + respaldo del LLM)
     plan_acciones: List[Dict[str, Any]]
-    sin_regla: List[Dict[str, Any]]   # problemas detectados sin regla en el grafo
+    sin_regla: List[Dict[str, Any]]   # problemas sin regla en el grafo que el LLM tampoco resolvió
     brief_tecnico: str
 
     # Ejecución
@@ -2743,6 +2743,9 @@ def _resolver_etiqueta(etiqueta, mapa: Dict[str, Any], nodos: List[str]) -> Opti
     return next((n for n in nodos if n.lower() == buscada), None)
 
 
+UMBRAL_SKEWNESS = 1.0
+
+
 def _aplicar_fechas_centinela(accion: dict) -> dict:
     """Inyecta la lista vigente de DATAPULSE_FECHAS_CENTINELA en marcar_fecha_centinela."""
     if accion.get("accion") != "marcar_fecha_centinela":
@@ -2756,12 +2759,41 @@ def _aplicar_fechas_centinela(accion: dict) -> dict:
     return ajustada
 
 
+def _ajustar_por_skewness(accion: dict, skewness: Optional[float]) -> dict:
+    """
+    Si la variable está sesgada (|skewness| > 1 según la metadata real, no la
+    etiqueta del LLM) y la acción es fillna_mean, la cambia por fillna_median.
+    """
+    if accion.get("accion") != "fillna_mean" or skewness is None:
+        return accion
+    try:
+        sesgo = float(skewness)
+    except (TypeError, ValueError):
+        return accion
+    if abs(sesgo) <= UMBRAL_SKEWNESS:
+        return accion
+    ajustada = dict(accion)
+    ajustada["accion"] = "fillna_median"
+    ajustada["parametros"] = {**(accion.get("parametros") or {}), "strategy": "median"}
+    ajustada["justificacion_es"] = (
+        f"{accion.get('justificacion_es') or ''} [Ajuste: |skewness| = {abs(sesgo):.2f} > "
+        f"{UMBRAL_SKEWNESS:g} en la metadata; la media está sesgada, se usa la mediana.]"
+    ).strip()
+    ajustada["justificacion_en"] = (
+        f"{accion.get('justificacion_en') or ''} [Adjusted: |skewness| = {abs(sesgo):.2f} > "
+        f"{UMBRAL_SKEWNESS:g} in metadata; the mean is skewed, median is used.]"
+    ).strip()
+    ajustada["ajuste"] = "skewness"
+    return ajustada
+
+
 def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
     global kg
     if kg is None:
         raise RuntimeError("El grafo de conocimiento (kg) no ha sido cargado.")
 
     diagnostico = state["diagnostico"]
+    columnas_info = (state.get("metadata") or {}).get("columnas_info", {})
     acciones = {}
 
     for col_name, diag in diagnostico.items():
@@ -2770,6 +2802,7 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             print(f"   ⚠️ Se omite '{col_name}': su diagnóstico no es un objeto ({type(diag).__name__}).")
             continue
         tipo = diag.get("tipo_inferido", "")
+        skewness = (columnas_info.get(col_name) or {}).get("skewness")
 
         # Soportar tanto "problema" (string, formato anterior)
         # como "problemas" (lista, formato nuevo multi-problema)
@@ -2818,6 +2851,7 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
                 "justificacion_en": best.get("justificacion_en"),
                 "fuente_decision": "knowledge_graph",
             }
+            accion_col = _ajustar_por_skewness(accion_col, skewness)
             acciones_col.append(_aplicar_fechas_centinela(accion_col))
 
         if not acciones_col and not fallbacks_col:
@@ -2836,27 +2870,57 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. NODE 4 — PLANIFICAR (el plan sale del grafo; el LLM ordena y explica)
+# 7. NODE 4 — PLANIFICAR (acciones del grafo + respaldo del LLM; ordena y explica)
 # ═══════════════════════════════════════════════════════════════
 
-PLANIFICAR_PROMPT = """Eres el planificador técnico de DataPulse. Las decisiones de limpieza YA están tomadas: son las acciones que el Grafo de Conocimiento (las reglas del usuario) eligió para cada columna. Tu trabajo es solo ordenarlas y explicárselas a OpenHands.
+PLANIFICAR_PROMPT = """Eres el planificador técnico de DataPulse. Recibes las acciones que el grafo de conocimiento eligió por columna (multi-problema) y los problemas que no tienen regla en el grafo.
 
-Reglas:
-A) Usa EXACTAMENTE las acciones de la lista (mismo id, acción y parámetros). No cambies ni añadas acciones: no hay más reglas que las del grafo.
-B) Los problemas de "sin_regla" no tienen regla en el grafo: NO propongas cómo tratarlos. El brief debe indicar que esas columnas no se tocan por esos problemas (se informan al final).
-C) Ordena las acciones para que ninguna anule el efecto de otra.
-D) brief_tecnico: instrucciones por columna, en el orden elegido, con los parámetros de cada acción y la justificación que da el grafo.
+Tu trabajo:
+A) Cada columna puede tener MÚLTIPLES acciones (una por problema). Incluye TODAS en el plan, no solo la primera. Las acciones del grafo NO se modifican: misma acción y mismos parámetros; solo decides su orden (por su id).
+B) Para problemas_fallback (sin regla en el grafo), decide la acción más apropiada. Máx. confianza: 0.70. fuente_decision: "llm_fallback".
+C) Trata centinelas correctamente: si ves nulos_disfrazados con valores como -999 (o cadenas como "N/A" en texto), la acción es REEMPLAZAR ese valor por NaN (no winsorizar). EXCEPCIÓN — fechas: las fechas centinela (marcar_fecha_centinela) SOLO se marcan con un flag; NUNCA se reemplazan ni se imputan.
+D) Trata negativos correctamente: si ves valores_negativos_inesperados en edad/precio/cantidad, la acción es FLAG + reemplazar por NaN (no recortar a 0 sin revisar).
+E) Ordena las acciones por prioridad:
+   1. drop_duplicates (primero siempre)
+   2. Reemplazar centinelas/nulos_disfrazados por NaN
+   3. Limpieza de strings (strip, lower, validación formato)
+   4. Conversión de tipos
+   5. Imputaciones (fillna, interpolate)
+   6. Outliers (winsorize, clip) — SOLO si NO son centinelas
+   7. Encoding / Escalado
+
+El brief_tecnico debe ser DETALLADO y específico por columna, indicando exactamente:
+- Qué problema tiene cada columna (con valores concretos si se conocen)
+- Qué transformación aplicar y con qué parámetros
+- Qué NO hacer (ej: no winsorizar centinelas, no imputar con media valores negativos que son errores)
 
 Devuelve UN SOLO JSON con esta estructura exacta:
-{{"orden": ["a1", "a2", "..."], "brief_tecnico": "instrucciones para OpenHands..."}}
+{{
+  "orden": ["a1", "f1", "a2"],
+  "acciones_fallback": [
+    {{
+      "id": "f1",
+      "columna": "nombre",
+      "problema": "el problema sin regla que resuelve esta accion",
+      "accion": "snake_case_funcion",
+      "confianza": 0.65,
+      "parametros": {{...}},
+      "justificacion": "..."
+    }}
+  ],
+  "brief_tecnico": "instrucciones detalladas y específicas para OpenHands..."
+}}
+"orden" lista los ids de TODAS las acciones (las del grafo "aN" y las tuyas "fN") en el orden de ejecución.
 
-Acciones del grafo:
+Acciones del grafo (no modificables):
 {acciones_json}
 
-Problemas sin regla en el grafo:
+Problemas sin regla en el grafo (problemas_fallback):
 {sin_regla_json}
 
 Responde SOLO con el JSON. Sin markdown."""
+
+MAX_CONFIANZA_FALLBACK = 0.70
 
 
 def _acciones_y_sin_regla(acciones_grafo: Dict[str, Any]) -> tuple:
@@ -2900,25 +2964,62 @@ def _ordenar_plan(acciones: List[Dict[str, Any]], orden: Any) -> List[Dict[str, 
     return plan + faltan
 
 
+def _acciones_fallback(propuestas: Any, sin_regla: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Acciones del LLM para problemas sin regla en el grafo. Solo se aceptan para
+    pares (columna, problema) que de verdad no tienen regla; la confianza se
+    limita a MAX_CONFIANZA_FALLBACK y la fuente es siempre "llm_fallback".
+    """
+    pendientes = {(p["columna"], p["problema"]) for p in sin_regla}
+    aceptadas, usados = [], set()
+    for prop in propuestas if isinstance(propuestas, list) else []:
+        if not isinstance(prop, dict):
+            continue
+        par = (str(prop.get("columna")), str(prop.get("problema", "")).strip().lower())
+        accion = prop.get("accion")
+        if par not in pendientes or par in usados or not isinstance(accion, str) or not accion.strip():
+            print(f"   ⚠️ Planificador: se descarta la acción del LLM {prop.get('accion')!r} "
+                  f"para {par}: solo puede resolver problemas sin regla en el grafo.")
+            continue
+        try:
+            confianza = float(prop.get("confianza", MAX_CONFIANZA_FALLBACK))
+        except (TypeError, ValueError):
+            confianza = MAX_CONFIANZA_FALLBACK
+        usados.add(par)
+        aceptadas.append({
+            "id": str(prop.get("id") or f"f{len(aceptadas) + 1}"),
+            "columna": par[0],
+            "problema": par[1],
+            "accion": accion.strip(),
+            "parametros": prop.get("parametros") if isinstance(prop.get("parametros"), dict) else {},
+            "confianza": max(0.0, min(confianza, MAX_CONFIANZA_FALLBACK)),
+            "justificacion": prop.get("justificacion"),
+            "fuente_decision": "llm_fallback",
+        })
+    return aceptadas
+
+
 def _seccion_obligatoria(plan: List[Dict[str, Any]], sin_regla: List[Dict[str, Any]]) -> str:
-    """Bloque determinista del brief: las acciones exactas del grafo y lo que no se toca."""
-    acciones = [{k: a[k] for k in ("columna", "problema", "accion", "parametros")} for a in plan]
-    texto = ("\n\n## ACCIONES DEL GRAFO (obligatorias, en este orden; no añadas otras)\n"
+    """Bloque determinista del brief: las acciones exactas del plan y lo que queda sin regla."""
+    acciones = [{k: a[k] for k in ("columna", "problema", "accion", "parametros", "fuente_decision")}
+                for a in plan]
+    texto = ("\n\n## ACCIONES DEL PLAN (obligatorias, en este orden; las del grafo no se modifican)\n"
              + json.dumps(acciones, ensure_ascii=False, indent=2))
     if sin_regla:
-        texto += ("\n\n## PROBLEMAS SIN REGLA EN EL GRAFO (no tratarlos; se informan)\n"
+        texto += ("\n\n## PROBLEMAS SIN REGLA NI ACCIÓN (no tratarlos; se informan)\n"
                   + json.dumps(sin_regla, ensure_ascii=False, indent=2))
     return texto
 
 
 def node_planificar(state: DataPulseState) -> DataPulseState:
     """
-    El plan sale del grafo: las acciones, sus parámetros y su confianza son las
-    de las reglas elegidas. El LLM solo propone el orden y redacta el brief.
+    Plan = acciones del grafo (no modificables) + respaldo del LLM para los
+    problemas sin regla (confianza ≤ 0.70, fuente_decision "llm_fallback").
+    El LLM ordena todas las acciones y redacta el brief para OpenHands.
     """
     acciones, sin_regla = _acciones_y_sin_regla(state.get("acciones_grafo", {}))
-    orden, brief = None, ""
-    if acciones:
+    orden, brief, fallback = None, "", []
+    if acciones or sin_regla:
         try:
             llm = get_llm()
             prompt = PLANIFICAR_PROMPT.format(
@@ -2928,11 +3029,17 @@ def node_planificar(state: DataPulseState) -> DataPulseState:
             parsed = extract_json_from_markdown(llm.invoke([HumanMessage(content=prompt)]).content)
             orden = parsed.get("orden")
             brief = str(parsed.get("brief_tecnico") or "")
+            fallback = _acciones_fallback(parsed.get("acciones_fallback"), sin_regla)
         except Exception as exc:
             print(f"   ⚠️ Planificador sin respuesta válida ({type(exc).__name__}): "
-                  "se usa el orden del grafo y solo las acciones obligatorias.")
+                  "se usa el orden del grafo y solo sus acciones.")
     else:
-        brief = "El Grafo de Conocimiento no tiene acciones para los problemas detectados."
+        brief = "No hay problemas que tratar."
+
+    for accion in acciones:
+        accion["fuente_decision"] = "knowledge_graph"
+    resueltos = {(f["columna"], f["problema"]) for f in fallback}
+    sin_resolver = [p for p in sin_regla if (p["columna"], p["problema"]) not in resueltos]
 
     plan = [
         {
@@ -2940,16 +3047,16 @@ def node_planificar(state: DataPulseState) -> DataPulseState:
             "problema": a["problema"],
             "accion": a["accion"],
             "confianza": a["confianza"],
-            "fuente_decision": "knowledge_graph",
+            "fuente_decision": a["fuente_decision"],
             "parametros": a["parametros"],
             "justificacion": a["justificacion"],
         }
-        for a in _ordenar_plan(acciones, orden)
+        for a in _ordenar_plan(acciones + fallback, orden)
     ]
     return {
         "plan_acciones": plan,
-        "sin_regla": sin_regla,
-        "brief_tecnico": brief + _seccion_obligatoria(plan, sin_regla),
+        "sin_regla": sin_resolver,
+        "brief_tecnico": brief + _seccion_obligatoria(plan, sin_resolver),
     }
 
 
@@ -3779,6 +3886,10 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
         "decisiones_knowledge_graph": sum(
             1 for a in state.get("plan_acciones", [])
             if a.get("fuente_decision") == "knowledge_graph"
+        ),
+        "decisiones_llm_fallback": sum(
+            1 for a in state.get("plan_acciones", [])
+            if a.get("fuente_decision") == "llm_fallback"
         ),
         "problemas_sin_regla": state.get("sin_regla", []),
         "plan_acciones": state.get("plan_acciones", [])

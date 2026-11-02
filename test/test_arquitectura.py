@@ -6,6 +6,8 @@ Tests de contrato de la arquitectura:
 - El vocabulario del diagnóstico sale del Grafo de Conocimiento y las
   acciones del grafo llegan al plan sin cambios, sea cual sea su contenido
   (se usa un grafo mínimo inventado).
+- Los problemas sin regla los resuelve el LLM (confianza ≤ 0.70,
+  fuente_decision "llm_fallback"); no puede tocar las acciones del grafo.
 """
 
 import json
@@ -83,20 +85,22 @@ def grafo_usuario(monkeypatch):
 class LLMGuion:
     """LLM falso: responde según el tipo de prompt y guarda lo que recibió."""
 
-    def __init__(self, diagnostico, orden):
+    def __init__(self, diagnostico, orden, fallback=None):
         self.diagnostico, self.orden, self.prompts = diagnostico, orden, []
+        self.fallback = fallback or []
 
     def invoke(self, mensajes):
         prompt = mensajes[0].content
         self.prompts.append(prompt)
         if "planificador técnico" in prompt:
             return SimpleNamespace(content=json.dumps(
-                {"orden": self.orden, "brief_tecnico": "Brief del LLM."}))
+                {"orden": self.orden, "acciones_fallback": self.fallback,
+                 "brief_tecnico": "Brief del LLM."}))
         return SimpleNamespace(content=json.dumps(self.diagnostico))
 
 
-def _pipeline(monkeypatch, diagnostico, orden):
-    llm = LLMGuion(diagnostico, orden)
+def _pipeline(monkeypatch, diagnostico, orden, fallback=None):
+    llm = LLMGuion(diagnostico, orden, fallback)
     monkeypatch.setattr(dp, "get_llm", lambda: llm)
     meta = {"filas": 3, "columnas_info": {c: {} for c in diagnostico}}
     diag = dp.node_diagnosticar({"metadata": meta})["diagnostico"]
@@ -121,28 +125,38 @@ def test_vocabulario_sale_del_grafo(grafo_usuario):
     assert "nulos_disfrazados" not in lista and "Valores_Centinela" not in lista
 
 
-def test_plan_contiene_exactamente_las_acciones_del_grafo(grafo_usuario, monkeypatch):
+def test_acciones_del_grafo_intactas_y_respaldo_del_llm(grafo_usuario, monkeypatch):
     diagnostico = {
-        "col1": {"tipo_inferido": "tipo_a", "problemas": ["x", "problema_y", "sin_regla_inventada"]},
-        "col2": {"tipo_inferido": "tipo_a", "problemas": ["problema_global"]},
+        "col1": {"tipo_inferido": "tipo_a", "problemas": ["x", "problema_y", "sin_regla_a"]},
+        "col2": {"tipo_inferido": "tipo_a", "problemas": ["problema_global", "sin_regla_b"]},
     }
-    # El LLM propone un orden e intenta colar una acción que no existe
-    llm, grafo, plan = _pipeline(monkeypatch, diagnostico, ["a3", "a99", "a1"])
+    fallback = [
+        # Válida: problema sin regla; la confianza se limita a 0.70
+        {"id": "f1", "columna": "col1", "problema": "sin_regla_a", "accion": "accion_del_llm",
+         "confianza": 0.95, "parametros": {"k": 1}, "justificacion": "decisión del LLM"},
+        # Inválida: intenta reemplazar una regla del grafo
+        {"id": "f2", "columna": "col1", "problema": "x", "accion": "otra_cosa", "confianza": 0.5},
+    ]
+    # El LLM ordena y también intenta colar un id inexistente
+    llm, grafo, plan = _pipeline(monkeypatch, diagnostico, ["a3", "f1", "a99", "a1"], fallback)
 
-    acciones = [(a["columna"], a["accion"], a["parametros"], a["fuente_decision"])
+    acciones = [(a["columna"], a["accion"], a["parametros"], a["fuente_decision"], a["confianza"])
                 for a in plan["plan_acciones"]]
     assert acciones == [
-        ("col2", "accion_global", {}, "knowledge_graph"),     # a3, primero según el LLM
-        ("col1", "accion_x", {"p": 1}, "knowledge_graph"),    # a1
-        ("col1", "accion_y_fuerte", {}, "knowledge_graph"),   # a2 no ordenada: al final
+        ("col2", "accion_global", {}, "knowledge_graph", 0.99),        # a3
+        ("col1", "accion_del_llm", {"k": 1}, "llm_fallback", 0.70),    # f1, confianza acotada
+        ("col1", "accion_x", {"p": 1}, "knowledge_graph", 0.9),        # a1, intacta
+        ("col1", "accion_y_fuerte", {}, "knowledge_graph", 0.95),      # a2 no ordenada: al final
     ]
-    # El problema sin regla se informa, no se limpia
-    assert plan["sin_regla"] == [{"columna": "col1", "problema": "sin_regla_inventada"}]
+    # Lo que el LLM no resolvió queda sin regla (se informa)
+    assert plan["sin_regla"] == [{"columna": "col2", "problema": "sin_regla_b"}]
     brief = plan["brief_tecnico"]
     assert brief.startswith("Brief del LLM.")
-    assert "ACCIONES DEL GRAFO" in brief and "accion_y_fuerte" in brief
-    assert "PROBLEMAS SIN REGLA" in brief and "sin_regla_inventada" in brief
-    assert "accion_y_debil" not in brief      # gana la regla de mayor confianza
+    assert "ACCIONES DEL PLAN" in brief and "accion_y_fuerte" in brief and "accion_del_llm" in brief
+    assert "otra_cosa" not in brief and "accion_y_debil" not in brief
+    # El LLM recibió las acciones del grafo y los problemas sin regla
+    prompt_plan = next(p for p in llm.prompts if "planificador técnico" in p)
+    assert "sin_regla_a" in prompt_plan and "accion_x" in prompt_plan
 
 
 def test_editar_el_grafo_cambia_el_plan(grafo_usuario, monkeypatch):
@@ -176,18 +190,26 @@ def test_planificador_sin_respuesta_valida_usa_el_grafo(grafo_usuario, monkeypat
     grafo = dp.node_consultar_grafo({"diagnostico": diag})["acciones_grafo"]
     plan = dp.node_planificar({"acciones_grafo": grafo})
     assert [a["accion"] for a in plan["plan_acciones"]] == ["accion_x"]
-    assert "ACCIONES DEL GRAFO" in plan["brief_tecnico"]
+    assert "ACCIONES DEL PLAN" in plan["brief_tecnico"]
 
 
-def test_sin_acciones_no_llama_al_llm(grafo_usuario, monkeypatch):
+def test_sin_reglas_el_llm_resuelve_y_sin_problemas_no_se_llama(grafo_usuario, monkeypatch):
+    llm = LLMGuion({}, ["f1"], [{"id": "f1", "columna": "col1", "problema": "algo_raro",
+                                 "accion": "accion_llm", "confianza": 0.5}])
+    monkeypatch.setattr(dp, "get_llm", lambda: llm)
+    plan = dp.node_planificar({"acciones_grafo": {
+        "col1": {"acciones": [], "problemas_fallback": ["algo_raro", "ninguno"]}}})
+    assert [(a["accion"], a["fuente_decision"], a["confianza"]) for a in plan["plan_acciones"]] == [
+        ("accion_llm", "llm_fallback", 0.5)]
+    assert plan["sin_regla"] == []
+
     def _no_llamar():
         raise AssertionError("no debería llamarse al LLM")
 
     monkeypatch.setattr(dp, "get_llm", _no_llamar)
-    plan = dp.node_planificar({"acciones_grafo": {
-        "col1": {"acciones": [], "problemas_fallback": ["algo_raro", "ninguno"]}}})
-    assert plan["plan_acciones"] == []
-    assert plan["sin_regla"] == [{"columna": "col1", "problema": "algo_raro"}]
+    vacio = dp.node_planificar({"acciones_grafo": {
+        "col1": {"acciones": [], "problemas_fallback": ["ninguno"]}}})
+    assert vacio["plan_acciones"] == [] and vacio["sin_regla"] == []
 
 
 def test_grafo_real_todas_las_reglas_alcanzables():

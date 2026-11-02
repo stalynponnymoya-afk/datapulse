@@ -238,9 +238,16 @@ def test_prompt_explica_los_campos_y_el_enmascarado():
         assert campo in prompt, campo
 
 
-def test_skewness_de_columnas_mayormente_numericas(meta):
-    """La skewness de la parte convertible llega al LLM como información."""
-    assert abs(meta["columnas_info"]["Edad"]["skewness"]) > 1  # sesgada por el 150
+def test_grafo_usa_skewness_de_columnas_mayormente_numericas(meta):
+    """La skewness de la parte convertible activa el ajuste a mediana."""
+    info = meta["columnas_info"]["Edad"]
+    assert abs(info["skewness"]) > 1  # sesgada por el 150
+    out = dp.node_consultar_grafo({
+        "diagnostico": {"Edad": {"tipo_inferido": "numerica_continua_simetrica",
+                                 "problemas": ["nulos_bajos"]}},
+        "metadata": meta,
+    })
+    assert out["acciones_grafo"]["Edad"]["acciones"][0]["accion"] == "fillna_median"
 
 
 # ── Utilidades ──────────────────────────────────────────────────────────────
