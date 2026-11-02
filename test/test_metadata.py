@@ -258,7 +258,9 @@ def test_utilidades():
     assert qc.es_mayormente_numerica(pd.Series(["1", "2", "3", "4", "x"]))
     assert not qc.es_mayormente_numerica(pd.Series(["1", "2", "x", "y", "z"]))
     assert not qc.es_mayormente_numerica(pd.Series([1, 2, 3]))  # ya es numérica
-    assert qc.extremos_iqr(pd.Series([1, 2, 3, 4, 5, 6, 100, -50])).tolist() == [100, -50]
+    assert qc.extremos_iqr(pd.Series(list(range(1, 11)) + [100, -50])).tolist() == [100, -50]
+    # Escala de 10 valores o menos (p. ej. satisfacción 1–5): sin IQR
+    assert qc.extremos_iqr(pd.Series([5] * 30 + [4] * 5 + [1])).empty
     assert qc.extremos_iqr(pd.Series([1, 1, 1, 1])).empty
     fechas = qc.parsear_fechas_flexible(pd.Series(["2025-01-05", "05/02/2025", "2025/03/05"]))
     assert fechas.notna().all()

@@ -2033,6 +2033,8 @@ class DataPulseState(TypedDict):
     ruta_processed: Optional[str]    # ruta local de processed_data.csv del intento
     processed_esperado: bool         # True si el intento debía dejar un processed_data.csv legible
     residuales: Optional[List[Dict[str, Any]]]  # problemas que quedan en processed_data.csv
+    columnas_nuevas: List[str]                  # en processed pero no en el original (no se evalúan)
+    columnas_eliminadas: List[str]              # del original que ya no están en processed
     mensaje_ejecucion: Optional[str]            # mensaje final de OpenHands o salida del script
     directorio_salida: Optional[str] # carpeta local con las salidas del intento
 
@@ -3921,6 +3923,22 @@ def _resumir_residuales(residuales: Optional[List[Dict[str, Any]]], max_items: i
     return "; ".join(partes) + (f"; y {extra} más" if extra > 0 else "")
 
 
+def _solo_columnas_originales(state: Dict[str, Any], df: pd.DataFrame) -> tuple:
+    """
+    El score se calcula solo con las columnas del dataset original: las nuevas
+    (flags, dummies) no se evalúan y las originales eliminadas se listan.
+    Devuelve (df a evaluar, columnas nuevas, columnas eliminadas). Sin metadata
+    del original se evalúan todas.
+    """
+    originales = [str(c) for c in ((state.get("metadata") or {}).get("columnas_info") or {})]
+    if not originales:
+        return df, [], []
+    presentes = [c for c in df.columns if str(c) in originales]
+    nuevas = [str(c) for c in df.columns if str(c) not in originales]
+    eliminadas = [c for c in originales if c not in {str(x) for x in df.columns}]
+    return df[presentes], nuevas, eliminadas
+
+
 def _error_validador(etiqueta: str, sobre: str, exc: Exception) -> Dict[str, Any]:
     """
     El validador (quality_checker) lanzó una excepción: estado
@@ -3938,7 +3956,9 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
     confiar en el quality_report.json que escribe el propio script generado.
 
     - score_antes: sobre el dataset original (se calcula una sola vez).
-    - score_despues: sobre el processed_data.csv real del intento.
+    - score_despues: sobre el processed_data.csv real del intento, solo con las
+      columnas que existían en el original (las nuevas y las eliminadas se
+      listan, no se evalúan).
     - Sin processed_data.csv → openhands_status = "sin_validar" (no hay
       commit). El router solo reintenta si debía existir y no apareció
       (``processed_esperado``).
@@ -3993,9 +4013,10 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
         return salida
 
     try:
-        df_processed = load_dataset(ruta)
+        df_processed, nuevas, eliminadas = _solo_columnas_originales(state, load_dataset(ruta))
+        salida.update({"columnas_nuevas": nuevas, "columnas_eliminadas": eliminadas})
         if df_processed.empty:
-            raise ValueError("dataset vacío")
+            raise ValueError("dataset vacío o sin ninguna columna del original")
     except Exception as exc:
         # El archivo apareció pero no es un dataset válido: la limpieza falló.
         msg = (
@@ -4017,6 +4038,9 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
     score = reporte["quality_score"]
     salida["score_despues"] = score
     salida["residuales"] = residuales
+    if nuevas or eliminadas:
+        print(f"   🧮 Score sobre las columnas originales; nuevas sin evaluar: {nuevas}; "
+              f"eliminadas: {eliminadas}")
     print(
         f"   📈 Score independiente: {score} "
         f"(reportado por el script: {state.get('score_reportado')})"
@@ -4057,6 +4081,8 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
         "problemas_sin_regla": state.get("sin_regla", []),
         "decisiones_negativos": state.get("decisiones_negativos", {}),
         "discrepancias_negativos": state.get("discrepancias_negativos", []),
+        "columnas_nuevas_no_evaluadas": state.get("columnas_nuevas", []),
+        "columnas_originales_eliminadas": state.get("columnas_eliminadas", []),
         "plan_acciones": state.get("plan_acciones", [])
     }
     files_to_commit.append((f"outputs/{ts}/audit_log.json", json.dumps(audit, ensure_ascii=False, indent=2)))
@@ -4201,7 +4227,7 @@ def _medir_resultado_parcial(state: DataPulseState) -> tuple:
     ruta = state.get("ruta_processed")
     if residuales is None and ruta and os.path.exists(ruta):
         try:
-            df = load_dataset(ruta)
+            df, _, _ = _solo_columnas_originales(state, load_dataset(ruta))
             reporte = generate_report_df(df, "processed_data.csv",
                                          decisiones_negativos=state.get("decisiones_negativos"))
             return reporte["quality_score"], _problemas_residuales(df, reporte), True
@@ -4269,6 +4295,11 @@ def _informe_markdown(tabla: Dict[str, Any], resumen: str) -> str:
         lineas += [f"| {p['columna']} | {p['problema']} |" for p in tabla["problemas_sin_regla"]]
     else:
         lineas.append("Ninguno.")
+    lineas += ["", "## Columnas que no entran en el score", ""]
+    lineas.append("- Nuevas (flags, dummies), no evaluadas: "
+                  + (", ".join(tabla.get("columnas_nuevas_no_evaluadas") or []) or "ninguna"))
+    lineas.append("- Originales eliminadas: "
+                  + (", ".join(tabla.get("columnas_originales_eliminadas") or []) or "ninguna"))
     lineas += ["", "## Decisiones sobre negativos", ""]
     decisiones = tabla.get("decisiones_negativos") or {}
     if decisiones:
@@ -4308,6 +4339,8 @@ def generar_informe_final(estado: Dict[str, Any]) -> Dict[str, Any]:
         "problemas_sin_regla": estado.get("sin_regla", []),
         "decisiones_negativos": estado.get("decisiones_negativos", {}),
         "discrepancias_negativos": estado.get("discrepancias_negativos", []),
+        "columnas_nuevas_no_evaluadas": estado.get("columnas_nuevas", []),
+        "columnas_originales_eliminadas": estado.get("columnas_eliminadas", []),
         "errores": [e[:300] for e in (estado.get("error_history") or [])[-3:]],
         "mensaje_ejecucion": (estado.get("mensaje_ejecucion") or "")[:500],
         "resultado_medido": medido,
@@ -4458,6 +4491,8 @@ def run_datapulse(
         "ruta_processed":     None,
         "processed_esperado": False,
         "residuales":         None,
+        "columnas_nuevas":    [],
+        "columnas_eliminadas": [],
         "mensaje_ejecucion":  None,
         "directorio_salida":  None,
         "archivos_generados": {},

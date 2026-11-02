@@ -247,11 +247,12 @@ def test_veredictos():
 
 def test_checks_basicos():
     df = pd.DataFrame({
-        "n": [1.0, None, 3.0, 1000.0, 2.0, 2.5, 1.5, 2.2],
-        "t": [" Madrid", "madrid", "MADRID", "Lima", "Lima", "Lima", "Quito  ", "Quito"],
-        "b": [True, False, True, True, False, True, True, False],
+        "n": [1.0, None, 3.0, 1000.0, 2.0, 2.5, 1.5, 2.2, 1.1, 1.3, 2.7, 3.1],
+        "t": [" Madrid", "madrid", "MADRID", "Lima", "Lima", "Lima", "Quito  ", "Quito",
+              "Lima", "Lima", "Quito", "Quito"],
+        "b": [True, False, True, True, False, True, True, False, True, True, False, False],
     })
-    assert check_nulls(df) == {"n": 12.5}
+    assert check_nulls(df) == {"n": round(100 / 12, 2)}
     assert check_duplicates(df)["count"] == 0
     assert "n" in check_outliers(df)
     txt = check_text_inconsistencies(df)["t"]

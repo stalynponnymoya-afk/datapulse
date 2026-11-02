@@ -254,13 +254,21 @@ def check_duplicates(df):
 # CHECK 3: OUTLIERS (IQR)
 # =====================================================
 
+# Columnas numéricas con este número de valores distintos o menos son escalas
+# o códigos (p. ej. Satisfaccion 1–5): el IQR no tiene sentido en ellas.
+MAX_VALORES_ESCALA = 10
+
+
 def check_outliers(df, factor=1.5):
     """
-    Detecta outliers con IQR en todas las columnas numéricas.
+    Detecta outliers con IQR en las columnas numéricas con más de
+    MAX_VALORES_ESCALA valores distintos (en escalas no se aplica).
     IQR = Q3 - Q1. Outlier si valor < Q1-1.5*IQR o > Q3+1.5*IQR.
     """
     outliers = {}
     for col in df.select_dtypes(include=[np.number]).columns:
+        if pd.api.types.is_bool_dtype(df[col]) or df[col].nunique() <= MAX_VALORES_ESCALA:
+            continue
         q1 = df[col].quantile(0.25)
         q3 = df[col].quantile(0.75)
         iqr = q3 - q1
@@ -556,9 +564,12 @@ def es_mayormente_numerica(serie: pd.Series, umbral: float = UMBRAL_MAYORMENTE) 
 
 
 def extremos_iqr(numeros: pd.Series, factor: float = 1.5) -> pd.Series:
-    """Valores fuera de [Q1 - f·IQR, Q3 + f·IQR], del más alejado al menos."""
+    """
+    Valores fuera de [Q1 - f·IQR, Q3 + f·IQR], del más alejado al menos. No se
+    aplica a escalas (MAX_VALORES_ESCALA valores distintos o menos).
+    """
     numeros = numeros.dropna()
-    if len(numeros) < 4:
+    if len(numeros) < 4 or numeros.nunique() <= MAX_VALORES_ESCALA:
         return numeros.iloc[0:0]
     q1, q3 = numeros.quantile(0.25), numeros.quantile(0.75)
     iqr = q3 - q1
@@ -778,8 +789,10 @@ def check_column_relationships(df):
 
     # --- 7a. Buscar relaciones de multiplicación (A ≈ B * C) ---
     # Palabras clave que sugieren "resultado" (total, amount, revenue, etc.)
+    # Se comparan como TOKENS del nombre (no subcadenas): "Discount" ya no
+    # coincide con "count" ni "Sum_Insured_Flag" con "sum" por accidente.
     result_keywords = [
-        "total", "amount", "revenue", "sum", "cost", "price_total",
+        "total", "amount", "revenue", "sum", "cost",
         "monto", "importe", "subtotal", "neto", "gross"
     ]
     # Palabras clave que sugieren "cantidad"
@@ -788,26 +801,21 @@ def check_column_relationships(df):
     ]
     # Palabras clave que sugieren "precio unitario"
     price_keywords = [
-        "price", "unit_price", "rate", "precio", "tarifa", "cost",
-        "unit_cost", "each"
+        "price", "rate", "precio", "tarifa", "cost", "each"
     ]
 
     found_relationships = []
 
     for result_col in numeric_cols:
-        result_lower = result_col.lower().replace(" ", "_")
-        is_result = any(kw in result_lower for kw in result_keywords)
-        if not is_result:
+        if not _nombre_contiene(result_col, result_keywords):
             continue
 
         for qty_col in numeric_cols:
-            qty_lower = qty_col.lower().replace(" ", "_")
-            if not any(kw in qty_lower for kw in qty_keywords):
+            if not _nombre_contiene(qty_col, qty_keywords):
                 continue
 
             for price_col in numeric_cols:
-                price_lower = price_col.lower().replace(" ", "_")
-                if not any(kw in price_lower for kw in price_keywords):
+                if not _nombre_contiene(price_col, price_keywords):
                     continue
 
                 if len({result_col, qty_col, price_col}) < 3:
