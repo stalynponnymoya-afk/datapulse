@@ -60,7 +60,7 @@ node): see `informe_final.md` below.
 
 ### Knowledge Graph
 
-The Knowledge Graph is a `MultiDiGraph` (NetworkX) whose rules (edges) are the base statistical/structural rules, organized in 6 categories, plus the rules of the domains listed in `DOMINIOS_ACTIVOS` (none by default; available: `salud`, `finanzas`, `economia`, `ocupacional`). The number of rules is not fixed: it is whatever you configure for your line of business. The base includes the `Negativos_Inciertos` rules (`flag_sin_modificar`: flag without changing values) and the `Valores_Centinela` rules: `reemplazar_centinela_por_nan` for numeric/financial columns, `replace_to_na` for categorical and text columns (same string list as the empty-string rule), and `marcar_fecha_centinela` for dates, which only **flags** the sentinel dates listed in `DATAPULSE_FECHAS_CENTINELA` (empty by default) and never imputes them:
+The Knowledge Graph is a `MultiDiGraph` (NetworkX) whose rules (edges) are the base statistical/structural rules, organized in 6 categories, plus the rules of the domains listed in `DOMINIOS_ACTIVOS` (none by default; available: `salud`, `finanzas`, `economia`, `ocupacional` and the `retail` demo). The number of rules is not fixed: it is whatever you configure for your line of business. The base includes the `Negativos_Inciertos` rules (`flag_sin_modificar`: flag without changing values) and the `Valores_Centinela` rules: `reemplazar_centinela_por_nan` for numeric/financial columns, `replace_to_na` for categorical and text columns (same string list as the empty-string rule), and `marcar_fecha_centinela` for dates, which only **flags** the sentinel dates listed in `DATAPULSE_FECHAS_CENTINELA` (empty by default) and never imputes them:
 
 1. **Structural Integrity** — duplicates, empty rows/columns, column name normalization
 2. **String Cleaning** — whitespace, line breaks, case normalization, email/phone validation
@@ -123,7 +123,8 @@ sent to the LLM fallback.
 
 **Create and activate a domain.**
 
-1. Copy `agregar_reglas_plantilla(kg)` as `agregar_reglas_<domain>(kg)` in `datapulse_prod.py`.
+1. Copy `agregar_reglas_plantilla(kg)` as `agregar_reglas_<domain>(kg)` in `datapulse_prod.py`
+   (`agregar_reglas_retail` is a complete example).
 2. Declare its new nodes with `_agregar_nodos_dominio(kg, problemas, tipos)` and add its rules
    (they may also hang from existing nodes such as `Variable_Numerica_Continua`).
 3. Register it: `DOMINIOS["<domain>"] = agregar_reglas_<domain>`.
@@ -157,6 +158,42 @@ dp.validar_grafo(dp.kg)   # if something is wrong, says which edge and which att
 dp.node_consultar_grafo({"diagnostico": {"region": {
     "tipo_inferido": "categorica_nominal", "problemas": ["codigo_region_inconsistente"]}}})
 ```
+
+**Example: the `retail` domain (demo).** It is registered but inactive; enable it with
+`DOMINIOS_ACTIVOS = ["retail"]`. Its business values are **example values, not final decisions**,
+and each rule receives them as explicit parameters:
+
+| Problem | Action | Example parameter |
+|---|---|---|
+| `Satisfaccion_Con_Etiquetas_Texto` | `mapear_etiquetas_satisfaccion_a_numero` | `mapeo = {"excelente": 5, "muy bueno": 4}` |
+| `Metodo_Pago_Ambiguo` | `reemplazar_categoria_ambigua` | `reemplazos = {"TARJETA": "Tarjeta sin especificar"}` |
+| `Numeros_En_Palabras` | `convertir_numeros_en_palabras` | `palabras = {"tres": 3, "veinte": 20, "treinta": 30}` (extendable) |
+| `Total_Compra_Inconsistente` | `recalcular_total_y_marcar` | `factores = ["Cantidad_Articulos", "Precio_Unitario"]`, `flag_suffix = "_recalculado"` (only rows that change) |
+
+The rules hang from the existing variable types, so the other rules of those columns (case,
+nulls, mixed types…) still apply. How to change the parameters:
+
+- **Permanently:** edit the dictionaries at the top of `agregar_reglas_retail(kg)` in
+  `datapulse_prod.py` (the "VALORES DE EJEMPLO" block). Each value is copied to every edge that
+  uses it (e.g. `palabras` goes to the continuous, discrete and financial rules), so you change it
+  in one place.
+- **Hot, in Colab:** enable the domain, then edit the edges by action name (this changes every
+  copy at once):
+
+```python
+dp.DOMINIOS_ACTIVOS = ["retail"]
+dp.aplicar_dominios_activos()
+for _, _, datos in dp.kg.edges(data=True):
+    if datos["accion"] == "convertir_numeros_en_palabras":
+        datos["parametros"]["palabras"]["cuarenta"] = 40
+    if datos["accion"] == "mapear_etiquetas_satisfaccion_a_numero":
+        datos["parametros"]["mapeo"]["bueno"] = 3
+dp.validar_grafo(dp.kg)
+```
+
+The executor receives these parameters as they are, in the "ACCIONES DEL PLAN" section of the
+brief. Rebuilding the graph (`dp.aplicar_dominios_activos(forzar=True)` or changing
+`DOMINIOS_ACTIVOS`) brings back the values written in the function.
 
 **What happens without a rule.** If the graph has no rule for the (type, problem) pair, the
 planner (LLM) proposes a fallback action with confidence ≤ 0.70 and
@@ -306,7 +343,7 @@ they can be changed after importing (`dp.OPTION = ...`) and before calling `run_
 | `CONTEXTO_DATASET` | `""` | Free-text description of the dataset, added to the diagnosis prompt (empty: `DATAPULSE_CONTEXTO`) |
 | `DECISIONES_NEGATIVOS` | `{}` | `{"column": "validos" \| "invalidos"}`: overrides the LLM decision on that column's negatives |
 | `MODO_SALIDA` | `"bi"` | `"bi"` (analysis/BI) or `"ml"` (models): rules whose `modo` differs are skipped |
-| `DOMINIOS_ACTIVOS` | `[]` | Domains whose rules are added to the graph (`salud`, `finanzas`, `economia`, `ocupacional` or your own) |
+| `DOMINIOS_ACTIVOS` | `[]` | Domains whose rules are added to the graph (`salud`, `finanzas`, `economia`, `ocupacional`, the `retail` demo or your own) |
 
 ### Data Privacy
 
@@ -524,7 +561,7 @@ un nodo): ver `informe_final.md` más abajo.
 
 ### Grafo de Conocimiento
 
-El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) cuyas reglas (aristas) son las reglas estadísticas/estructurales base, organizadas en 6 categorías, más las de los dominios listados en `DOMINIOS_ACTIVOS` (ninguno por defecto; disponibles: `salud`, `finanzas`, `economia`, `ocupacional`). El número de reglas no es fijo: es el que configures para tu giro de negocio. La base incluye las reglas de `Negativos_Inciertos` (`flag_sin_modificar`: marca sin cambiar valores) y las de `Valores_Centinela`: `reemplazar_centinela_por_nan` en columnas numéricas y financieras, `replace_to_na` en categóricas y texto (con la misma lista de cadenas que la regla de cadenas vacías) y `marcar_fecha_centinela` en fechas, que solo **marca con un flag** las fechas centinela definidas en `DATAPULSE_FECHAS_CENTINELA` (vacía por defecto) y nunca las imputa:
+El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) cuyas reglas (aristas) son las reglas estadísticas/estructurales base, organizadas en 6 categorías, más las de los dominios listados en `DOMINIOS_ACTIVOS` (ninguno por defecto; disponibles: `salud`, `finanzas`, `economia`, `ocupacional` y la demo `retail`). El número de reglas no es fijo: es el que configures para tu giro de negocio. La base incluye las reglas de `Negativos_Inciertos` (`flag_sin_modificar`: marca sin cambiar valores) y las de `Valores_Centinela`: `reemplazar_centinela_por_nan` en columnas numéricas y financieras, `replace_to_na` en categóricas y texto (con la misma lista de cadenas que la regla de cadenas vacías) y `marcar_fecha_centinela` en fechas, que solo **marca con un flag** las fechas centinela definidas en `DATAPULSE_FECHAS_CENTINELA` (vacía por defecto) y nunca las imputa:
 
 1. **Integridad Estructural** — duplicados, filas/columnas vacías, normalización de nombres
 2. **Limpieza de Texto** — espacios, saltos de línea, normalización de caja, validación email/teléfono
@@ -590,7 +627,8 @@ va al fallback del LLM.
 
 **Crear y activar un dominio.**
 
-1. Copia `agregar_reglas_plantilla(kg)` como `agregar_reglas_<dominio>(kg)` en `datapulse_prod.py`.
+1. Copia `agregar_reglas_plantilla(kg)` como `agregar_reglas_<dominio>(kg)` en `datapulse_prod.py`
+   (`agregar_reglas_retail` es un ejemplo completo).
 2. Declara sus nodos nuevos con `_agregar_nodos_dominio(kg, problemas, tipos)` y añade sus reglas
    (también pueden colgar de nodos existentes, como `Variable_Numerica_Continua`).
 3. Regístralo: `DOMINIOS["<dominio>"] = agregar_reglas_<dominio>`.
@@ -625,6 +663,42 @@ dp.validar_grafo(dp.kg)   # si algo está mal, dice qué arista y qué atributo
 dp.node_consultar_grafo({"diagnostico": {"region": {
     "tipo_inferido": "categorica_nominal", "problemas": ["codigo_region_inconsistente"]}}})
 ```
+
+**Ejemplo: el dominio `retail` (demo).** Está registrado pero inactivo; se activa con
+`DOMINIOS_ACTIVOS = ["retail"]`. Sus valores de negocio son **valores de ejemplo, no decisiones
+definitivas**, y cada regla los recibe como parámetros explícitos:
+
+| Problema | Acción | Parámetro de ejemplo |
+|---|---|---|
+| `Satisfaccion_Con_Etiquetas_Texto` | `mapear_etiquetas_satisfaccion_a_numero` | `mapeo = {"excelente": 5, "muy bueno": 4}` |
+| `Metodo_Pago_Ambiguo` | `reemplazar_categoria_ambigua` | `reemplazos = {"TARJETA": "Tarjeta sin especificar"}` |
+| `Numeros_En_Palabras` | `convertir_numeros_en_palabras` | `palabras = {"tres": 3, "veinte": 20, "treinta": 30}` (ampliable) |
+| `Total_Compra_Inconsistente` | `recalcular_total_y_marcar` | `factores = ["Cantidad_Articulos", "Precio_Unitario"]`, `flag_suffix = "_recalculado"` (solo filas que cambian) |
+
+Las reglas cuelgan de los tipos de variable existentes, así que las demás reglas de esas columnas
+(mayúsculas, nulos, tipos mixtos…) siguen aplicándose. Cómo cambiar los parámetros:
+
+- **De forma permanente:** edita los diccionarios del inicio de `agregar_reglas_retail(kg)` en
+  `datapulse_prod.py` (bloque "VALORES DE EJEMPLO"). Cada valor se copia a todas las aristas que lo
+  usan (p. ej. `palabras` va a las reglas de continua, discreta y financiera), así que se cambia
+  en un solo sitio.
+- **En caliente, en Colab:** activa el dominio y luego edita las aristas por nombre de acción (así
+  cambias todas las copias a la vez):
+
+```python
+dp.DOMINIOS_ACTIVOS = ["retail"]
+dp.aplicar_dominios_activos()
+for _, _, datos in dp.kg.edges(data=True):
+    if datos["accion"] == "convertir_numeros_en_palabras":
+        datos["parametros"]["palabras"]["cuarenta"] = 40
+    if datos["accion"] == "mapear_etiquetas_satisfaccion_a_numero":
+        datos["parametros"]["mapeo"]["bueno"] = 3
+dp.validar_grafo(dp.kg)
+```
+
+El ejecutor recibe estos parámetros tal cual, en la sección "ACCIONES DEL PLAN" del brief. Volver
+a construir el grafo (`dp.aplicar_dominios_activos(forzar=True)` o cambiar `DOMINIOS_ACTIVOS`)
+recupera los valores escritos en la función.
 
 **Qué pasa si no hay regla.** Si el grafo no tiene regla para el par (tipo, problema), el
 planificador (LLM) propone una acción de respaldo con confianza ≤ 0,70 y
@@ -774,7 +848,7 @@ se pueden cambiar después de importar (`dp.OPCION = ...`) y antes de llamar a `
 | `CONTEXTO_DATASET` | `""` | Descripción libre del dataset que se añade al prompt de diagnóstico (vacía: `DATAPULSE_CONTEXTO`) |
 | `DECISIONES_NEGATIVOS` | `{}` | `{"columna": "validos" \| "invalidos"}`: reemplaza la decisión del LLM sobre los negativos de esa columna |
 | `MODO_SALIDA` | `"bi"` | `"bi"` (análisis/BI) o `"ml"` (modelos): se omiten las reglas cuyo `modo` no coincide |
-| `DOMINIOS_ACTIVOS` | `[]` | Dominios cuyas reglas se agregan al grafo (`salud`, `finanzas`, `economia`, `ocupacional` o uno propio) |
+| `DOMINIOS_ACTIVOS` | `[]` | Dominios cuyas reglas se agregan al grafo (`salud`, `finanzas`, `economia`, `ocupacional`, la demo `retail` o uno propio) |
 
 ### Privacidad de los Datos
 

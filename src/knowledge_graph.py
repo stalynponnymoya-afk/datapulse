@@ -13,7 +13,7 @@ reglas estadísticas ni de las reglas de dominio que puedan divergir.
 Contenido expuesto:
 - ``construir_grafo_conocimiento``  — reglas estadísticas y estructurales base
 - ``agregar_reglas_dominio``        — agrega los dominios indicados (sin argumentos, todos)
-- ``agregar_reglas_salud`` / ``_finanzas`` / ``_economia`` / ``_ocupacional`` — un dominio cada una
+- ``agregar_reglas_salud`` / ``_finanzas`` / ``_economia`` / ``_ocupacional`` / ``_retail`` — un dominio cada una (retail: demo con valores de ejemplo)
 - ``agregar_reglas_plantilla``      — plantilla documentada para un dominio propio
 - ``DOMINIOS``                      — registro nombre → función de dominio
 - ``aplicar_dominios_activos``      — reconstruye el grafo global según DOMINIOS_ACTIVOS
@@ -50,6 +50,7 @@ from datapulse_prod import (  # noqa: E402
     agregar_reglas_finanzas,
     agregar_reglas_ocupacional,
     agregar_reglas_plantilla,
+    agregar_reglas_retail,
     agregar_reglas_salud,
     aplicar_dominios_activos,
     construir_grafo_conocimiento,
@@ -72,6 +73,7 @@ __all__ = [
     "agregar_reglas_finanzas",
     "agregar_reglas_economia",
     "agregar_reglas_ocupacional",
+    "agregar_reglas_retail",
     "agregar_reglas_plantilla",
     "DOMINIOS",
     "aplicar_dominios_activos",

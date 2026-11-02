@@ -47,7 +47,7 @@ def test_por_defecto_ningun_dominio():
 
 
 def test_registro_de_dominios():
-    assert set(dp.DOMINIOS) == {"salud", "finanzas", "economia", "ocupacional"}
+    assert set(dp.DOMINIOS) == {"salud", "finanzas", "economia", "ocupacional", "retail"}
     assert dp.DOMINIOS["salud"] is dp.agregar_reglas_salud
     # La plantilla está documentada pero no registrada
     assert dp.agregar_reglas_plantilla not in dp.DOMINIOS.values()
@@ -58,6 +58,7 @@ def test_cada_dominio_agrega_solo_sus_nodos():
     representativos = {
         "salud": "Variable_Clinica_Fecha", "finanzas": "Variable_Financiera_Tasa",
         "economia": "Variable_Economica_Indicador", "ocupacional": "Exposicion_Limite_Excedido",
+        "retail": "Numeros_En_Palabras",
     }
     vistos = {nombre: _nodos_de(dp.DOMINIOS[nombre]) for nombre in representativos}
     for nombre, (nodos, aristas) in vistos.items():

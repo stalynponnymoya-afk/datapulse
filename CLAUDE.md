@@ -42,7 +42,7 @@ se pueden cambiar después de importar (`dp.OPCION = ...`) y antes de llamar a `
 | `CONTEXTO_DATASET` | `""` | Texto libre que describe el dataset; se añade al prompt de diagnóstico. Si está vacío se usa la variable de entorno `DATAPULSE_CONTEXTO`. |
 | `DECISIONES_NEGATIVOS` | `{}` | `{"columna": "validos" \| "invalidos"}`: reemplaza la decisión del LLM sobre los negativos de esa columna (fuente `usuario`). |
 | `MODO_SALIDA` | `"bi"` | `"bi"` (análisis/BI) o `"ml"` (modelos). `consultar_grafo` omite las reglas cuyo `modo` no coincide; las reglas sin `modo` se aplican en ambos. |
-| `DOMINIOS_ACTIVOS` | `[]` | Dominios de reglas que se agregan al grafo (`salud`, `finanzas`, `economia`, `ocupacional`, o uno propio registrado). Solo sus tipos y problemas aparecen en el vocabulario del diagnóstico. |
+| `DOMINIOS_ACTIVOS` | `[]` | Dominios de reglas que se agregan al grafo (`salud`, `finanzas`, `economia`, `ocupacional`, `retail` —demo con valores de ejemplo— o uno propio registrado). Solo sus tipos y problemas aparecen en el vocabulario del diagnóstico. |
 
 Las claves (`ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `OPENHANDS_API_KEY`, `GITHUB_TOKEN`) y
 `GITHUB_USERNAME`/`GITHUB_REPO` se leen de los Secrets de Colab o de variables de entorno; nunca

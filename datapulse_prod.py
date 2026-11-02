@@ -143,7 +143,8 @@ GITHUB_DATA_FILE   = ""          # ← ESCRIBE AQUÍ EL NOMBRE DE TU ARCHIVO
 GITHUB_DATA_BRANCH = "main"      # rama donde vive el archivo (normalmente "main")
 
 # Dominios de reglas que se agregan al grafo de conocimiento (ver DOMINIOS):
-# "salud", "finanzas", "economia", "ocupacional" o uno propio registrado. Vacía
+# "salud", "finanzas", "economia", "ocupacional", "retail" (demo con valores de
+# ejemplo) o uno propio registrado. Vacía
 # por defecto: solo las reglas base; solo los tipos y problemas de los
 # dominios activos aparecen en el vocabulario del diagnóstico.
 DOMINIOS_ACTIVOS: List[str] = []
@@ -1988,21 +1989,115 @@ def agregar_reglas_ocupacional(kg):
     return kg
 
 
+def agregar_reglas_retail(kg):
+    """
+    Dominio DEMO de retail (ventas de una tienda). No está activo por defecto:
+    actívalo con DOMINIOS_ACTIVOS = ["retail"].
+
+    Los valores de negocio de abajo son VALORES DE EJEMPLO, no decisiones
+    definitivas. Cada regla los recibe como parámetros explícitos de su arista
+    (es lo que lee el ejecutor), así que para cambiarlos basta con editar los
+    diccionarios del inicio de esta función. Las reglas cuelgan de los tipos
+    de variable existentes: las demás reglas de esas columnas (mayúsculas,
+    nulos, tipos mixtos...) siguen aplicándose.
+    """
+    # ── VALORES DE EJEMPLO: ajústalos a tu negocio ──────────────────────
+    # Satisfacción: etiqueta de texto → valor de la escala numérica (1–5).
+    etiquetas_satisfaccion = {"excelente": 5, "muy bueno": 4}
+    # Método de pago: valor ambiguo → categoría propia.
+    reemplazos_metodo_pago = {"TARJETA": "Tarjeta sin especificar"}
+    # Números escritos en palabras → número (ampliable: añade las palabras que uses).
+    numeros_en_palabras = {"tres": 3, "veinte": 20, "treinta": 30}
+    # Total de la compra: se recalcula como el producto de los factores.
+    columna_total = "Total_Compra"
+    factores_total = ["Cantidad_Articulos", "Precio_Unitario"]
+    # ────────────────────────────────────────────────────────────────────
+
+    _agregar_nodos_dominio(kg, ["Satisfaccion_Con_Etiquetas_Texto", "Metodo_Pago_Ambiguo",
+                                "Numeros_En_Palabras", "Total_Compra_Inconsistente"], [])
+    ejemplo_es = "Valor de ejemplo: ajústalo a tu negocio."
+    ejemplo_en = "Example value: adjust it to your business."
+
+    # Satisfacción: la escala puede diagnosticarse como ordinal o como discreta
+    for tipo in ("Variable_Categorica_Ordinal", "Variable_Numerica_Discreta"):
+        kg.add_edge(tipo, "Satisfaccion_Con_Etiquetas_Texto",
+            accion="mapear_etiquetas_satisfaccion_a_numero",
+            parametros={"mapeo": dict(etiquetas_satisfaccion),
+                        "ignorar_mayusculas_y_espacios": True,
+                        "valores_numericos": "sin_cambios"},
+            confianza=0.90,
+            justificacion_es="La satisfacción es una escala numérica: cada etiqueta de texto se "
+                             "traduce al número indicado en 'mapeo'. " + ejemplo_es,
+            justificacion_en="Satisfaction is a numeric scale: each text label is translated to "
+                             "the number given in 'mapeo'. " + ejemplo_en)
+
+    kg.add_edge("Variable_Categorica_Nominal", "Metodo_Pago_Ambiguo",
+        accion="reemplazar_categoria_ambigua",
+        parametros={"reemplazos": dict(reemplazos_metodo_pago),
+                    "coincidir_valor_completo": True,
+                    "ignorar_mayusculas_y_espacios": True},
+        confianza=0.90,
+        justificacion_es="Un método de pago que no dice cuál es (p. ej. 'TARJETA' sin crédito ni "
+                         "débito) no se asigna a otra categoría: pasa a la categoría propia de "
+                         "'reemplazos'. " + ejemplo_es,
+        justificacion_en="A payment method that does not say which one it is (e.g. 'TARJETA' "
+                         "without credit or debit) is not assigned to another category: it goes "
+                         "to its own category from 'reemplazos'. " + ejemplo_en)
+
+    for tipo in ("Variable_Numerica_Continua", "Variable_Numerica_Discreta", "Variable_Financiera"):
+        kg.add_edge(tipo, "Numeros_En_Palabras",
+            accion="convertir_numeros_en_palabras",
+            parametros={"palabras": dict(numeros_en_palabras),
+                        "ignorar_mayusculas_y_espacios": True,
+                        "palabras_no_listadas": "sin_cambios",
+                        "aplicar_antes_de": ["to_numeric_coerce", "pd_to_numeric_coerce"]},
+            confianza=0.90,
+            justificacion_es="Los números escritos en palabras se convierten con la tabla "
+                             "'palabras' antes de pasar la columna a número, para no perderlos "
+                             "como NaN. " + ejemplo_es,
+            justificacion_en="Numbers written in words are converted with the 'palabras' table "
+                             "before the column is made numeric, so they are not lost as NaN. "
+                             + ejemplo_en)
+
+    # El total puede diagnosticarse como financiero o como continua
+    for tipo in ("Variable_Financiera", "Variable_Numerica_Continua"):
+        kg.add_edge(tipo, "Total_Compra_Inconsistente",
+            accion="recalcular_total_y_marcar",
+            parametros={"columna_total": columna_total,
+                        "factores": list(factores_total),
+                        "operacion": "multiplicar",
+                        "redondeo": 2,
+                        "tolerancia": 0.01,
+                        "flag_suffix": "_recalculado",
+                        "marcar_solo_filas_que_cambian": True,
+                        "si_falta_un_factor": "conservar_original",
+                        "aplicar_despues_de": ["convertir_numeros_en_palabras"]},
+            confianza=0.88,
+            justificacion_es="El total se recalcula como el producto de 'factores' y las filas "
+                             "cuyo valor cambia se marcan con el flag. " + ejemplo_es,
+            justificacion_en="The total is recomputed as the product of 'factores' and the rows "
+                             "whose value changes are flagged. " + ejemplo_en)
+
+    return kg
+
+
 # Registro de dominios: nombre → función que agrega sus reglas al grafo.
 # Para un dominio propio, copia agregar_reglas_plantilla y regístralo aquí.
+# "retail" es un dominio de demostración con valores de ejemplo.
 DOMINIOS: Dict[str, Any] = {
     "salud": agregar_reglas_salud,
     "finanzas": agregar_reglas_finanzas,
     "economia": agregar_reglas_economia,
     "ocupacional": agregar_reglas_ocupacional,
+    "retail": agregar_reglas_retail,
 }
 
 
 def agregar_reglas_dominio(kg, dominios: Optional[List[str]] = None):
     """
     Agrega al grafo las reglas de los dominios indicados (sus nodos, tipos y
-    problemas). Sin argumentos agrega TODOS los dominios registrados, igual que
-    antes (salud, finanzas, economía y ocupacional).
+    problemas). Sin argumentos agrega TODOS los dominios registrados (salud,
+    finanzas, economía, ocupacional y la demo de retail).
     Llamar después de construir_grafo_conocimiento().
     """
     nombres = list(DOMINIOS) if dominios is None else [str(d).strip().lower() for d in dominios]
@@ -2155,6 +2250,10 @@ PROBLEMA_MAP_DOMINIO = {
     "rango_ocupacional_invalido":      "Rango_Ocupacional_Invalido",
     "exposicion_limite_excedido":      "Exposicion_Limite_Excedido",
     "sobre_limite":                    "Exposicion_Limite_Excedido",
+    # Retail (demo)
+    "etiquetas_texto_en_escala":       "Satisfaccion_Con_Etiquetas_Texto",
+    "numero_en_palabras":              "Numeros_En_Palabras",
+    "total_inconsistente":             "Total_Compra_Inconsistente",
 }
 
 KNOWLEDGE_GRAPH = agregar_reglas_dominio(KNOWLEDGE_GRAPH, DOMINIOS_ACTIVOS)
