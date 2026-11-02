@@ -22,7 +22,7 @@ DataPulse combines four technologies in a single orchestrated pipeline:
 |---|---|---|
 | **Orchestrator** | LangGraph | State machine with 7 nodes, conditional retry logic |
 | **Reasoning** | Claude Sonnet 5.5 (Anthropic) by default; Groq-hosted LLM as fallback | Diagnoses column types, detects problems, reads the Knowledge Graph decisions and writes the cleaning brief that OpenHands receives |
-| **Decision Rules** | NetworkX (Knowledge Graph) | 142 rules: 116 base statistical/structural rules + 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) |
+| **Decision Rules** | NetworkX (Knowledge Graph) | Base statistical/structural rules valid for any dataset + optional domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA) enabled with `DOMINIOS_ACTIVOS`; a rule can be limited to one output mode (`bi` or `ml`) |
 | **Autonomous Agent** | OpenHands Cloud API | Writes, executes, and validates the cleaning code autonomously |
 
 ### Pipeline Architecture
@@ -60,7 +60,7 @@ node): see `informe_final.md` below.
 
 ### Knowledge Graph
 
-The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **142 rules (edges)**: 116 base statistical/structural rules organized in 6 categories, plus 26 deterministic domain rules (Health/WHO-AHA, Finance/IFRS, Economics/IMF, Occupational Safety/OSHA). The 116 base rules are the 106 original ones plus 3 `Negativos_Inciertos` rules (`flag_sin_modificar`: flag without changing values) and 7 `Valores_Centinela` rules added in phase 1: `reemplazar_centinela_por_nan` for numeric/financial columns, `replace_to_na` for categorical and text columns (same string list as the empty-string rule), and `marcar_fecha_centinela` for dates, which only **flags** the sentinel dates listed in `DATAPULSE_FECHAS_CENTINELA` (empty by default) and never imputes them:
+The Knowledge Graph is a `MultiDiGraph` (NetworkX) whose rules (edges) are the base statistical/structural rules, organized in 6 categories, plus the rules of the domains listed in `DOMINIOS_ACTIVOS` (none by default; available: `salud`, `finanzas`, `economia`, `ocupacional`). The number of rules is not fixed: it is whatever you configure for your line of business. The base includes the `Negativos_Inciertos` rules (`flag_sin_modificar`: flag without changing values) and the `Valores_Centinela` rules: `reemplazar_centinela_por_nan` for numeric/financial columns, `replace_to_na` for categorical and text columns (same string list as the empty-string rule), and `marcar_fecha_centinela` for dates, which only **flags** the sentinel dates listed in `DATAPULSE_FECHAS_CENTINELA` (empty by default) and never imputes them:
 
 1. **Structural Integrity** — duplicates, empty rows/columns, column name normalization
 2. **String Cleaning** — whitespace, line breaks, case normalization, email/phone validation
@@ -69,7 +69,7 @@ The Knowledge Graph is a `MultiDiGraph` (NetworkX) with **142 rules (edges)**: 1
 5. **Outlier Detection** — winsorization, Isolation Forest, Local Outlier Factor
 6. **Scaling & Encoding** — MinMax, Standard, Robust scaling, OneHot/Ordinal encoding
 
-Each rule contains: action, confidence score (between 0.78 and 1.0), parameters, and bilingual justification.
+Each rule contains: action, confidence (0–1), parameters, bilingual justification and, optionally, an output mode (`modo`).
 
 The rules live only in `datapulse_prod.py` (`construir_grafo_conocimiento()` and `agregar_reglas_dominio()`). The labels the LLM can use in its diagnosis are generated from the graph itself (every node is offered, with its aliases or its own name), so any rule added there is reachable without touching prompts. Graph actions reach the plan unchanged (action, parameters and confidence); the only adjustment is for skewed variables: if |skewness| > 1 and the action is `fillna_mean`, `fillna_median` is used and noted in the justification. When the graph has no rule for a specific case, the decision falls back to the LLM with a maximum confidence of 0.70 (`fuente_decision: "llm_fallback"`); whatever the LLM does not resolve is listed in the final report.
 
@@ -86,6 +86,98 @@ the `DATAPULSE_CONTEXTO` environment variable) adds free-text context to the dia
 is kept as a cross-check, and any mismatch goes to the final report and `audit_log.json`, never to
 the error history. Without a diagnosis (API, command line) the list is used as before.
 
+### How to Edit Your Graph
+
+Cleaning quality depends on the graph configured for each line of business; the pipeline (7
+nodes) does not change. A test dataset measures that the architecture works, not that it cleans
+perfectly.
+
+**Where the rules are.** Only in `datapulse_prod.py`: `construir_grafo_conocimiento()` holds the
+base rules (valid for any business) and each domain has its own function
+`agregar_reglas_<domain>(kg)`, registered in `DOMINIOS`. `src/knowledge_graph.py` only re-exports
+them: do not add rules there.
+
+**Edge format.** Each rule is an edge from a variable-type node to a problem node:
+
+```python
+kg.add_edge("Variable_Numerica_Continua", "Outlier_Severo",
+    accion="flag_outlier_no_remove",      # explicit name (see below)
+    modo="bi",                             # optional: "bi" | "ml"; omitted = both modes
+    confianza=0.85,                        # 0–1; the highest wins for the same type and problem
+    parametros={"strategy": "flag_no_remove", "flag_suffix": "_outlier"},
+    justificacion_es="Para BI el valor real se conserva: se marca, no se recorta.",
+    justificacion_en="For BI the real value is kept: it is flagged, not capped.")
+```
+
+Structural problems that do not depend on the type (duplicates, empty rows…) hang from the
+`Esquema_General` node. A new node needs no alias: the diagnosis vocabulary is generated from the
+graph and the LLM can use the node name in lower case (`Mi_Problema` → `mi_problema`). Aliases in
+`TIPO_MAP` / `PROBLEMA_MAP` are optional and only resolve when their node is in the current graph.
+
+**The `modo` attribute.** `MODO_SALIDA` (`"bi"` by default) decides which rules apply:
+`consultar_grafo` skips edges whose `modo` differs, and edges without `modo` apply in both modes.
+Mark with `modo="ml"` every rule that encodes, scales, transforms the distribution, reduces
+dimensions or caps real values. If every rule for a problem belongs to the other mode, the problem
+is recorded as `omitido_por_modo` (state, brief, `audit_log.json` and final report) and is **not**
+sent to the LLM fallback.
+
+**Create and activate a domain.**
+
+1. Copy `agregar_reglas_plantilla(kg)` as `agregar_reglas_<domain>(kg)` in `datapulse_prod.py`.
+2. Declare its new nodes with `_agregar_nodos_dominio(kg, problemas, tipos)` and add its rules
+   (they may also hang from existing nodes such as `Variable_Numerica_Continua`).
+3. Register it: `DOMINIOS["<domain>"] = agregar_reglas_<domain>`.
+4. Activate it in the configuration block: `DOMINIOS_ACTIVOS = ["<domain>"]` (in Colab:
+   `dp.DOMINIOS_ACTIVOS = ["<domain>"]` before `run_datapulse`). Only the types and problems of
+   active domains appear in the diagnosis vocabulary.
+
+**Name actions explicitly.** No table maps action names to functions: the executor (OpenHands or
+the local LLM) reads the action and its parameters as text and writes the code from them. Use a
+name that says what to do (`reemplazar_centinela_por_nan`, not `limpiar`) and put every value in
+`parametros` (sentinels, mappings, thresholds, flag suffix).
+
+**Validation.** `validar_grafo` runs when the graph is built, when domains are added and at the
+start of `run_datapulse`. It fails with a message naming the edge (origin → destination, key and
+action) and the attribute: non-empty `accion`, `confianza` between 0 and 1, `parametros` as a
+dict, non-empty `justificacion_es` / `justificacion_en`, `modo` equal to `"bi"` or `"ml"` if
+present, and no node without edges. The tests do not depend on how many rules there are: editing
+the graph with this format does not break them.
+
+**Hot testing in Colab.** Set `DOMINIOS_ACTIVOS` first (changing it rebuilds the graph and
+discards hot edits), then add the rule and check which action the graph chooses, without calling
+any LLM:
+
+```python
+import datapulse_prod as dp
+dp.kg.add_edge("Variable_Categorica_Nominal", "Codigo_Region_Inconsistente",
+    accion="str_upper_y_strip", confianza=0.9, parametros={"strip": True},
+    justificacion_es="Códigos de región en mayúsculas y sin espacios.",
+    justificacion_en="Region codes in upper case and without spaces.")
+dp.validar_grafo(dp.kg)   # if something is wrong, says which edge and which attribute
+dp.node_consultar_grafo({"diagnostico": {"region": {
+    "tipo_inferido": "categorica_nominal", "problemas": ["codigo_region_inconsistente"]}}})
+```
+
+**What happens without a rule.** If the graph has no rule for the (type, problem) pair, the
+planner (LLM) proposes a fallback action with confidence ≤ 0.70 and
+`fuente_decision: "llm_fallback"`; whatever it does not resolve appears under "Problems without a
+rule" in the final report. If rules exist but all belong to the other output mode, the problem is
+`omitido_por_modo` and does not go to the fallback; in `bi` mode, fallback actions that encode,
+scale or transform the distribution (e.g. `np_log1p`) are discarded as well.
+
+### LLM Calls per Run
+
+| Step | LLM calls |
+|---|---|
+| `diagnosticar` | 1 (+1 if the reply misses columns: the retry asks only for those) |
+| `planificar` | 1 (0 if there is nothing to plan) |
+| `ejecutar`, local mode | 1 per attempt (the LLM writes the script) |
+| `ejecutar`, OpenHands mode | 0 (OpenHands uses its own model) |
+
+Local mode: 2 + number of attempts (+1 if diagnosis columns were missing); for example, 3
+attempts → 5 calls (6). OpenHands mode: 2 (3). Automatic SDK retries on network errors are not
+counted.
+
 ### What It Produces
 
 | File | Description |
@@ -100,6 +192,8 @@ the error history. Without a diagnosis (API, command line) the list is used as b
 > `eda_report.html` is **not implemented** yet: earlier versions of this README listed it, but the pipeline does not generate it.
 
 ### Example Output
+
+Run in `ml` mode (in the default `bi` mode there is no one-hot encoding step and outliers are flagged, not capped):
 
 ```
 [1/7] Removing duplicates...        → 0 removed
@@ -157,7 +251,11 @@ The score that decides the commit is **not** the one written by the generated sc
 - `score_reportado`: what the script wrote in `quality_report.json` (informative only).
 
 If there is no `processed_data.csv` to read, the attempt ends as `sin_validar` and **nothing is
-committed**. It is retried only when the file should have existed and did not appear (the script
+committed**. The score is measured **only on the original columns**: new columns (flags,
+dummies) are listed in the report but not evaluated, and removed original columns are listed too.
+Committing requires `score_despues >= DATAPULSE_MIN_SCORE_PASS` **and**
+`score_despues >= score_antes`: a worse score is retried like a low one and, if it is still worse
+when the attempts run out, the run ends without commit and the report says so. It is retried only when the file should have existed and did not appear (the script
 did not write it, or the agent did not commit it); if the results could not be read at all,
 retrying would not help and the run stops. A `processed_data.csv` that exists but is not a valid
 dataset (empty, unreadable) counts as a validated failure with score 0. When the score is below `DATAPULSE_MIN_SCORE_PASS`, a summary of the residual-problems table
@@ -171,6 +269,7 @@ Attempt limits are **total attempts**, the first one included:
 | Infrastructure failure (`error`, `timeout`, `stuck`, `stopped`) or the script crashed | `error`… | 2 (`OH_MAX_INTENTOS_INFRA`) |
 | Score below the threshold, or `processed_data.csv` should have existed and did not appear | `finished` / `sin_validar` | 3 (`OH_MAX_INTENTOS_SCORE`) |
 | Results could not be read (`sin_validar` with nothing to expect) | `sin_validar` | 1 (no retry) |
+| The validator itself failed while measuring | `error_validador` | 1 (no retry, no commit; the report says which attempt) |
 | Configuration or policy rejection (missing user/repo, data upload not allowed, results not readable) | `rechazado` | 1 (no retry, no sandbox) |
 
 ### Environment Variables
@@ -198,6 +297,16 @@ Attempt limits are **total attempts**, the first one included:
 > variables). The other `DATAPULSE_*` options are environment variables only (`os.environ[...]` in a
 > cell before importing). No key is ever stored in the repository or printed: on import DataPulse
 > only shows where each value came from.
+
+Options in the configuration block of `datapulse_prod.py` (next to `GITHUB_DATA_FILE`). In Colab
+they can be changed after importing (`dp.OPTION = ...`) and before calling `run_datapulse`:
+
+| Option | Default | Purpose |
+|---|---|---|
+| `CONTEXTO_DATASET` | `""` | Free-text description of the dataset, added to the diagnosis prompt (empty: `DATAPULSE_CONTEXTO`) |
+| `DECISIONES_NEGATIVOS` | `{}` | `{"column": "validos" \| "invalidos"}`: overrides the LLM decision on that column's negatives |
+| `MODO_SALIDA` | `"bi"` | `"bi"` (analysis/BI) or `"ml"` (models): rules whose `modo` differs are skipped |
+| `DOMINIOS_ACTIVOS` | `[]` | Domains whose rules are added to the graph (`salud`, `finanzas`, `economia`, `ocupacional` or your own) |
 
 ### Data Privacy
 
@@ -247,7 +356,8 @@ first, then environment variable — so a missing secret does not disable the ot
    %cd datapulse
    !pip install -q -r requirements.txt
    ```
-   If pip upgrades pandas/numpy, restart the session when Colab asks and run `%cd datapulse` again.
+   Restart the session after installing and run `%cd /content/datapulse` again (see
+   [Testing in Colab](#testing-in-colab)).
 2. Run DataPulse **by importing it in the notebook** (not with `!python datapulse_prod.py`: Colab
    Secrets are not available in a separate process). On import it prints where each value came
    from and which mode will be used, without showing any key:
@@ -261,6 +371,42 @@ first, then environment variable — so a missing secret does not disable the ot
    from google.colab import files
    files.download(estado["ruta_processed"])
    ```
+
+#### Testing in Colab
+
+To test a new version, clone it from scratch: an old copy or modules already loaded in memory
+cause errors that look like bugs in the code.
+
+```python
+%cd /content
+!rm -rf datapulse
+!git clone -b main https://github.com/<your_user>/datapulse.git   # -b: the branch to test
+%cd datapulse
+!pip install -q -r requirements.txt
+```
+
+- pip may print `ERROR: pip's dependency resolver does not currently take into account…` saying
+  that `google-colab` requires other versions of pandas, requests, etc. These warnings are
+  expected and do not affect DataPulse.
+- **Restart the session after installing** (Runtime → Restart session), even if Colab does not
+  ask, then go back to the folder and check that the new version is the one loaded:
+
+```python
+%cd /content/datapulse
+import datapulse_prod as dp
+assert hasattr(dp, "DECISIONES_NEGATIVOS"), "Old version in memory: clone again and restart the session"
+```
+
+- Configure and run (options in the table under [Environment Variables](#environment-variables)):
+
+```python
+dp.MODO_SALIDA = "bi"              # or "ml"
+dp.DOMINIOS_ACTIVOS = []           # e.g. ["salud"]
+dp.CONTEXTO_DATASET = "Retail store sales, one row per purchase"
+dp.DECISIONES_NEGATIVOS = {}       # e.g. {"Temperature": "validos"}
+estado = dp.run_datapulse("/content/my_data.xlsx")
+dp._print_results(estado)
+```
 
 #### Option B: Local Execution (Standard Python Environment)
 1. Clone the repository and install the dependencies:
@@ -302,7 +448,7 @@ first, then environment variable — so a missing secret does not disable the ot
 
 ### Limitations
 
-- Knowledge Graph covers common statistical cases. Domain-specific datasets (medical, regulated financial) may fall back to LLM decisions with lower confidence
+- The base Knowledge Graph covers common statistical cases. For domain-specific datasets, activate or write a domain (`DOMINIOS_ACTIVOS`); otherwise those problems fall back to LLM decisions with lower confidence
 - OpenHands execution takes 1-5 minutes per run
 - GitHub API has a 100MB file size limit
 - LLM rate limits depend on the Groq model you select via `GROQ_MODEL` and your plan tier
@@ -340,7 +486,7 @@ DataPulse combina cuatro tecnologías en un pipeline orquestado:
 |---|---|---|
 | **Orquestador** | LangGraph | Máquina de estados con 7 nodos y lógica de retry condicional |
 | **Razonamiento** | Claude Sonnet 5.5 (Anthropic) por defecto; LLM alojado en Groq como respaldo | Diagnostica tipos de columnas, detecta problemas, lee las decisiones del Grafo de Conocimiento y redacta el brief de limpieza que recibe OpenHands |
-| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | 142 reglas: 116 reglas estadísticas/estructurales base + 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) |
+| **Reglas de Decisión** | NetworkX (Grafo de Conocimiento) | Reglas estadísticas/estructurales base válidas para cualquier dataset + reglas de dominio opcionales (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA) que se activan con `DOMINIOS_ACTIVOS`; una regla puede limitarse a un modo de salida (`bi` o `ml`) |
 | **Agente Autónomo** | OpenHands Cloud API | Escribe, ejecuta y valida el código de limpieza de forma autónoma |
 
 ### Arquitectura del Pipeline
@@ -378,7 +524,7 @@ un nodo): ver `informe_final.md` más abajo.
 
 ### Grafo de Conocimiento
 
-El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **142 reglas (aristas)**: 116 reglas estadísticas/estructurales base organizadas en 6 categorías, más 26 reglas deterministas de dominio (Salud/OMS-AHA, Finanzas/IFRS, Economía/FMI, Seguridad Ocupacional/OSHA). Las 116 base son las 106 originales más 3 reglas de `Negativos_Inciertos` (`flag_sin_modificar`: marca sin cambiar valores) y 7 reglas de `Valores_Centinela` añadidas en la fase 1: `reemplazar_centinela_por_nan` en columnas numéricas y financieras, `replace_to_na` en categóricas y texto (con la misma lista de cadenas que la regla de cadenas vacías) y `marcar_fecha_centinela` en fechas, que solo **marca con un flag** las fechas centinela definidas en `DATAPULSE_FECHAS_CENTINELA` (vacía por defecto) y nunca las imputa:
+El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) cuyas reglas (aristas) son las reglas estadísticas/estructurales base, organizadas en 6 categorías, más las de los dominios listados en `DOMINIOS_ACTIVOS` (ninguno por defecto; disponibles: `salud`, `finanzas`, `economia`, `ocupacional`). El número de reglas no es fijo: es el que configures para tu giro de negocio. La base incluye las reglas de `Negativos_Inciertos` (`flag_sin_modificar`: marca sin cambiar valores) y las de `Valores_Centinela`: `reemplazar_centinela_por_nan` en columnas numéricas y financieras, `replace_to_na` en categóricas y texto (con la misma lista de cadenas que la regla de cadenas vacías) y `marcar_fecha_centinela` en fechas, que solo **marca con un flag** las fechas centinela definidas en `DATAPULSE_FECHAS_CENTINELA` (vacía por defecto) y nunca las imputa:
 
 1. **Integridad Estructural** — duplicados, filas/columnas vacías, normalización de nombres
 2. **Limpieza de Texto** — espacios, saltos de línea, normalización de caja, validación email/teléfono
@@ -387,7 +533,7 @@ El Grafo de Conocimiento es un `MultiDiGraph` (NetworkX) con **142 reglas (arist
 5. **Detección de Outliers** — winsorización, Isolation Forest, Local Outlier Factor
 6. **Escalado y Encoding** — MinMax, Standard, Robust scaling, OneHot/Ordinal encoding
 
-Cada regla contiene: acción, confianza (entre 0,78 y 1,0), parámetros y justificación bilingüe.
+Cada regla contiene: acción, confianza (0–1), parámetros, justificación bilingüe y, opcionalmente, un modo de salida (`modo`).
 
 Las reglas viven solo en `datapulse_prod.py` (`construir_grafo_conocimiento()` y `agregar_reglas_dominio()`). Las etiquetas que el LLM puede usar en el diagnóstico se generan desde el propio grafo (se ofrece cada nodo, con sus alias o su propio nombre), así que cualquier regla que se agregue ahí es alcanzable sin tocar los prompts. Las acciones del grafo llegan al plan sin cambios (acción, parámetros y confianza); el único ajuste es para variables sesgadas: si |skewness| > 1 y la acción es `fillna_mean`, se usa `fillna_median` y se anota en la justificación. Cuando el grafo no tiene regla para un caso específico, la decisión cae al LLM con confianza máxima de 0,70 (`fuente_decision: "llm_fallback"`); lo que el LLM no resuelve aparece en el informe final.
 
@@ -405,6 +551,101 @@ del LLM para esa columna (fuente `usuario`). Con diagnóstico, el analizador sol
 final y a `audit_log.json`, nunca al historial de errores. Sin diagnóstico (API, línea de
 comandos) se usa la lista como antes.
 
+### Cómo Editar tu Grafo
+
+La calidad de la limpieza depende del grafo configurado para cada giro de negocio; el pipeline
+(7 nodos) no cambia. Un dataset de prueba mide que la arquitectura funcione, no que limpie
+perfecto.
+
+**Dónde están las reglas.** Solo en `datapulse_prod.py`: `construir_grafo_conocimiento()` tiene
+las reglas base (válidas para cualquier negocio) y cada dominio tiene su función
+`agregar_reglas_<dominio>(kg)`, registrada en `DOMINIOS`. `src/knowledge_graph.py` solo las
+re-exporta: no agregues reglas ahí.
+
+**Formato de una arista.** Cada regla es una arista de un nodo de tipo de variable a un nodo de
+problema:
+
+```python
+kg.add_edge("Variable_Numerica_Continua", "Outlier_Severo",
+    accion="flag_outlier_no_remove",      # nombre explícito (ver abajo)
+    modo="bi",                             # opcional: "bi" | "ml"; sin modo = ambos modos
+    confianza=0.85,                        # 0–1; gana la mayor para el mismo tipo y problema
+    parametros={"strategy": "flag_no_remove", "flag_suffix": "_outlier"},
+    justificacion_es="Para BI el valor real se conserva: se marca, no se recorta.",
+    justificacion_en="For BI the real value is kept: it is flagged, not capped.")
+```
+
+Los problemas estructurales que no dependen del tipo (duplicados, filas vacías…) cuelgan del nodo
+`Esquema_General`. Un nodo nuevo no necesita alias: el vocabulario del diagnóstico se genera del
+grafo y el LLM puede usar el nombre del nodo en minúsculas (`Mi_Problema` → `mi_problema`). Los
+alias en `TIPO_MAP` / `PROBLEMA_MAP` son opcionales y solo resuelven si su nodo está en el grafo
+vigente.
+
+**El atributo `modo`.** `MODO_SALIDA` (`"bi"` por defecto) decide qué reglas se aplican:
+`consultar_grafo` omite las aristas cuyo `modo` no coincide, y las aristas sin `modo` se aplican en
+ambos. Marca con `modo="ml"` toda regla que codifique, escale, transforme la distribución, reduzca
+dimensiones o recorte valores reales. Si todas las reglas de un problema son del otro modo, el
+problema queda como `omitido_por_modo` (estado, brief, `audit_log.json` e informe final) y **no**
+va al fallback del LLM.
+
+**Crear y activar un dominio.**
+
+1. Copia `agregar_reglas_plantilla(kg)` como `agregar_reglas_<dominio>(kg)` en `datapulse_prod.py`.
+2. Declara sus nodos nuevos con `_agregar_nodos_dominio(kg, problemas, tipos)` y añade sus reglas
+   (también pueden colgar de nodos existentes, como `Variable_Numerica_Continua`).
+3. Regístralo: `DOMINIOS["<dominio>"] = agregar_reglas_<dominio>`.
+4. Actívalo en el bloque de configuración: `DOMINIOS_ACTIVOS = ["<dominio>"]` (en Colab:
+   `dp.DOMINIOS_ACTIVOS = ["<dominio>"]` antes de `run_datapulse`). Solo los tipos y problemas de
+   los dominios activos aparecen en el vocabulario del diagnóstico.
+
+**Nombra las acciones de forma explícita.** No hay una tabla que traduzca nombres de acción a
+funciones: el ejecutor (OpenHands o el LLM local) lee la acción y sus parámetros como texto y
+escribe el código a partir de ellos. Usa un nombre que diga qué hacer
+(`reemplazar_centinela_por_nan`, no `limpiar`) y pon todos los valores en `parametros`
+(centinelas, mapeos, umbrales, sufijo del flag).
+
+**Validación.** `validar_grafo` se ejecuta al construir el grafo, al agregar dominios y al empezar
+`run_datapulse`. Falla con un mensaje que nombra la arista (origen → destino, clave y acción) y el
+atributo: `accion` no vacía, `confianza` entre 0 y 1, `parametros` como dict,
+`justificacion_es` / `justificacion_en` no vacías, `modo` igual a `"bi"` o `"ml"` si existe, y
+ningún nodo sin aristas. Los tests no dependen de cuántas reglas haya: editar el grafo con este
+formato no los rompe.
+
+**Probar en caliente en Colab.** Fija primero `DOMINIOS_ACTIVOS` (cambiarlo reconstruye el grafo y
+descarta las ediciones en caliente); luego agrega la regla y comprueba qué acción elige el grafo,
+sin llamar a ningún LLM:
+
+```python
+import datapulse_prod as dp
+dp.kg.add_edge("Variable_Categorica_Nominal", "Codigo_Region_Inconsistente",
+    accion="str_upper_y_strip", confianza=0.9, parametros={"strip": True},
+    justificacion_es="Códigos de región en mayúsculas y sin espacios.",
+    justificacion_en="Region codes in upper case and without spaces.")
+dp.validar_grafo(dp.kg)   # si algo está mal, dice qué arista y qué atributo
+dp.node_consultar_grafo({"diagnostico": {"region": {
+    "tipo_inferido": "categorica_nominal", "problemas": ["codigo_region_inconsistente"]}}})
+```
+
+**Qué pasa si no hay regla.** Si el grafo no tiene regla para el par (tipo, problema), el
+planificador (LLM) propone una acción de respaldo con confianza ≤ 0,70 y
+`fuente_decision: "llm_fallback"`; lo que no resuelva aparece en "Problemas sin regla" del informe
+final. Si hay reglas pero todas son del otro modo de salida, el problema queda `omitido_por_modo` y
+no va al fallback; en modo `bi` también se descartan las acciones de respaldo que codifican,
+escalan o transforman la distribución (p. ej. `np_log1p`).
+
+### Llamadas al LLM por Ejecución
+
+| Paso | Llamadas al LLM |
+|---|---|
+| `diagnosticar` | 1 (+1 si a la respuesta le faltan columnas: el reintento pide solo esas) |
+| `planificar` | 1 (0 si no hay nada que planificar) |
+| `ejecutar`, modo local | 1 por intento (el LLM escribe el script) |
+| `ejecutar`, modo OpenHands | 0 (OpenHands usa su propio modelo) |
+
+Modo local: 2 + número de intentos (+1 si faltaron columnas en el diagnóstico); por ejemplo,
+3 intentos → 5 llamadas (6). Modo OpenHands: 2 (3). No se cuentan los reintentos automáticos del
+SDK ante errores de red.
+
 ### Qué Produce
 
 | Archivo | Descripción |
@@ -419,6 +660,8 @@ comandos) se usa la lista como antes.
 > `eda_report.html` **no está implementado** todavía: versiones anteriores de este README lo listaban, pero el pipeline no lo genera.
 
 ### Ejemplo de Ejecución
+
+Ejecución en modo `ml` (en el modo `bi` por defecto no hay paso de one-hot encoding y los outliers se marcan, no se recortan):
 
 ```
 [1/7] Removiendo duplicados...       → 0 eliminados
@@ -476,7 +719,11 @@ El score que decide el commit **no** es el que escribe el script generado.
 - `score_reportado`: lo que escribió el script en `quality_report.json` (solo informativo).
 
 Si no hay `processed_data.csv` que leer, el intento termina como `sin_validar` y **no hay
-commit**. Solo se reintenta cuando el archivo debía existir y no apareció (el script no lo escribió
+commit**. El score se mide **solo sobre las columnas originales**: las columnas nuevas (flags,
+dummies) se listan en el informe pero no se evalúan, y también se listan las originales
+eliminadas. El commit exige `score_despues >= DATAPULSE_MIN_SCORE_PASS` **y**
+`score_despues >= score_antes`: si el score empeora se reintenta como un score bajo y, si sigue
+peor al agotar los intentos, termina sin commit y el informe lo indica. Solo se reintenta cuando el archivo debía existir y no apareció (el script no lo escribió
 o el agente no hizo commit de él); si los resultados no se pudieron leer, reintentar no lo arregla
 y la ejecución termina. Un `processed_data.csv` que existe pero no es un dataset válido (vacío,
 ilegible) cuenta como un fallo validado con score 0. Cuando el score queda bajo `DATAPULSE_MIN_SCORE_PASS`, se agrega al historial de errores
@@ -490,6 +737,7 @@ Los límites son **intentos totales**, incluido el primero:
 | Fallo de infraestructura (`error`, `timeout`, `stuck`, `stopped`) o el script falló | `error`… | 2 (`OH_MAX_INTENTOS_INFRA`) |
 | Score bajo el umbral, o `processed_data.csv` debía existir y no apareció | `finished` / `sin_validar` | 3 (`OH_MAX_INTENTOS_SCORE`) |
 | Resultados ilegibles (`sin_validar` sin nada que esperar) | `sin_validar` | 1 (sin reintento) |
+| El propio validador falló al medir | `error_validador` | 1 (sin reintento ni commit; el informe dice en qué intento) |
 | Rechazo por configuración o política (falta usuario/repo, subida de datos no permitida, resultados ilegibles) | `rechazado` | 1 (sin reintento ni sandbox) |
 
 ### Variables de Entorno
@@ -517,6 +765,16 @@ Los límites son **intentos totales**, incluido el primero:
 > prioridad sobre las variables de entorno). Las demás opciones `DATAPULSE_*` son solo variables de
 > entorno (`os.environ[...]` en una celda antes de importar). Ninguna clave se guarda en el repositorio
 > ni se imprime: al importar, DataPulse solo muestra de dónde salió cada valor.
+
+Opciones del bloque de configuración de `datapulse_prod.py` (junto a `GITHUB_DATA_FILE`). En Colab
+se pueden cambiar después de importar (`dp.OPCION = ...`) y antes de llamar a `run_datapulse`:
+
+| Opción | Por defecto | Uso |
+|---|---|---|
+| `CONTEXTO_DATASET` | `""` | Descripción libre del dataset que se añade al prompt de diagnóstico (vacía: `DATAPULSE_CONTEXTO`) |
+| `DECISIONES_NEGATIVOS` | `{}` | `{"columna": "validos" \| "invalidos"}`: reemplaza la decisión del LLM sobre los negativos de esa columna |
+| `MODO_SALIDA` | `"bi"` | `"bi"` (análisis/BI) o `"ml"` (modelos): se omiten las reglas cuyo `modo` no coincide |
+| `DOMINIOS_ACTIVOS` | `[]` | Dominios cuyas reglas se agregan al grafo (`salud`, `finanzas`, `economia`, `ocupacional` o uno propio) |
 
 ### Privacidad de los Datos
 
@@ -567,7 +825,8 @@ secreto de Colab y luego la variable de entorno —, así que un secreto que fal
    %cd datapulse
    !pip install -q -r requirements.txt
    ```
-   Si pip actualiza pandas/numpy, reinicia la sesión cuando Colab lo pida y vuelve a `%cd datapulse`.
+   Reinicia la sesión después de instalar y vuelve a `%cd /content/datapulse` (ver
+   [Probar en Colab](#probar-en-colab)).
 2. Ejecutar DataPulse **importándolo en el notebook** (no con `!python datapulse_prod.py`: los
    Secrets de Colab no están disponibles en un proceso aparte). Al importarlo muestra de dónde salió
    cada valor y qué modo se usará, sin mostrar ninguna clave:
@@ -581,6 +840,42 @@ secreto de Colab y luego la variable de entorno —, así que un secreto que fal
    from google.colab import files
    files.download(estado["ruta_processed"])
    ```
+
+#### Probar en Colab
+
+Para probar una versión nueva, clónala desde cero: una copia vieja o módulos ya cargados en
+memoria provocan errores que parecen fallos del código.
+
+```python
+%cd /content
+!rm -rf datapulse
+!git clone -b main https://github.com/<tu_usuario>/datapulse.git   # -b: la rama que quieres probar
+%cd datapulse
+!pip install -q -r requirements.txt
+```
+
+- pip puede mostrar `ERROR: pip's dependency resolver does not currently take into account…`
+  diciendo que `google-colab` requiere otras versiones de pandas, requests, etc. Esos avisos son
+  esperados y no afectan a DataPulse.
+- **Reinicia la sesión después de instalar** (Entorno de ejecución → Reiniciar sesión), aunque
+  Colab no lo pida; luego vuelve a la carpeta y comprueba que está cargada la versión nueva:
+
+```python
+%cd /content/datapulse
+import datapulse_prod as dp
+assert hasattr(dp, "DECISIONES_NEGATIVOS"), "Versión vieja en memoria: vuelve a clonar y reinicia la sesión"
+```
+
+- Configura y ejecuta (opciones en la tabla de [Variables de Entorno](#variables-de-entorno)):
+
+```python
+dp.MODO_SALIDA = "bi"              # o "ml"
+dp.DOMINIOS_ACTIVOS = []           # p. ej. ["salud"]
+dp.CONTEXTO_DATASET = "Ventas de una tienda minorista, una fila por compra"
+dp.DECISIONES_NEGATIVOS = {}       # p. ej. {"Temperatura": "validos"}
+estado = dp.run_datapulse("/content/mis_datos.xlsx")
+dp._print_results(estado)
+```
 
 #### Opción B: Ejecución Local (Entorno Python Estándar)
 1. Clona el repositorio e instala las dependencias:
@@ -622,7 +917,7 @@ secreto de Colab y luego la variable de entorno —, así que un secreto que fal
 
 ### Limitaciones
 
-- El Grafo de Conocimiento cubre casos estadísticos comunes. Datasets de dominio muy específico (médico, financiero regulado) pueden caer en decisiones del LLM con menor confianza
+- El Grafo de Conocimiento base cubre casos estadísticos comunes. Para datasets de un dominio específico, activa o escribe un dominio (`DOMINIOS_ACTIVOS`); si no, esos problemas caen en decisiones del LLM con menor confianza
 - La ejecución de OpenHands toma 1-5 minutos por corrida
 - GitHub API tiene límite de 100MB por archivo
 - Los límites de tasa del LLM dependen del modelo de Groq que elijas vía `GROQ_MODEL` y de tu plan
