@@ -17,6 +17,7 @@ Contenido expuesto:
 - ``agregar_reglas_plantilla``      — plantilla documentada para un dominio propio
 - ``DOMINIOS``                      — registro nombre → función de dominio
 - ``aplicar_dominios_activos``      — reconstruye el grafo global según DOMINIOS_ACTIVOS
+- ``validar_grafo`` / ``errores_grafo`` / ``GrafoInvalidoError`` — validador del formato
 - ``KNOWLEDGE_GRAPH`` / ``kg``      — grafo construido al importar (base + DOMINIOS_ACTIVOS,
   vacía por defecto). Si cambias ``datapulse_prod.DOMINIOS_ACTIVOS`` usa
   ``datapulse_prod.kg``: estos nombres apuntan al grafo de la importación.
@@ -36,6 +37,7 @@ if _REPO_ROOT not in sys.path:
 
 from datapulse_prod import (  # noqa: E402
     DOMINIOS,
+    GrafoInvalidoError,
     KNOWLEDGE_GRAPH,
     PROBLEMA_MAP,
     PROBLEMA_MAP_DOMINIO,
@@ -51,7 +53,9 @@ from datapulse_prod import (  # noqa: E402
     agregar_reglas_salud,
     aplicar_dominios_activos,
     construir_grafo_conocimiento,
+    errores_grafo,
     kg,
+    validar_grafo,
 )
 
 __all__ = [
@@ -71,5 +75,8 @@ __all__ = [
     "agregar_reglas_plantilla",
     "DOMINIOS",
     "aplicar_dominios_activos",
+    "validar_grafo",
+    "errores_grafo",
+    "GrafoInvalidoError",
     "_map_tipo_problema",
 ]

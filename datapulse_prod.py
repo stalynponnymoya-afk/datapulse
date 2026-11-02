@@ -360,6 +360,72 @@ def _fechas_centinela_config() -> List[str]:
     return fechas
 
 
+# ═══════════════════════════════════════════════════════════════
+# VALIDADOR DEL GRAFO — se ejecuta al construirlo y antes de cada ejecución
+# ═══════════════════════════════════════════════════════════════
+
+MODOS_REGLA = ("bi", "ml")
+
+
+class GrafoInvalidoError(ValueError):
+    """El grafo de conocimiento tiene reglas o nodos que no cumplen el formato."""
+
+
+def _errores_arista(origen, destino, clave, datos: Dict[str, Any]) -> List[str]:
+    """Errores de formato de una arista (vacío si es válida)."""
+    accion = datos.get("accion")
+    nombre = f"arista {origen} → {destino} [clave {clave}]"
+    if isinstance(accion, str) and accion.strip():
+        nombre += f" (accion={accion!r})"
+    errores = []
+    if not isinstance(accion, str) or not accion.strip():
+        errores.append(f"{nombre}: 'accion' debe ser un texto no vacío (valor: {accion!r})")
+    confianza = datos.get("confianza")
+    if (isinstance(confianza, bool) or not isinstance(confianza, (int, float))
+            or not 0 <= confianza <= 1):
+        errores.append(f"{nombre}: 'confianza' debe ser un número entre 0 y 1 "
+                       f"(valor: {confianza!r})")
+    if not isinstance(datos.get("parametros"), dict):
+        errores.append(f"{nombre}: 'parametros' debe ser un dict, aunque sea {{}} "
+                       f"(valor: {datos.get('parametros')!r})")
+    for idioma in ("justificacion_es", "justificacion_en"):
+        texto = datos.get(idioma)
+        if not isinstance(texto, str) or not texto.strip():
+            errores.append(f"{nombre}: '{idioma}' debe ser un texto no vacío (valor: {texto!r})")
+    if "modo" in datos and datos["modo"] not in MODOS_REGLA:
+        errores.append(f"{nombre}: 'modo' debe ser \"bi\" o \"ml\" u omitirse "
+                       f"(valor: {datos['modo']!r})")
+    return errores
+
+
+def errores_grafo(grafo) -> List[str]:
+    """Lista de errores del grafo: aristas mal formadas y nodos sin ninguna arista."""
+    errores = []
+    for origen, destino, clave, datos in grafo.edges(keys=True, data=True):
+        errores += _errores_arista(origen, destino, clave, datos)
+    for nodo in grafo.nodes():
+        if grafo.degree(nodo) == 0:
+            errores.append(f"nodo {nodo!r}: no tiene ninguna arista (añade una regla que lo use "
+                           "o quítalo con kg.remove_node)")
+    return errores
+
+
+def validar_grafo(grafo):
+    """
+    Comprueba que cada arista tenga accion no vacía, confianza en [0, 1],
+    parametros dict, justificacion_es/en no vacías y, si lo trae, modo "bi" o
+    "ml"; y que no haya nodos sin aristas. Devuelve el grafo si es válido; si
+    no, lanza GrafoInvalidoError con todos los errores (qué arista y qué
+    atributo).
+    """
+    errores = errores_grafo(grafo)
+    if errores:
+        raise GrafoInvalidoError(
+            f"Grafo de conocimiento inválido ({len(errores)} error(es)):\n"
+            + "\n".join(f"  - {e}" for e in errores))
+    return grafo
+
+
 def construir_grafo_conocimiento() -> nx.DiGraph:
     """
     Construye el grafo base: reglas estadísticas y estructurales que valen
@@ -1322,7 +1388,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
     # ═══════════════════════════════════════════════════════════
     # FIN REGLAS NUEVAS
     # ═══════════════════════════════════════════════════════════
-    return kg
+    return validar_grafo(kg)
 
 # Instanciamos el grafo globalmente para que el nodo 3 lo pueda usar
 KNOWLEDGE_GRAPH = construir_grafo_conocimiento()
@@ -1953,7 +2019,7 @@ def agregar_reglas_dominio(kg, dominios: Optional[List[str]] = None):
         print("✅ Dominios activos: ninguno (DOMINIOS_ACTIVOS vacía)")
     print(f"   Nodos totales: {kg.number_of_nodes()}")
     print(f"   Edges totales: {kg.number_of_edges()}")
-    return kg
+    return validar_grafo(kg)
 
 
 def agregar_reglas_plantilla(kg):
@@ -1974,6 +2040,8 @@ def agregar_reglas_plantilla(kg):
        (en Colab: dp.DOMINIOS_ACTIVOS = ["<dominio>"] antes de run_datapulse).
     6. Opcional: alias en TIPO_MAP / PROBLEMA_MAP. Sin alias, el LLM usa el
        nombre del nodo en minúsculas (Mi_Problema → "mi_problema").
+    7. Al agregar los dominios, validar_grafo comprueba el formato de cada
+       regla y falla indicando qué arista y qué atributo están mal.
     """
     _agregar_nodos_dominio(kg, ["Mi_Problema"], ["Variable_Mi_Tipo"])
     kg.add_edge("Variable_Mi_Tipo", "Mi_Problema",
@@ -3074,7 +3142,7 @@ def _resolver_etiqueta(etiqueta, mapa: Dict[str, Any], nodos: List[str]) -> Opti
     return next((n for n in nodos if n.lower() == buscada), None)
 
 
-MODOS_SALIDA = ("bi", "ml")
+MODOS_SALIDA = MODOS_REGLA
 ESTADO_OMITIDO_POR_MODO = "omitido_por_modo"
 
 
@@ -4855,6 +4923,7 @@ def run_datapulse(
     if kg is None:
         kg = KNOWLEDGE_GRAPH
     aplicar_dominios_activos()
+    validar_grafo(kg)                     # también las ediciones en caliente (dp.kg.add_edge...)
     modo_salida = modo_salida_vigente()   # falla aquí, antes de llamar al LLM, si no es válido
 
     # Resolver fuente del archivo

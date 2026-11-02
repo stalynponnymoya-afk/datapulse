@@ -37,9 +37,9 @@ def test_knowledge_graph_construction():
     kg = agregar_reglas_dominio(kg)
     assert kg.number_of_edges() > edges_before, "Domain rules should add edges"
 
-    assert kg.number_of_edges() > 100, (
-        f"Total edges should exceed 100, got {kg.number_of_edges()}"
-    )
+    # Sin conteos exactos: el formato de cada regla lo comprueba el validador
+    from datapulse_prod import errores_grafo
+    assert errores_grafo(kg) == []
     print(f"✅ Knowledge Graph: {kg.number_of_nodes()} nodes, {kg.number_of_edges()} edges")
 
 

@@ -83,8 +83,7 @@ def test_grafo_global_es_base_mas_dominios_activos():
     base = dp.construir_grafo_conocimiento()
     assert dp.DOMINIOS_ACTIVOS == []
     assert sorted(dp.kg.edges()) == sorted(base.edges())
-    confianzas = [d["confianza"] for _, _, d in dp.kg.edges(data=True)]
-    assert all(0 <= c <= 1 for c in confianzas)
+    assert dp.errores_grafo(dp.kg) == []
 
 
 def test_centinelas_en_texto_y_categorias_replace_to_na():
