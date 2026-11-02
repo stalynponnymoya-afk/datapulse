@@ -2444,6 +2444,9 @@ Reglas de severidad:
 - null_pct 30-60% O centinela O negativo inesperado → alta
 - null_pct >= 60% O centinelas absurdos O múltiples problemas críticos → critica
 
+FORMATO DE SALIDA (obligatorio):
+Un objeto JSON cuyas claves son EXACTAMENTE los nombres de columna que aparecen en "columnas_info" de la metadata (todas, escritas igual) y cuyo valor es el objeto de diagnóstico de esa columna. No añadas ninguna otra clave: nada de resúmenes, notas generales ni envoltorios como "diagnostico" o "columnas".
+
 Metadata:
 {metadata_json}
 
@@ -2458,12 +2461,72 @@ def construir_prompt_diagnostico(metadata: dict) -> str:
     )
 
 
+_CLAVES_ENVOLTORIO = ("diagnostico", "diagnóstico", "diagnosis", "columnas", "columns",
+                      "diagnostico_por_columna", "resultado", "result")
+_CLAVES_NOMBRE_COLUMNA = ("columna", "column", "nombre_columna", "nombre", "name")
+
+
+def _normalizar_diagnostico(crudo: Any, columnas: List[str]) -> Dict[str, Any]:
+    """
+    Deja el diagnóstico del LLM como {columna_real: {diagnóstico}}.
+
+    El LLM no siempre respeta la forma pedida: a veces añade claves de resumen
+    (texto), envuelve todo en otra clave o devuelve una lista. Se desenvuelve,
+    se convierte la lista y se descarta lo que no sea el diagnóstico (dict) de
+    una columna real, avisando de lo ignorado y de lo que falta.
+    """
+    columnas = [str(c) for c in columnas]
+    reales = set(columnas)
+
+    # Lista de objetos con el nombre de la columna dentro
+    if isinstance(crudo, list):
+        convertido = {}
+        for item in crudo:
+            if isinstance(item, dict):
+                nombre = next((item[k] for k in _CLAVES_NOMBRE_COLUMNA if k in item), None)
+                if nombre is not None:
+                    convertido[str(nombre)] = item
+        crudo = convertido
+    if not isinstance(crudo, dict):
+        raise ValueError("El diagnóstico del LLM no es un objeto JSON por columna.")
+
+    # Envoltorio: ninguna clave es una columna, pero dentro hay columnas
+    if reales and not (reales & set(map(str, crudo))):
+        for clave in _CLAVES_ENVOLTORIO + tuple(crudo):
+            interno = crudo.get(clave)
+            if isinstance(interno, (dict, list)):
+                try:
+                    return _normalizar_diagnostico(interno, columnas)
+                except ValueError:
+                    continue
+
+    normalizado, ignoradas = {}, []
+    for clave, valor in crudo.items():
+        clave = str(clave)
+        if (not reales or clave in reales) and isinstance(valor, dict):
+            normalizado[clave] = valor
+        else:
+            ignoradas.append(clave)
+    if ignoradas:
+        print(f"   ⚠️ Diagnóstico: se ignoran claves que no son el diagnóstico de una columna: {ignoradas}")
+    faltan = [c for c in columnas if c not in normalizado]
+    if faltan:
+        print(f"   ⚠️ Diagnóstico: columnas sin diagnóstico del LLM: {faltan}")
+    if not normalizado:
+        raise ValueError(
+            "El diagnóstico del LLM no contiene ninguna columna del dataset "
+            f"(claves recibidas: {list(map(str, crudo))[:10]})."
+        )
+    return normalizado
+
+
 def node_diagnosticar(state: DataPulseState) -> DataPulseState:
     llm = get_llm()
     prompt = construir_prompt_diagnostico(state["metadata"])
     response = llm.invoke([HumanMessage(content=prompt)])
-    diagnostico = extract_json_from_markdown(response.content)
-    return {"diagnostico": diagnostico}
+    crudo = extract_json_from_markdown(response.content)
+    columnas = list((state.get("metadata") or {}).get("columnas_info", {}))
+    return {"diagnostico": _normalizar_diagnostico(crudo, columnas)}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2539,6 +2602,10 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
     acciones = {}
 
     for col_name, diag in diagnostico.items():
+        if not isinstance(diag, dict):
+            # Defensa: una entrada mal formada no debe tumbar el pipeline
+            print(f"   ⚠️ Se omite '{col_name}': su diagnóstico no es un objeto ({type(diag).__name__}).")
+            continue
         tipo = diag.get("tipo_inferido", "")
         skewness = (columnas_info.get(col_name) or {}).get("skewness")
 
