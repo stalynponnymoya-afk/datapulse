@@ -155,6 +155,10 @@ CONTEXTO_DATASET   = ""
 # Decisiones del usuario sobre negativos por columna: {"columna": "validos" |
 # "invalidos"}. Reemplazan la decisión del LLM para esa columna (fuente "usuario").
 DECISIONES_NEGATIVOS: Dict[str, str] = {}
+# Modo de salida: "bi" (análisis/BI: conserva valores reales y legibles) o "ml"
+# (preparación para modelos). consultar_grafo omite las reglas cuyo atributo
+# modo no coincide; las reglas sin modo se aplican en ambos.
+MODO_SALIDA        = "bi"
 
 # Claves: cada una por separado (secreto de Colab → variable de entorno → vacía)
 GROQ_API_KEY       = _leer_config("GROQ_API_KEY")
@@ -713,6 +717,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Outlier_Severo",
                 accion="scipy_winsorize",
+                modo="ml",
                 confianza=0.86,
                 parametros={"limits": [0.01, 0.01], "inclusive": [True, True]},
                 justificacion_es="La winsorización al percentil 1 y 99 reemplaza outliers por los valores de corte, preservando el tamaño muestral y reduciendo el impacto de colas pesadas sin eliminar registros.",
@@ -720,10 +725,21 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Outlier_Severo",
                 accion="scipy_winsorize",
+                modo="ml",
                 confianza=0.84,
                 parametros={"limits": [0.05, 0.05], "inclusive": [True, True]},
                 justificacion_es="La winsorización al 5-95 es más agresiva, recomendada cuando la distribución subyacente se sabe que tiene colas pesadas (log-normal, Pareto) y el interés está en el cuerpo central.",
                 justificacion_en="The 5-95 winsorization is more aggressive, recommended when the underlying distribution is known to have heavy tails (log-normal, Pareto) and the interest is in the central body.")
+
+    # Modo BI: los valores reales no se recortan; el outlier se marca y se
+    # conserva (mismos parámetros que la regla financiera).
+    kg.add_edge("Variable_Numerica_Continua", "Outlier_Severo",
+                accion="flag_outlier_no_remove",
+                modo="bi",
+                confianza=0.85,
+                parametros={"strategy": "flag_no_remove", "flag_suffix": "_outlier"},
+                justificacion_es="Para análisis/BI el valor real se conserva: el outlier se MARCA con un flag y no se elimina ni se recorta (winsorizar cambia sumas y promedios del reporte).",
+                justificacion_en="For analysis/BI the real value is kept: the outlier is FLAGGED and neither removed nor capped (winsorizing changes report sums and averages).")
 
     kg.add_edge("Variable_Numerica_Continua", "Outlier_Multivariado",
                 accion="sklearn_isolation_forest",
@@ -741,6 +757,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Distribucion_Sesgada_Positiva",
                 accion="scipy_boxcox",
+                modo="ml",
                 confianza=0.78,
                 parametros={"lmbda": None},
                 justificacion_es="La transformación Box-Cox estima el parámetro lambda óptimo para maximizar la normalidad de la distribución, siendo el método paramétrico gold-standard para normalización de colas asimétricas. Requiere valores estrictamente positivos.",
@@ -748,6 +765,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Distribucion_Sesgada_Positiva",
                 accion="sklearn_power_transform_boxcox",
+                modo="ml",
                 confianza=0.80,
                 parametros={"method": "box-cox", "standardize": True},
                 justificacion_es="PowerTransformer con Box-Cox optimiza la normalidad de variables estrictamente positivas, siendo superior a la transformación logarítmica manual porque estima lambda de máxima verosimilitud.",
@@ -755,6 +773,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Distribucion_Sesgada_Rango_Mixto",
                 accion="sklearn_power_transform_yeo_johnson",
+                modo="ml",
                 confianza=0.80,
                 parametros={"method": "yeo-johnson", "standardize": True},
                 justificacion_es="Yeo-Johnson dentro de PowerTransformer maneja rangos mixtos (positivos, negativos, cero), proporcionando una normalización automática sin requerir pre-procesamiento de signo.",
@@ -767,6 +786,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes",
                 accion="sklearn_min_max_scale",
+                modo="ml",
                 confianza=0.92,
                 parametros={"feature_range": [0, 1]},
                 justificacion_es="El escalado Min-Max transforma variables a un rango fijo [0,1], preservando la forma de la distribución y siendo indispensable para algoritmos basados en distancia (KNN, K-Means, SVM, redes neuronales).",
@@ -774,6 +794,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes",
                 accion="sklearn_standard_scale",
+                modo="ml",
                 confianza=0.93,
                 parametros={"with_mean": True, "with_std": True},
                 justificacion_es="La estandarización Z-score (media 0, desviación 1) es requisito para modelos que asumen normalidad multivariada (regresión logística, LDA, Gaussian NB) y mejora la convergencia del gradient descent.",
@@ -781,6 +802,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Outliers_Presentes",
                 accion="sklearn_robust_scale",
+                modo="ml",
                 confianza=0.90,
                 parametros={"with_centering": True, "with_scaling": True, "quantile_range": [25.0, 75.0]},
                 justificacion_es="RobustScaler usa mediana e IQR en lugar de media y desviación estándar, siendo inmune a outliers severos. Es la estrategia de escalado por defecto recomendada cuando no se ha tratado previamente outliers.",
@@ -788,6 +810,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Centrado_Cero",
                 accion="sklearn_max_abs_scale",
+                modo="ml",
                 confianza=0.85,
                 parametros={},
                 justificacion_es="MaxAbsScaler escala por el valor absoluto máximo, preservando el signo y siendo útil para datos ya centrados en cero o sparse matrices donde no se desea introducir nuevos ceros.",
@@ -795,6 +818,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Gaussianas",
                 accion="sklearn_quantile_transform_uniform",
+                modo="ml",
                 confianza=0.82,
                 parametros={"n_quantiles": 1000, "output_distribution": "uniform", "random_state": 42},
                 justificacion_es="La transformación cuantílica a uniforme aplana cualquier distribución a una uniforme en [0,1], eliminando asimetría y colas pesadas. Es no paramétrica y robusta a la forma de la distribución original.",
@@ -802,6 +826,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Gaussianas",
                 accion="sklearn_quantile_transform_normal",
+                modo="ml",
                 confianza=0.81,
                 parametros={"n_quantiles": 1000, "output_distribution": "normal", "random_state": 42},
                 justificacion_es="La transformación cuantílica a normal fuerza una distribución gaussiana independientemente de la forma original, siendo útil cuando el modelo subyacente asume estrictamente normalidad multivariada.",
@@ -809,6 +834,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_LogNormales",
                 accion="sklearn_power_transform_boxcox",
+                modo="ml",
                 confianza=0.80,
                 parametros={"method": "box-cox", "standardize": True},
                 justificacion_es="PowerTransformer con Box-Cox optimiza la normalidad de variables estrictamente positivas, siendo superior a la transformación logarítmica manual porque estima lambda de máxima verosimilitud.",
@@ -816,6 +842,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Escalas_Diferentes_Rango_Mixto",
                 accion="sklearn_power_transform_yeo_johnson",
+                modo="ml",
                 confianza=0.80,
                 parametros={"method": "yeo-johnson", "standardize": True},
                 justificacion_es="Yeo-Johnson dentro de PowerTransformer maneja rangos mixtos (positivos, negativos, cero), proporcionando una normalización automática sin requerir pre-procesamiento de signo.",
@@ -823,6 +850,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Nominal", "Cardinalidad_Baja",
                 accion="pd_get_dummies",
+                modo="ml",
                 confianza=0.95,
                 parametros={"drop_first": True, "dtype": "int"},
                 justificacion_es="One-Hot Encoding con drop_first=True elimina la multicolinealidad perfecta (dummy variable trap) y representa categorías nominales en un espacio euclídeo donde todas las categorías son equidistantes.",
@@ -830,6 +858,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Nominal", "Cardinalidad_Baja",
                 accion="sklearn_one_hot_encode",
+                modo="ml",
                 confianza=0.95,
                 parametros={"drop": "first", "sparse_output": False, "dtype": "int", "handle_unknown": "ignore"},
                 justificacion_es="OneHotEncoder de sklearn ofrece manejo de categorías desconocidas en inferencia (handle_unknown='ignore'), siendo preferible a pandas cuando el pipeline se despliega en producción con datos nuevos.",
@@ -837,6 +866,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Ordinal", "Orden_Jerarquico_Conocido",
                 accion="pd_map",
+                modo="ml",
                 confianza=0.94,
                 parametros={},
                 justificacion_es="La codificación ordinal manual preserva la distancia semántica entre niveles jerárquicos (bajo=1, medio=2, alto=3), permitiendo que modelos lineales capturen la monotonicidad inherente.",
@@ -844,6 +874,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Ordinal", "Orden_Jerarquico_Auto",
                 accion="sklearn_ordinal_encode",
+                modo="ml",
                 confianza=0.85,
                 parametros={"handle_unknown": "use_encoded_value", "unknown_value": -1},
                 justificacion_es="OrdinalEncoder de sklearn asigna automáticamente enteros a categorías ordenadas lexicográficamente, preservando la secuencialidad sin intervención manual y manejando valores desconocidos en producción.",
@@ -851,6 +882,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Continua", "Colinealidad_Alta",
                 accion="sklearn_pca",
+                modo="ml",
                 confianza=0.80,
                 parametros={"n_components": 0.95, "svd_solver": "full"},
                 justificacion_es="PCA transforma variables altamente correlacionadas en componentes ortogonales no correlacionados, eliminando redundancia y reduciendo dimensionalidad mientras retiene el 95% de varianza explicada.",
@@ -894,6 +926,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Nominal", "Ninguno",
         accion="evaluar_encoding_por_cardinalidad",
+        modo="ml",
         parametros={
             "if_low_cardinality": {"max": 15, "action": "onehot_encode"},
             "if_high_cardinality": {"min": 16, "action": "label_encode"},
@@ -904,6 +937,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Ordinal", "Ninguno",
         accion="ordinal_encode",
+        modo="ml",
         parametros={"strategy": "ordinal_encode"},
         confianza=0.85,
         justificacion_es="Ordinal limpia: encoding ordinal preserva relación de orden entre categorías.",
@@ -925,6 +959,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Booleana", "Ninguno",
         accion="mantener_como_int",
+        modo="ml",
         parametros={"map_to": {"True": 1, "False": 0}},
         confianza=0.88,
         justificacion_es="Booleana limpia: convertir a 0/1 para compatibilidad con modelos predictivos.",
@@ -955,6 +990,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Texto_General", "Cardinalidad_Excesiva",
         accion="evaluar_drop_o_hash",
+        modo="ml",
         parametros={"threshold_unique_pct": 80, "strategy": "hash_encode_or_drop"},
         confianza=0.78,
         justificacion_es="Texto con cardinalidad >80%: hash encoding o eliminar. NUNCA OneHot.",
@@ -962,6 +998,7 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Categorica_Nominal", "Cardinalidad_Excesiva",
         accion="label_encode",
+        modo="ml",
         parametros={"strategy": "label_encode", "max_categories": 50},
         confianza=0.82,
         justificacion_es="Categórica nominal con alta cardinalidad: LabelEncode en vez de OneHot.",
@@ -1201,10 +1238,19 @@ def construir_grafo_conocimiento() -> nx.DiGraph:
 
     kg.add_edge("Variable_Numerica_Discreta", "Outlier_Severo",
         accion="scipy_winsorize",
+        modo="ml",
         confianza=0.85,
         parametros={"limits": [0.01, 0.01]},
         justificacion_es="Winsorización al 1-99% controla valores extremos en conteos sin eliminar registros.",
         justificacion_en="1-99% winsorization controls extreme count values without dropping records.")
+
+    kg.add_edge("Variable_Numerica_Discreta", "Outlier_Severo",
+        accion="flag_outlier_no_remove",
+        modo="bi",
+        parametros={"strategy": "flag_no_remove", "flag_suffix": "_outlier"},
+        confianza=0.85,
+        justificacion_es="Para análisis/BI el conteo real se conserva: el outlier se MARCA con un flag y no se elimina ni se recorta.",
+        justificacion_en="For analysis/BI the real count is kept: the outlier is FLAGGED and neither removed nor capped.")
 
     kg.add_edge("Variable_Numerica_Discreta", "Rango_Invalido",
         accion="set_nan_y_flag",
@@ -2087,6 +2133,8 @@ class DataPulseState(TypedDict):
     avisos_diagnostico: List[str]                     # avisos de la normalización del diagnóstico
     respuesta_cruda_diagnostico: Optional[str]        # ruta en outputs/ si hubo avisos
     acciones_grafo: Dict[str, Any]
+    modo_salida: str                                  # "bi" | "ml" (MODO_SALIDA al consultar el grafo)
+    omitidos_por_modo: List[Dict[str, Any]]           # problemas cuyas reglas son todas de otro modo
 
     # Planificación (acciones del grafo + respaldo del LLM)
     plan_acciones: List[Dict[str, Any]]
@@ -3026,6 +3074,23 @@ def _resolver_etiqueta(etiqueta, mapa: Dict[str, Any], nodos: List[str]) -> Opti
     return next((n for n in nodos if n.lower() == buscada), None)
 
 
+MODOS_SALIDA = ("bi", "ml")
+ESTADO_OMITIDO_POR_MODO = "omitido_por_modo"
+
+
+def modo_salida_vigente() -> str:
+    """MODO_SALIDA normalizado ("bi" o "ml"); un valor distinto falla con un mensaje claro."""
+    modo = str(MODO_SALIDA or "").strip().lower()
+    if modo not in MODOS_SALIDA:
+        raise ValueError(f"MODO_SALIDA debe ser 'bi' o 'ml', no {MODO_SALIDA!r}.")
+    return modo
+
+
+def _arista_aplica_en_modo(datos: Dict[str, Any], modo: str) -> bool:
+    """Una regla sin atributo modo vale en ambos modos; con modo, solo en el suyo."""
+    return datos.get("modo") in (None, modo)
+
+
 UMBRAL_SKEWNESS = 1.0
 
 
@@ -3114,7 +3179,9 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
 
     diagnostico = state["diagnostico"]
     columnas_info = (state.get("metadata") or {}).get("columnas_info", {})
+    modo = modo_salida_vigente()
     acciones = {}
+    omitidos = []
 
     for col_name, diag in diagnostico.items():
         if not isinstance(diag, dict):
@@ -3142,6 +3209,7 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
         # Construir lista de acciones: una por cada problema que tenga regla en el grafo
         acciones_col = []
         fallbacks_col = []
+        omitidos_col = []
 
         for problema in problemas_lista:
             _, tgt = _map_tipo_problema(tipo, problema)
@@ -3161,7 +3229,19 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             if not edges_data:
                 fallbacks_col.append(problema)
                 continue
-            best = max(edges_data, key=lambda x: x.get("confianza", 0.0))
+            en_modo = [d for d in edges_data if _arista_aplica_en_modo(d, modo)]
+            if not en_modo:
+                # Hay reglas, pero todas son de otro modo de salida: el problema
+                # se omite a propósito y NO va al fallback del LLM.
+                omitido = {
+                    "columna": col_name, "problema": problema, "modo": modo,
+                    "estado": ESTADO_OMITIDO_POR_MODO,
+                    "acciones_omitidas": sorted({d.get("accion") for d in edges_data}),
+                }
+                omitidos_col.append(omitido)
+                omitidos.append(omitido)
+                continue
+            best = max(en_modo, key=lambda x: x.get("confianza", 0.0))
             accion_col = {
                 "problema": problema,
                 "accion": best.get("accion"),
@@ -3175,7 +3255,7 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             accion_col = _ajustar_por_negativos(accion_col, diag.get("negativos"))
             acciones_col.append(_aplicar_fechas_centinela(accion_col))
 
-        if not acciones_col and not fallbacks_col:
+        if not acciones_col and not fallbacks_col and not omitidos_col:
             # No se encontró ningún problema reconocible
             fallbacks_col.append(problema_principal or "ninguno")
 
@@ -3184,10 +3264,14 @@ def node_consultar_grafo(state: DataPulseState) -> DataPulseState:
             "acciones":           acciones_col,        # lista de acciones del grafo
             "requiere_llm_fallback": len(fallbacks_col) > 0,
             "problemas_fallback": fallbacks_col,       # problemas sin regla en el grafo
+            "omitidos_por_modo":  omitidos_col,        # reglas solo de otro modo de salida
             "diagnostico_original": diag,
         }
 
-    return {"acciones_grafo": acciones}
+    if omitidos:
+        print(f"   🎛️ Modo {modo}: {len(omitidos)} problema(s) omitidos por modo de salida: "
+              f"{[(o['columna'], o['problema']) for o in omitidos]}")
+    return {"acciones_grafo": acciones, "modo_salida": modo, "omitidos_por_modo": omitidos}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3207,8 +3291,9 @@ E) Ordena las acciones por prioridad:
    3. Limpieza de strings (strip, lower, validación formato)
    4. Conversión de tipos
    5. Imputaciones (fillna, interpolate)
-   6. Outliers (winsorize, clip) — SOLO si NO son centinelas
-   7. Encoding / Escalado
+   6. Outliers (winsorize, clip) — SOLO si NO son centinelas y SOLO en modo ml (en bi se marcan con flag)
+   7. Encoding / Escalado — SOLO en modo ml
+F) MODO DE SALIDA: "{modo_salida}". {reglas_modo}
 
 El brief_tecnico debe ser DETALLADO y específico por columna, indicando exactamente:
 - Qué problema tiene cada columna (con valores concretos si se conocen)
@@ -3242,6 +3327,47 @@ Problemas sin regla en el grafo (problemas_fallback):
 Responde SOLO con el JSON. Sin markdown."""
 
 MAX_CONFIANZA_FALLBACK = 0.70
+
+REGLAS_MODO_PROMPT = {
+    "bi": ("La salida es para análisis/BI: conserva los valores reales y legibles. PROHIBIDO "
+           "proponer, en acciones_fallback y en el brief, codificar (one-hot, get_dummies, label, "
+           "ordinal o hash encoding), escalar o normalizar (min-max, z-score, robust), transformar la "
+           "distribución (log, log1p, sqrt, Box-Cox, Yeo-Johnson, cuantiles), reducir dimensiones "
+           "(PCA) o recortar valores reales (winsorize, clip). Los outliers se marcan con un flag y "
+           "no se recortan. Si un problema solo se resuelve con una de esas transformaciones, no "
+           "propongas acción: queda sin acción y se informa."),
+    "ml": ("La salida es para modelos: se permiten encoding, escalado y transformaciones de "
+           "distribución cuando el problema lo requiera."),
+}
+
+# Acciones que codifican, escalan, transforman la distribución, reducen
+# dimensiones o recortan valores reales: en modo "bi" se descartan si el LLM
+# las propone como respaldo. Se comparan por palabra (token) del nombre o de
+# los parámetros strategy/method, y por fragmentos del nombre sin guiones.
+TOKENS_ACCION_ML = {"encode", "encoder", "dummies", "onehot", "log", "log1p", "log2", "log10", "ln",
+                    "logaritmo", "logaritmica", "logaritmico", "sqrt", "pca", "boxcox", "quantile",
+                    "cuantiles", "minmax", "zscore"}
+PREFIJOS_TOKEN_ML = ("scal", "rescal", "escal", "standardiz", "estandariz", "winsor", "clip",
+                     "recort", "codific", "yeo", "johnson")
+FRAGMENTOS_ACCION_ML = ("onehot", "getdummies", "labelencod", "ordinalencod", "hashencod",
+                        "targetencod", "minmax", "zscore", "boxcox", "yeojohnson",
+                        "powertransform", "quantiletransform", "np_log", "log1p")
+
+
+def es_accion_ml(accion: Any, parametros: Any = None) -> bool:
+    """True si la acción (o su strategy/method) es propia del modo "ml"."""
+    textos = [str(accion or "")]
+    if isinstance(parametros, dict):
+        textos += [str(parametros.get(k)) for k in ("strategy", "method", "metodo", "transform")
+                   if parametros.get(k) is not None]
+    for texto in textos:
+        texto = texto.strip().lower()
+        tokens = [t for t in re.split(r"[^a-z0-9]+", texto) if t]
+        compacto = texto.replace("_", "").replace("-", "").replace(" ", "")
+        if (any(t in TOKENS_ACCION_ML or t.startswith(PREFIJOS_TOKEN_ML) for t in tokens)
+                or any(f in compacto or f in texto for f in FRAGMENTOS_ACCION_ML)):
+            return True
+    return False
 
 
 def _acciones_y_sin_regla(acciones_grafo: Dict[str, Any]) -> tuple:
@@ -3285,11 +3411,15 @@ def _ordenar_plan(acciones: List[Dict[str, Any]], orden: Any) -> List[Dict[str, 
     return plan + faltan
 
 
-def _acciones_fallback(propuestas: Any, sin_regla: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _acciones_fallback(propuestas: Any, sin_regla: List[Dict[str, Any]], modo: str = "ml",
+                       descartadas_por_modo: Optional[List[Dict[str, Any]]] = None
+                       ) -> List[Dict[str, Any]]:
     """
     Acciones del LLM para problemas sin regla en el grafo. Solo se aceptan para
     pares (columna, problema) que de verdad no tienen regla; la confianza se
     limita a MAX_CONFIANZA_FALLBACK y la fuente es siempre "llm_fallback".
+    En modo "bi" se descartan las acciones propias de "ml" (es_accion_ml) y se
+    anotan en descartadas_por_modo con estado "omitido_por_modo".
     """
     pendientes = {(p["columna"], p["problema"]) for p in sin_regla}
     aceptadas, usados = [], set()
@@ -3301,6 +3431,17 @@ def _acciones_fallback(propuestas: Any, sin_regla: List[Dict[str, Any]]) -> List
         if par not in pendientes or par in usados or not isinstance(accion, str) or not accion.strip():
             print(f"   ⚠️ Planificador: se descarta la acción del LLM {prop.get('accion')!r} "
                   f"para {par}: solo puede resolver problemas sin regla en el grafo.")
+            continue
+        if modo == "bi" and es_accion_ml(accion, prop.get("parametros")):
+            print(f"   ⚠️ Planificador: se descarta la acción del LLM {accion!r} para {par}: "
+                  "codifica, escala, transforma la distribución o recorta valores y el modo es bi.")
+            usados.add(par)
+            if descartadas_por_modo is not None:
+                descartadas_por_modo.append({
+                    "columna": par[0], "problema": par[1], "modo": modo,
+                    "estado": ESTADO_OMITIDO_POR_MODO, "acciones_omitidas": [accion.strip()],
+                    "origen": "llm_fallback",
+                })
             continue
         try:
             confianza = float(prop.get("confianza", MAX_CONFIANZA_FALLBACK))
@@ -3321,10 +3462,13 @@ def _acciones_fallback(propuestas: Any, sin_regla: List[Dict[str, Any]]) -> List
 
 
 def _seccion_obligatoria(plan: List[Dict[str, Any]], sin_regla: List[Dict[str, Any]],
-                        decisiones_negativos: Optional[Dict[str, Any]] = None) -> str:
+                        decisiones_negativos: Optional[Dict[str, Any]] = None,
+                        modo: Optional[str] = None,
+                        omitidos_por_modo: Optional[List[Dict[str, Any]]] = None) -> str:
     """
     Bloque determinista del brief: las acciones exactas del plan, lo que queda
-    sin regla y qué columnas no pueden ver modificados sus negativos.
+    sin regla, qué columnas no pueden ver modificados sus negativos y el modo
+    de salida con los problemas omitidos por modo.
     """
     acciones = [{k: a[k] for k in ("columna", "problema", "accion", "parametros", "fuente_decision")}
                 for a in plan]
@@ -3340,6 +3484,15 @@ def _seccion_obligatoria(plan: List[Dict[str, Any]], sin_regla: List[Dict[str, A
                   "Ninguna acción puede cambiar, recortar, imputar ni eliminar los valores "
                   "negativos de estas columnas; solo se modifican negativos 'invalidos':\n"
                   + json.dumps(protegidas, ensure_ascii=False, indent=2))
+    if modo:
+        texto += f"\n\n## MODO DE SALIDA: {modo} (obligatorio)\n" + REGLAS_MODO_PROMPT[modo]
+        if modo == "bi":
+            texto += ("\nNo añadas por tu cuenta encoding, escalado, transformaciones de distribución "
+                      "(log, log1p, Box-Cox...), PCA ni recortes de valores reales.")
+    if omitidos_por_modo:
+        texto += ("\n\n## PROBLEMAS OMITIDOS POR MODO DE SALIDA (no tratarlos; se informan)\n"
+                  + json.dumps([{k: o[k] for k in ("columna", "problema", "acciones_omitidas")}
+                                for o in omitidos_por_modo], ensure_ascii=False, indent=2))
     return texto
 
 
@@ -3350,6 +3503,9 @@ def node_planificar(state: DataPulseState) -> DataPulseState:
     El LLM ordena todas las acciones y redacta el brief para OpenHands.
     """
     acciones, sin_regla = _acciones_y_sin_regla(state.get("acciones_grafo", {}))
+    modo = state.get("modo_salida") or modo_salida_vigente()
+    omitidos = list(state.get("omitidos_por_modo") or [])
+    descartadas = []
     orden, brief, fallback = None, "", []
     if acciones or sin_regla:
         try:
@@ -3357,11 +3513,14 @@ def node_planificar(state: DataPulseState) -> DataPulseState:
             prompt = PLANIFICAR_PROMPT.format(
                 acciones_json=json.dumps(acciones, ensure_ascii=False, indent=2),
                 sin_regla_json=json.dumps(sin_regla, ensure_ascii=False, indent=2),
+                modo_salida=modo,
+                reglas_modo=REGLAS_MODO_PROMPT[modo],
             )
             parsed = extract_json_from_markdown(llm.invoke([HumanMessage(content=prompt)]).content)
             orden = parsed.get("orden")
             brief = str(parsed.get("brief_tecnico") or "")
-            fallback = _acciones_fallback(parsed.get("acciones_fallback"), sin_regla)
+            fallback = _acciones_fallback(parsed.get("acciones_fallback"), sin_regla, modo,
+                                          descartadas)
         except Exception as exc:
             print(f"   ⚠️ Planificador sin respuesta válida ({type(exc).__name__}): "
                   "se usa el orden del grafo y solo sus acciones.")
@@ -3370,8 +3529,9 @@ def node_planificar(state: DataPulseState) -> DataPulseState:
 
     for accion in acciones:
         accion["fuente_decision"] = "knowledge_graph"
-    resueltos = {(f["columna"], f["problema"]) for f in fallback}
+    resueltos = {(f["columna"], f["problema"]) for f in fallback + descartadas}
     sin_resolver = [p for p in sin_regla if (p["columna"], p["problema"]) not in resueltos]
+    omitidos += descartadas
 
     plan = [
         {
@@ -3388,8 +3548,10 @@ def node_planificar(state: DataPulseState) -> DataPulseState:
     return {
         "plan_acciones": plan,
         "sin_regla": sin_resolver,
+        "omitidos_por_modo": omitidos,
         "brief_tecnico": brief + _seccion_obligatoria(plan, sin_resolver,
-                                                      state.get("decisiones_negativos")),
+                                                      state.get("decisiones_negativos"),
+                                                      modo, omitidos),
     }
 
 
@@ -4298,6 +4460,8 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
             if a.get("fuente_decision") == "llm_fallback"
         ),
         "problemas_sin_regla": state.get("sin_regla", []),
+        "modo_salida": state.get("modo_salida"),
+        "omitidos_por_modo": state.get("omitidos_por_modo", []),
         "decisiones_negativos": state.get("decisiones_negativos", {}),
         "discrepancias_negativos": state.get("discrepancias_negativos", []),
         "columnas_nuevas_no_evaluadas": state.get("columnas_nuevas", []),
@@ -4469,6 +4633,9 @@ def _resumen_determinista(tabla: Dict[str, Any]) -> str:
         partes.append(f"Quedan {len(tabla['valores_sin_limpiar'])} problemas sin limpiar.")
     if tabla["problemas_sin_regla"]:
         partes.append(f"{len(tabla['problemas_sin_regla'])} problemas no tienen regla en el grafo.")
+    if tabla.get("omitidos_por_modo"):
+        partes.append(f"{len(tabla['omitidos_por_modo'])} problema(s) omitidos por el modo de salida "
+                      f"'{tabla.get('modo_salida')}'.")
     decisiones = tabla.get("decisiones_negativos") or {}
     if decisiones:
         conteo = {}
@@ -4504,7 +4671,7 @@ def _informe_markdown(tabla: Dict[str, Any], resumen: str) -> str:
         f"- **Estado:** {tabla['estado']} · **Modo:** {tabla['modo']} · **Intentos:** {tabla['intentos']}",
         f"- **Score:** {tabla['score_antes']} → {tabla['score_despues']} (umbral {tabla['umbral']}); "
         f"declarado por el script: {tabla['score_reportado']}",
-        f"- **Resultado:** {destino}", "",
+        f"- **Resultado:** {destino} · **Modo de salida:** {tabla.get('modo_salida') or '—'}", "",
         "## Resumen", "", resumen, "",
         "## Valores que no se pudieron limpiar", "",
     ]
@@ -4519,6 +4686,13 @@ def _informe_markdown(tabla: Dict[str, Any], resumen: str) -> str:
     if tabla["problemas_sin_regla"]:
         lineas += ["| Columna | Problema |", "|---|---|"]
         lineas += [f"| {p['columna']} | {p['problema']} |" for p in tabla["problemas_sin_regla"]]
+    else:
+        lineas.append("Ninguno.")
+    lineas += ["", "## Omitidos por modo de salida", ""]
+    if tabla.get("omitidos_por_modo"):
+        lineas += ["| Columna | Problema | Acciones omitidas | Origen |", "|---|---|---|---|"]
+        lineas += [f"| {o['columna']} | {o['problema']} | {', '.join(o['acciones_omitidas'])} | "
+                   f"{o.get('origen', 'knowledge_graph')} |" for o in tabla["omitidos_por_modo"]]
     else:
         lineas.append("Ninguno.")
     lineas += ["", "## Columnas que no entran en el score", ""]
@@ -4570,6 +4744,8 @@ def generar_informe_final(estado: Dict[str, Any]) -> Dict[str, Any]:
         "destino": estado.get("github_url"),
         "valores_sin_limpiar": residuales,
         "problemas_sin_regla": estado.get("sin_regla", []),
+        "modo_salida": estado.get("modo_salida"),
+        "omitidos_por_modo": estado.get("omitidos_por_modo", []),
         "decisiones_negativos": estado.get("decisiones_negativos", {}),
         "discrepancias_negativos": estado.get("discrepancias_negativos", []),
         "columnas_nuevas_no_evaluadas": estado.get("columnas_nuevas", []),
@@ -4679,6 +4855,7 @@ def run_datapulse(
     if kg is None:
         kg = KNOWLEDGE_GRAPH
     aplicar_dominios_activos()
+    modo_salida = modo_salida_vigente()   # falla aquí, antes de llamar al LLM, si no es válido
 
     # Resolver fuente del archivo
     gh_file   = github_file   or GITHUB_DATA_FILE
@@ -4717,6 +4894,8 @@ def run_datapulse(
         "avisos_diagnostico":   [],
         "respuesta_cruda_diagnostico": None,
         "acciones_grafo":       {},
+        "modo_salida":          modo_salida,
+        "omitidos_por_modo":    [],
         "plan_acciones":        [],
         "sin_regla":            [],
         "brief_tecnico":        "",

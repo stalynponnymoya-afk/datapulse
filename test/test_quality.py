@@ -138,7 +138,10 @@ def test_clean_data_edges_activated():
         assert not res["requiere_llm_fallback"], (
             f"{col} ({res['tipo_inferido']}) fell back to LLM for clean data"
         )
-        assert res["acciones"][0]["accion"], f"{col} produced no action"
+        # En modo "bi" las reglas "Ninguno" solo de modelos (encoding, 0/1) se omiten por modo
+        assert res["acciones"] or res["omitidos_por_modo"], f"{col} produced no action"
+        if res["acciones"]:
+            assert res["acciones"][0]["accion"], f"{col} produced no action"
     print(f"✅ Clean-data edges activated for {len(tipos_con_ninguno)} types")
 
 
