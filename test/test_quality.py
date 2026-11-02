@@ -233,9 +233,12 @@ def test_router_retry_policy():
                 return path
 
     # Error de infraestructura: 2 intentos en total (1 reintento), nunca commit.
-    for estado in ("error", "timeout", "stuck", "stopped"):
+    for estado in ("error", "stopped"):
         infra = walk(estado, 0)
         assert infra == ["retry"] * (OH_MAX_INTENTOS_INFRA - 1) + ["end_no_commit"], infra
+    # Demasiado tiempo o atascado: sin reintento, directo al informe final.
+    for estado in ("timeout", "stuck"):
+        assert walk(estado, 100) == ["end_no_commit"]
     # Aunque el score fuera alto, un fallo de infraestructura no hace commit.
     assert "commit" not in walk("error", 100)
 

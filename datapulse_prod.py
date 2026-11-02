@@ -107,6 +107,9 @@ OH_RETRY_ON_LOW_SCORE  = True   # reintentar cuando el score queda bajo el umbra
 OH_MAX_INTENTOS_SCORE  = 3
 # Estados terminales de OpenHands que indican fallo de infraestructura
 OH_ESTADOS_INFRA = ("error", "timeout", "stuck", "stopped")
+# De ellos, los de demora (tardó demasiado o se atascó) no se reintentan: se
+# pasa al informe final con lo que haya producido la ejecución.
+OH_ESTADOS_DEMORA = ("timeout", "stuck")
 
 
 
@@ -2007,6 +2010,9 @@ class DataPulseState(TypedDict):
     veredicto_revision: Optional[str]           # aprobado | corregir | terminar
     revision: Optional[Dict[str, Any]]
     instrucciones_correccion: Optional[str]     # para el siguiente intento
+
+    # Informe final (todas las ejecuciones terminan aquí)
+    informe_final: Optional[Dict[str, Any]]
     directorio_salida: Optional[str] # carpeta local con las salidas del intento
 
     # Fuente del archivo (None = archivo local subido; str = path en repo)
@@ -3098,8 +3104,9 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
             print(f"   ⚠️ Pipeline local terminó con código {proc.returncode}")
             print(stderr_tail)
     except subprocess.TimeoutExpired:
-        status = "error"
+        status = "timeout"
         stdout = ""
+        stderr_tail = f"El script superó el tiempo máximo de ejecución ({OH_TIMEOUT_SEG}s)."
         print(f"   ⚠️ Pipeline local excedió {OH_TIMEOUT_SEG}s")
 
     # Leer los reportes reales generados localmente
@@ -3142,7 +3149,7 @@ def _run_local_groq_pipeline(state: DataPulseState) -> dict:
         "codigo": codigo,
         "archivos_generados": archivos_generados,
     }
-    if status == "error" and stderr_tail:
+    if status != "finished" and stderr_tail:
         resultado["error_history"] = [f"El script falló: {stderr_tail}"]
     return resultado
 
@@ -3679,6 +3686,11 @@ def router_validar_score(state: DataPulseState) -> str:
     if status == "rechazado":
         return "end_no_commit"
 
+    # Demasiado tiempo o atascado: no se re-lanza; el informe final explica qué
+    # pasó y mide lo que haya producido.
+    if status in OH_ESTADOS_DEMORA:
+        return "end_no_commit"
+
     # Fallo de infraestructura: presupuesto corto para no re-lanzar sandboxes.
     if status in OH_ESTADOS_INFRA:
         return "retry" if intentos < OH_MAX_INTENTOS_INFRA else "end_no_commit"
@@ -4030,6 +4042,131 @@ def node_commit(state: DataPulseState) -> DataPulseState:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 10b. NODE — INFORME FINAL (score y valores que no se pudieron limpiar)
+# ═══════════════════════════════════════════════════════════════
+
+INFORME_PROMPT = """Redactas el informe final de DataPulse para el usuario. Usa SOLO los datos de la tabla (los midió DataPulse; no inventes números) y explica en 3 a 6 frases:
+- qué pasó en la ejecución; si se detuvo antes de terminar (timeout, stuck, error, rechazado, sin_validar), la causa probable según los errores y el mensaje de la ejecución;
+- en qué estado quedan los datos: score antes y después y qué valores no se pudieron limpiar;
+- qué problemas no tienen regla en el Grafo de Conocimiento (el usuario puede añadirlas).
+Responde en texto plano, sin JSON ni markdown.
+
+Tabla:
+{tabla_json}"""
+
+
+def _medir_resultado_parcial(state: DataPulseState) -> tuple:
+    """
+    Score y residuales del último processed_data.csv. Si la validación no lo
+    midió (p. ej. timeout con resultado parcial de OpenHands), se mide aquí.
+    """
+    residuales, score = state.get("residuales"), state.get("score_despues")
+    ruta = state.get("ruta_processed")
+    if residuales is None and ruta and os.path.exists(ruta):
+        try:
+            df = load_dataset(ruta)
+            reporte = generate_report_df(df, "processed_data.csv")
+            return reporte["quality_score"], _problemas_residuales(df, reporte), True
+        except Exception as exc:
+            print(f"   ⚠️ No se pudo medir el resultado parcial: {type(exc).__name__}: {exc}")
+    return (score if residuales is not None else None), (residuales or []), residuales is not None
+
+
+def _resumen_determinista(tabla: Dict[str, Any]) -> str:
+    """Resumen sin LLM (si no está disponible o la ejecución fue rechazada)."""
+    partes = [f"La ejecución terminó en estado '{tabla['estado']}' tras {tabla['intentos']} intento(s)."]
+    if tabla["score_despues"] is not None:
+        partes.append(f"Score: {tabla['score_antes']} antes y {tabla['score_despues']} después "
+                      f"(umbral {tabla['umbral']}).")
+    else:
+        partes.append("No hubo un processed_data.csv que medir.")
+    if tabla["valores_sin_limpiar"]:
+        partes.append(f"Quedan {len(tabla['valores_sin_limpiar'])} problemas sin limpiar.")
+    if tabla["problemas_sin_regla"]:
+        partes.append(f"{len(tabla['problemas_sin_regla'])} problemas no tienen regla en el grafo.")
+    if tabla["errores"]:
+        partes.append(f"Último error: {tabla['errores'][-1][:200]}")
+    return " ".join(partes)
+
+
+def _informe_markdown(tabla: Dict[str, Any], resumen: str) -> str:
+    """Informe legible: resumen + tabla de valores sin limpiar + problemas sin regla."""
+    destino = tabla["destino"] or "no se publicó (sin commit)"
+    lineas = [
+        "# Informe final DataPulse", "",
+        f"- **Estado:** {tabla['estado']} · **Modo:** {tabla['modo']} · **Intentos:** {tabla['intentos']}",
+        f"- **Score:** {tabla['score_antes']} → {tabla['score_despues']} (umbral {tabla['umbral']}); "
+        f"declarado por el script: {tabla['score_reportado']}",
+        f"- **Revisión del LLM:** {tabla['veredicto_revision']}",
+        f"- **Resultado:** {destino}", "",
+        "## Resumen", "", resumen, "",
+        "## Valores que no se pudieron limpiar", "",
+    ]
+    if tabla["valores_sin_limpiar"]:
+        lineas += ["| Columna | Problema | Cantidad | Ejemplos |", "|---|---|---|---|"]
+        for f in tabla["valores_sin_limpiar"]:
+            ejemplos = ", ".join(f["ejemplos"]).replace("|", "\\|")
+            lineas.append(f"| {f['columna']} | {f['problema']} | {f['cantidad']} | {ejemplos} |")
+    else:
+        lineas.append("Ninguno medido.")
+    lineas += ["", "## Problemas sin regla en el Grafo de Conocimiento", ""]
+    if tabla["problemas_sin_regla"]:
+        lineas += ["| Columna | Problema |", "|---|---|"]
+        lineas += [f"| {p['columna']} | {p['problema']} |" for p in tabla["problemas_sin_regla"]]
+    else:
+        lineas.append("Ninguno.")
+    return "\n".join(lineas) + "\n"
+
+
+def node_informe_final(state: DataPulseState) -> DataPulseState:
+    """
+    Cierre de toda ejecución (con o sin commit): tabla medida por DataPulse con
+    el score y los valores que no se pudieron limpiar, y un resumen del LLM de
+    qué pasó (sobre todo si OpenHands tardó demasiado o se atascó). Se guarda
+    solo en local, en outputs/<ts>-informe/.
+    """
+    score, residuales, medido = _medir_resultado_parcial(state)
+    contexto = _contexto_resultado(state)
+    tabla = {
+        "estado": state.get("openhands_status"),
+        "modo": "OpenHands" if OPENHANDS_API_KEY else "local",
+        "intentos": state.get("intentos"),
+        "score_antes": state.get("score_antes"),
+        "score_despues": score,
+        "umbral": MIN_SCORE_PASS,
+        "score_reportado": state.get("score_reportado"),
+        "veredicto_revision": state.get("veredicto_revision"),
+        "analisis_revision": (state.get("revision") or {}).get("analisis"),
+        "destino": state.get("github_url"),
+        "valores_sin_limpiar": residuales,
+        "problemas_sin_regla": state.get("sin_regla", []),
+        "errores": contexto["errores_recientes"],
+        "mensaje_ejecucion": contexto["mensaje_ejecucion"],
+        "resultado_medido": medido,
+    }
+
+    resumen = ""
+    if tabla["estado"] != "rechazado":
+        try:
+            prompt = INFORME_PROMPT.format(tabla_json=json.dumps(tabla, ensure_ascii=False, indent=2))
+            resumen = (get_llm().invoke([HumanMessage(content=prompt)]).content or "").strip()
+        except Exception as exc:
+            print(f"   ⚠️ Resumen del LLM no disponible ({type(exc).__name__}).")
+    resumen = resumen or _resumen_determinista(tabla)
+
+    carpeta = os.path.join("outputs", datetime.now().strftime("%Y%m%d-%H%M%S") + "-informe")
+    os.makedirs(carpeta, exist_ok=True)
+    markdown = _informe_markdown(tabla, resumen)
+    with open(os.path.join(carpeta, "informe_final.json"), "w", encoding="utf-8") as f:
+        json.dump({**tabla, "resumen": resumen}, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(carpeta, "informe_final.md"), "w", encoding="utf-8") as f:
+        f.write(markdown)
+    print("\n" + markdown)
+    print(f"   🗂️ Informe guardado en {carpeta}/")
+    return {"informe_final": {**tabla, "resumen": resumen, "ruta": os.path.abspath(carpeta)}}
+
+
+# ═══════════════════════════════════════════════════════════════
 # 11. BUILDER DEL GRAFO LANGGRAPH
 # ═══════════════════════════════════════════════════════════════
 
@@ -4045,6 +4182,7 @@ def build_datapulse_graph():
     workflow.add_node("validar_score", node_validar_score)
     workflow.add_node("revisar_resultado", node_revisar_resultado)
     workflow.add_node("commit", node_commit)
+    workflow.add_node("informe_final", node_informe_final)
 
     # Edges secuenciales principales
     workflow.add_edge(START, "ingestar")
@@ -4062,11 +4200,13 @@ def build_datapulse_graph():
         {
             "retry": "ejecutar",
             "commit": "commit",
-            "end_no_commit": END
+            "end_no_commit": "informe_final",
         }
     )
 
-    workflow.add_edge("commit", END)
+    # Toda ejecución termina en el informe final, haya commit o no
+    workflow.add_edge("commit", "informe_final")
+    workflow.add_edge("informe_final", END)
 
     return workflow.compile()
 
@@ -4165,6 +4305,7 @@ def run_datapulse(
         "veredicto_revision": None,
         "revision":           None,
         "instrucciones_correccion": None,
+        "informe_final":      None,
         "directorio_salida":  None,
         "archivos_generados": {},
         "openhands_status":   "",
@@ -4185,7 +4326,13 @@ def _print_results(final_state: dict) -> None:
     print(f"Score calidad    : {final_state['score_despues']}/100 (validación independiente)")
     print(f"Score reportado  : {final_state.get('score_reportado')} (informativo)")
     print(f"Intentos usados  : {final_state['intentos']}")
+    print(f"Revisión del LLM : {final_state.get('veredicto_revision')}")
     print(f"GitHub URL       : {final_state.get('github_url', 'N/A')}")
+    informe = final_state.get("informe_final") or {}
+    if informe:
+        print(f"Informe final    : {informe.get('ruta')}")
+        print(f"Sin limpiar      : {len(informe.get('valores_sin_limpiar') or [])} problemas | "
+              f"sin regla en el grafo: {len(informe.get('problemas_sin_regla') or [])}")
 
     archivos = final_state.get("archivos_generados", {})
     if archivos:
