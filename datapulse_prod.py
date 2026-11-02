@@ -3840,12 +3840,20 @@ def router_validar_score(state: DataPulseState) -> str:
     if status == "sin_validar":
         return "retry" if state.get("processed_esperado") and puede_reintentar else "end_no_commit"
 
-    if score >= MIN_SCORE_PASS:
+    # El commit exige superar el umbral Y no empeorar respecto del original;
+    # si empeora se trata como score bajo.
+    if score >= MIN_SCORE_PASS and not _score_empeora(state):
         return "commit"
 
-    # Autocorrección: un score bajo con ejecución correcta sí merece reintento,
-    # con su propio presupuesto.
+    # Autocorrección: un score bajo (o que empeora) con ejecución correcta sí
+    # merece reintento, con su propio presupuesto.
     return "retry" if puede_reintentar else "end_no_commit"
+
+
+def _score_empeora(state: Dict[str, Any]) -> bool:
+    """True si score_despues quedó por debajo de score_antes (si ambos se conocen)."""
+    antes, despues = state.get("score_antes"), state.get("score_despues")
+    return antes is not None and despues is not None and despues < antes
 
 MAX_RESIDUALES = 40
 MAX_EJEMPLOS_RESIDUALES = 3
@@ -4046,11 +4054,19 @@ def node_validar_score(state: DataPulseState) -> DataPulseState:
         f"(reportado por el script: {state.get('score_reportado')})"
     )
 
+    antes = salida.get("score_antes", state.get("score_antes"))
     if score < MIN_SCORE_PASS:
         # La tabla de residuales va al historial para el siguiente intento
         salida["error_history"] = [
             f"{etiqueta}Validación independiente: score {score}/100 (< {MIN_SCORE_PASS}). "
             f"Problemas que quedan en processed_data.csv: {_resumir_residuales(salida['residuales'])}"
+        ]
+    elif antes is not None and score < antes:
+        # Pasa el umbral pero empeora el original: también se reintenta
+        salida["error_history"] = [
+            f"{etiqueta}Validación independiente: el score empeoró ({score} < {antes} del "
+            f"original). Problemas que quedan en processed_data.csv: "
+            f"{_resumir_residuales(salida['residuales'])}"
         ]
     return salida
 
@@ -4260,6 +4276,9 @@ def _resumen_determinista(tabla: Dict[str, Any]) -> str:
                       "de negativos (solo informativas).")
     if tabla["estado"] == "error_validador":
         partes.append("El validador falló: no hubo commit ni reintento.")
+    if tabla.get("score_empeoro") and not tabla.get("destino"):
+        partes.append(f"Terminó sin commit porque el score empeoró respecto del original "
+                      f"({tabla['score_despues']} < {tabla['score_antes']}).")
     if tabla["errores"]:
         ultimo = tabla["errores"][-1]
         m = re.match(r"^\[intento (\d+)\] (.*)$", ultimo, re.DOTALL)
@@ -4341,6 +4360,8 @@ def generar_informe_final(estado: Dict[str, Any]) -> Dict[str, Any]:
         "discrepancias_negativos": estado.get("discrepancias_negativos", []),
         "columnas_nuevas_no_evaluadas": estado.get("columnas_nuevas", []),
         "columnas_originales_eliminadas": estado.get("columnas_eliminadas", []),
+        "score_empeoro": (score is not None and estado.get("score_antes") is not None
+                          and score < estado["score_antes"]),
         "errores": [e[:300] for e in (estado.get("error_history") or [])[-3:]],
         "mensaje_ejecucion": (estado.get("mensaje_ejecucion") or "")[:500],
         "resultado_medido": medido,

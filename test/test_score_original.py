@@ -89,3 +89,71 @@ def test_iqr_no_se_aplica_a_escalas():
     meta = dp.serialize_metadata(df, "x.csv")["columnas_info"]
     assert meta["Satisfaccion"]["muestra_anomala"] == []
     assert meta["Monto"]["muestra_anomala"][0] == "500"
+
+
+# ── Punto 4: el commit exige no empeorar ────────────────────────────────────
+
+import json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("antes, despues, intentos, esperado", [
+    (60, 90, 1, "commit"),
+    (90, 90, 1, "commit"),                          # igual: no empeora
+    (95, 80, 1, "retry"),                           # pasa el umbral pero empeora
+    (95, 80, dp.OH_MAX_INTENTOS_SCORE, "end_no_commit"),
+    (None, 80, 1, "commit"),                        # sin score_antes: solo el umbral
+    (40, 50, 1, "retry"),                           # mejora pero bajo el umbral
+])
+def test_router_exige_no_empeorar(antes, despues, intentos, esperado):
+    estado = {"openhands_status": "finished", "score_antes": antes, "score_despues": despues,
+              "intentos": intentos}
+    assert dp.router_validar_score(estado) == esperado
+
+
+def test_empeorar_va_a_error_history_con_residuales(tmp_path):
+    processed = pd.DataFrame({"edad": [30 + 2 * i for i in range(19)] + [None],
+                              "ciudad": ["quito", "lima"] * 10, "comentario": ["ok"] * 20})
+    estado = _estado(tmp_path, processed)
+    estado["score_antes"] = 100
+    out = dp.node_validar_score(estado)
+    assert dp.MIN_SCORE_PASS <= out["score_despues"] < 100
+    assert "el score empeoró" in out["error_history"][0]
+    assert "edad: nulos" in out["error_history"][0]
+    assert dp.router_validar_score({**estado, **out}) == "retry"
+
+
+def test_langgraph_sigue_peor_al_agotar_intentos(tmp_path, monkeypatch):
+    """Original limpio, el script lo empeora siempre: 3 intentos, sin commit, informe."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dp, "OPENHANDS_API_KEY", "")
+    monkeypatch.setattr(dp, "GITHUB_TOKEN", "")
+    monkeypatch.setattr(dp, "MIN_SCORE_PASS", 50)
+
+    class LLM:
+        def invoke(self, mensajes):
+            p = mensajes[0].content
+            if "planificador técnico" in p:
+                return SimpleNamespace(content=json.dumps(
+                    {"orden": [], "acciones_fallback": [], "brief_tecnico": "B"}))
+            if "Escribe el script Python COMPLETO" in p:
+                return SimpleNamespace(content=(
+                    "import sys\nimport pandas as pd\ndf = pd.read_csv(sys.argv[1])\n"
+                    "df.loc[:4, 'edad'] = None\ndf.to_csv('processed_data.csv', index=False)\n"))
+            return SimpleNamespace(content=json.dumps(
+                {"edad": {"tipo_inferido": "numerica_discreta", "problemas": ["ninguno"]}}))
+
+    monkeypatch.setattr(dp, "get_llm", lambda: LLM())
+    datos = tmp_path / "d.csv"
+    pd.DataFrame({"edad": [30 + 2 * i for i in range(20)]}).to_csv(datos, index=False)
+
+    final = dp.run_datapulse(str(datos))
+    assert final["intentos"] == dp.OH_MAX_INTENTOS_SCORE
+    assert final["score_despues"] < final["score_antes"]
+    assert final["score_despues"] >= dp.MIN_SCORE_PASS       # pasaba el umbral
+    assert final["github_url"] is None
+    inf = final["informe_final"]
+    assert inf["score_empeoro"] is True
+    assert "Terminó sin commit porque el score empeoró" in inf["resumen"]
