@@ -78,14 +78,13 @@ def test_sin_metadata_no_rompe():
     assert out["acciones_grafo"]["x"]["acciones"][0]["accion"] == "fillna_mean"
 
 
-def test_conteo_de_reglas():
-    kg = dp.construir_grafo_conocimiento()
-    base = kg.number_of_edges()
-    kg = dp.agregar_reglas_dominio(kg)
-    assert (base, kg.number_of_edges() - base) == (116, 26)
-    assert dp.kg.number_of_edges() == 142
+def test_grafo_global_es_base_mas_dominios_activos():
+    """Sin dominios activos, el grafo global es exactamente el grafo base."""
+    base = dp.construir_grafo_conocimiento()
+    assert dp.DOMINIOS_ACTIVOS == []
+    assert sorted(dp.kg.edges()) == sorted(base.edges())
     confianzas = [d["confianza"] for _, _, d in dp.kg.edges(data=True)]
-    assert min(confianzas) == 0.78 and max(confianzas) == 1.0
+    assert all(0 <= c <= 1 for c in confianzas)
 
 
 def test_centinelas_en_texto_y_categorias_replace_to_na():
@@ -160,7 +159,6 @@ def test_rango_invalido_set_nan_y_flag_sin_recorte():
         assert "NaN" in d["justificacion_es"] and "inventa" in d["justificacion_es"]
     # Ninguna regla de Rango_Invalido conserva flag_y_nan (no cubría montos positivos absurdos)
     assert all(d["accion"] == "set_nan_y_flag" for _, d in reglas)
-    assert dp.kg.number_of_edges() == 142
 
 
 def test_rango_invalido_cubre_negativos_y_fuera_de_rango():

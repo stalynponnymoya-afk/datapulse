@@ -142,6 +142,12 @@ MIN_SCORE_PASS    = _entero_env("DATAPULSE_MIN_SCORE_PASS", 70)
 GITHUB_DATA_FILE   = ""          # ← ESCRIBE AQUÍ EL NOMBRE DE TU ARCHIVO
 GITHUB_DATA_BRANCH = "main"      # rama donde vive el archivo (normalmente "main")
 
+# Dominios de reglas que se agregan al grafo de conocimiento (ver DOMINIOS):
+# "salud", "finanzas", "economia", "ocupacional" o uno propio registrado. Vacía
+# por defecto: solo las reglas base; solo los tipos y problemas de los
+# dominios activos aparecen en el vocabulario del diagnóstico.
+DOMINIOS_ACTIVOS: List[str] = []
+
 # Contexto del dataset (texto libre) que se añade al prompt de diagnóstico, p. ej.
 # "Mediciones meteorológicas horarias de 12 estaciones andinas". Si queda vacío
 # se usa la variable de entorno DATAPULSE_CONTEXTO.
@@ -352,10 +358,9 @@ def _fechas_centinela_config() -> List[str]:
 
 def construir_grafo_conocimiento() -> nx.DiGraph:
     """
-    Construye el grafo base: 116 reglas estadísticas y estructurales (106
-    originales + 7 de Valores_Centinela + 3 de Negativos_Inciertos, añadidas
-    en la fase 1). Las 26 reglas de dominio se agregan después con
-    agregar_reglas_dominio().
+    Construye el grafo base: reglas estadísticas y estructurales que valen
+    para cualquier giro de negocio. Las reglas de dominio son opcionales y se
+    agregan después con agregar_reglas_dominio(kg, DOMINIOS_ACTIVOS).
     """
     kg = nx.MultiDiGraph()
 
@@ -1287,40 +1292,15 @@ Fuentes de evidencia para cada rango/regla documentadas inline.
 """
 
 
-def agregar_reglas_dominio(kg):
-    """
-    Agrega 26 reglas de dominio a un grafo existente.
-    Llamar después de construir_grafo_conocimiento().
-    """
-    count_before = kg.number_of_edges()
+def _agregar_nodos_dominio(kg, problemas: List[str], tipos: List[str]) -> None:
+    """Declara los nodos propios de un dominio (problemas y tipos de variable)."""
+    kg.add_nodes_from(problemas, node_type="problema_dominio")
+    kg.add_nodes_from(tipos, node_type="tipo_variable_dominio")
 
-    # Nodos de problema de dominio nuevos
-    problemas_dominio = [
-        "Rango_Clinico_Invalido",
-        "Codigo_Medico_Invalido",
-        "Fecha_Clinica_Inconsistente",
-        "Rango_Financiero_Invalido",
-        "Consistencia_Contable_Rota",
-        "Rango_Economico_Invalido",
-        "Rango_Ocupacional_Invalido",
-        "Exposicion_Limite_Excedido",
-    ]
 
-    # Nodos de tipo de variable de dominio nuevos
-    tipos_dominio = [
-        "Variable_Clinica_Signo_Vital",
-        "Variable_Clinica_Laboratorio",
-        "Variable_Clinica_Codigo",
-        "Variable_Clinica_Fecha",
-        "Variable_Financiera_Tasa",
-        "Variable_Financiera_Ratio",
-        "Variable_Economica_Indicador",
-        "Variable_Ocupacional_Exposicion",
-        "Variable_Ocupacional_Incidente",
-    ]
-
-    kg.add_nodes_from(problemas_dominio, node_type="problema_dominio")
-    kg.add_nodes_from(tipos_dominio, node_type="tipo_variable_dominio")
+def agregar_reglas_salud(kg):
+    """Dominio "salud": Salud / datos clínicos (rangos OMS-AHA, códigos médicos, fechas clínicas)."""
+    _agregar_nodos_dominio(kg, ['Rango_Clinico_Invalido', 'Codigo_Medico_Invalido', 'Fecha_Clinica_Inconsistente'], ['Variable_Clinica_Signo_Vital', 'Variable_Clinica_Laboratorio', 'Variable_Clinica_Codigo', 'Variable_Clinica_Fecha'])
 
     # ═══════════════════════════════════════════════════════════════
     #
@@ -1535,6 +1515,12 @@ def agregar_reglas_dominio(kg):
         justificacion_es="Fecha clínica limpia: convertir a datetime, extraer componentes, calcular estancia",
         justificacion_en="Clean clinical date: convert to datetime, extract components, calculate length of stay")
 
+    return kg
+
+
+def agregar_reglas_finanzas(kg):
+    """Dominio "finanzas": Finanzas (tasas, ratios, consistencia contable IFRS)."""
+    _agregar_nodos_dominio(kg, ['Rango_Financiero_Invalido', 'Consistencia_Contable_Rota'], ['Variable_Financiera_Tasa', 'Variable_Financiera_Ratio'])
 
     # ═══════════════════════════════════════════════════════════════
     #
@@ -1658,6 +1644,12 @@ def agregar_reglas_dominio(kg):
         justificacion_es="Validación de ecuación contable básica (IFRS). Filas inconsistentes marcadas.",
         justificacion_en="Basic accounting equation validation (IFRS). Inconsistent rows flagged.")
 
+    return kg
+
+
+def agregar_reglas_economia(kg):
+    """Dominio "economia": Economía / indicadores macroeconómicos (FMI)."""
+    _agregar_nodos_dominio(kg, ['Rango_Economico_Invalido'], ['Variable_Economica_Indicador'])
 
     # ═══════════════════════════════════════════════════════════════
     #
@@ -1740,6 +1732,12 @@ def agregar_reglas_dominio(kg):
         justificacion_es="Indicadores con nulos moderados: NO imputar (distorsiona análisis de política). Marcar.",
         justificacion_en="Indicators with moderate nulls: DO NOT impute (distorts policy analysis). Flag instead.")
 
+    return kg
+
+
+def agregar_reglas_ocupacional(kg):
+    """Dominio "ocupacional": Salud ocupacional / seguridad laboral (OSHA)."""
+    _agregar_nodos_dominio(kg, ['Rango_Ocupacional_Invalido', 'Exposicion_Limite_Excedido'], ['Variable_Ocupacional_Exposicion', 'Variable_Ocupacional_Incidente'])
 
     # ═══════════════════════════════════════════════════════════════
     #
@@ -1875,15 +1873,69 @@ def agregar_reglas_dominio(kg):
         justificacion_es="Incidentes con nulos bajos: 0 es supuesto válido (no reportado = no ocurrió) en contexto OSHA",
         justificacion_en="Incidents with low nulls: 0 is valid assumption (not reported = did not occur) in OSHA context")
 
+    return kg
 
-    # ═══════════════════════════════════════════════════════════════
-    # MAPEO DE TIPOS DE DOMINIO — agregar al TIPO_MAP existente
-    # ═══════════════════════════════════════════════════════════════
 
-    print(f"✅ Reglas de dominio agregadas: {kg.number_of_edges() - count_before} reglas en 4 dominios")
+# Registro de dominios: nombre → función que agrega sus reglas al grafo.
+# Para un dominio propio, copia agregar_reglas_plantilla y regístralo aquí.
+DOMINIOS: Dict[str, Any] = {
+    "salud": agregar_reglas_salud,
+    "finanzas": agregar_reglas_finanzas,
+    "economia": agregar_reglas_economia,
+    "ocupacional": agregar_reglas_ocupacional,
+}
+
+
+def agregar_reglas_dominio(kg, dominios: Optional[List[str]] = None):
+    """
+    Agrega al grafo las reglas de los dominios indicados (sus nodos, tipos y
+    problemas). Sin argumentos agrega TODOS los dominios registrados, igual que
+    antes (salud, finanzas, economía y ocupacional).
+    Llamar después de construir_grafo_conocimiento().
+    """
+    nombres = list(DOMINIOS) if dominios is None else [str(d).strip().lower() for d in dominios]
+    desconocidos = [n for n in nombres if n not in DOMINIOS]
+    if desconocidos:
+        raise ValueError(f"Dominios desconocidos: {desconocidos}. Registrados: {sorted(DOMINIOS)}.")
+    count_before = kg.number_of_edges()
+    for nombre in nombres:
+        DOMINIOS[nombre](kg)
+    if nombres:
+        print(f"✅ Reglas de dominio agregadas: {kg.number_of_edges() - count_before} reglas "
+              f"({', '.join(nombres)})")
+    else:
+        print("✅ Dominios activos: ninguno (DOMINIOS_ACTIVOS vacía)")
     print(f"   Nodos totales: {kg.number_of_nodes()}")
     print(f"   Edges totales: {kg.number_of_edges()}")
+    return kg
 
+
+def agregar_reglas_plantilla(kg):
+    """
+    PLANTILLA para crear un dominio propio (no está registrada ni se aplica).
+
+    1. Copia esta función en datapulse_prod.py como agregar_reglas_<dominio>(kg)
+       (por ejemplo agregar_reglas_retail).
+    2. Declara con _agregar_nodos_dominio los problemas y tipos de variable
+       nuevos del dominio. Puedes colgar reglas de nodos existentes
+       (Variable_Numerica_Continua, Rango_Invalido...).
+    3. Añade cada regla con el formato existente: accion (nombre explícito en
+       snake_case, porque el ejecutor la interpreta como texto), confianza
+       (0–1; gana la mayor para el mismo tipo y problema), parametros (dict
+       explícito), justificacion_es/en y, opcional, modo="bi" | "ml".
+    4. Regístrala en DOMINIOS:  DOMINIOS["<dominio>"] = agregar_reglas_<dominio>
+    5. Actívala en el bloque de configuración:  DOMINIOS_ACTIVOS = ["<dominio>"]
+       (en Colab: dp.DOMINIOS_ACTIVOS = ["<dominio>"] antes de run_datapulse).
+    6. Opcional: alias en TIPO_MAP / PROBLEMA_MAP. Sin alias, el LLM usa el
+       nombre del nodo en minúsculas (Mi_Problema → "mi_problema").
+    """
+    _agregar_nodos_dominio(kg, ["Mi_Problema"], ["Variable_Mi_Tipo"])
+    kg.add_edge("Variable_Mi_Tipo", "Mi_Problema",
+        accion="nombre_explicito_de_la_accion",
+        parametros={"parametro": "valor explícito"},
+        confianza=0.80,
+        justificacion_es="Por qué esta acción resuelve este problema en este dominio.",
+        justificacion_en="Why this action solves this problem in this domain.")
     return kg
 
 
@@ -1991,9 +2043,27 @@ PROBLEMA_MAP_DOMINIO = {
     "sobre_limite":                    "Exposicion_Limite_Excedido",
 }
 
-KNOWLEDGE_GRAPH = agregar_reglas_dominio(KNOWLEDGE_GRAPH)
+KNOWLEDGE_GRAPH = agregar_reglas_dominio(KNOWLEDGE_GRAPH, DOMINIOS_ACTIVOS)
+_DOMINIOS_APLICADOS = tuple(DOMINIOS_ACTIVOS)
 TIPO_MAP.update(TIPO_MAP_DOMINIO)
 PROBLEMA_MAP.update(PROBLEMA_MAP_DOMINIO)
+
+
+def aplicar_dominios_activos(forzar: bool = False):
+    """
+    Reconstruye el grafo global (base + DOMINIOS_ACTIVOS) si DOMINIOS_ACTIVOS
+    cambió desde que se construyó (p. ej. dp.DOMINIOS_ACTIVOS = ["salud"] en
+    Colab). Los cambios en caliente hechos antes sobre dp.kg se pierden:
+    fija DOMINIOS_ACTIVOS primero y edita el grafo después.
+    """
+    global KNOWLEDGE_GRAPH, kg, _DOMINIOS_APLICADOS
+    activos = tuple(DOMINIOS_ACTIVOS)
+    if not forzar and activos == _DOMINIOS_APLICADOS:
+        return kg
+    print(f"ℹ️ DOMINIOS_ACTIVOS = {list(activos)}: se reconstruye el grafo de conocimiento.")
+    KNOWLEDGE_GRAPH = kg = agregar_reglas_dominio(construir_grafo_conocimiento(), activos)
+    _DOMINIOS_APLICADOS = activos
+    return kg
 
 # ── Asignar grafo al alias global que usan los nodos del pipeline ──
 kg = KNOWLEDGE_GRAPH
@@ -2929,8 +2999,8 @@ def _map_tipo_problema(tipo_inferido: str, problema: str) -> tuple:
     Mapea los tipos/problemas del LLM a los nodos del grafo kg.
 
     Consulta los diccionarios globales TIPO_MAP y PROBLEMA_MAP, que incluyen
-    tanto las reglas estadísticas base como las reglas de dominio (Salud,
-    Finanzas, Economía y Seguridad Ocupacional).
+    los alias base y los de todos los dominios registrados; solo resuelven los
+    alias cuyo nodo está en el grafo vigente (dominios en DOMINIOS_ACTIVOS).
 
     Si la etiqueta no es un alias, se acepta el nombre del nodo tal cual (sin
     distinguir mayúsculas), de modo que un nodo nuevo del usuario es alcanzable
@@ -2947,11 +3017,12 @@ def _resolver_etiqueta(etiqueta, mapa: Dict[str, Any], nodos: List[str]) -> Opti
     """Alias del mapa o, si no, el nombre de un nodo del grafo (sin distinguir mayúsculas)."""
     if not isinstance(etiqueta, str) or not etiqueta.strip():
         return None
-    if etiqueta in mapa:
-        return mapa[etiqueta]
+    # Un alias solo vale si su nodo está en el grafo vigente (los alias de un
+    # dominio inactivo no resuelven: el problema va al fallback del LLM).
     buscada = etiqueta.strip().lower()
-    if buscada in mapa:
-        return mapa[buscada]
+    for clave in (etiqueta, buscada):
+        if clave in mapa and mapa[clave] in kg:
+            return mapa[clave]
     return next((n for n in nodos if n.lower() == buscada), None)
 
 
@@ -4607,6 +4678,7 @@ def run_datapulse(
     global kg
     if kg is None:
         kg = KNOWLEDGE_GRAPH
+    aplicar_dominios_activos()
 
     # Resolver fuente del archivo
     gh_file   = github_file   or GITHUB_DATA_FILE

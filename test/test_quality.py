@@ -37,7 +37,6 @@ def test_knowledge_graph_construction():
     kg = agregar_reglas_dominio(kg)
     assert kg.number_of_edges() > edges_before, "Domain rules should add edges"
 
-    # 116 base (estadísticas + estructurales + centinelas + negativos inciertos) + 26 de dominio = 142
     assert kg.number_of_edges() > 100, (
         f"Total edges should exceed 100, got {kg.number_of_edges()}"
     )
@@ -60,8 +59,10 @@ def test_domain_rules_connected():
     for alias, node in PROBLEMA_MAP_DOMINIO.items():
         assert PROBLEMA_MAP.get(alias) == node, f"PROBLEMA_MAP missing domain alias {alias}"
 
+    # Con DOMINIOS_ACTIVOS vacía los alias de dominio no resuelven (fallback del LLM);
+    # la resolución con el dominio activo se prueba en test_dominios.py.
     src, tgt = _map_tipo_problema("signo_vital", "rango_clinico_invalido")
-    assert (src, tgt) == ("Variable_Clinica_Signo_Vital", "Rango_Clinico_Invalido")
+    assert (src, tgt) == (None, None)
     print("✅ Domain rules connected through global maps")
 
 

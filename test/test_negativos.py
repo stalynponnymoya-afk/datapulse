@@ -197,7 +197,6 @@ def test_nodo_negativos_inciertos():
     assert all(d["accion"] == "flag_sin_modificar" and d["parametros"]["modifica_valores"] is False
                for _, d in reglas)
     assert dp.PROBLEMA_MAP["negativos_inciertos"] == "Negativos_Inciertos"
-    assert dp.kg.number_of_edges() == 142
 
 
 # ── Trazabilidad: audit_log e informe, nunca error_history ──────────────────
