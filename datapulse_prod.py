@@ -23,6 +23,7 @@ import networkx as nx
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from operator import add
 from datetime import datetime
+from urllib.parse import quote
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_groq import ChatGroq
@@ -98,6 +99,10 @@ GITHUB_REPO       = _leer_config("GITHUB_REPO")
 GROQ_MODEL        = _leer_config("GROQ_MODEL", "openai/gpt-oss-120b")
 OH_TIMEOUT_SEG    = 900    # ventana de ejecución remota en OpenHands (~15 min)
 OH_STARTUP_TIMEOUT_SEG = 600  # espera máxima a que el sandbox quede READY
+# Lectura de eventos de OpenHands: 100 eventos por página y, como protección
+# contra bucles, un máximo de páginas (50 páginas = hasta 5.000 eventos).
+OH_EVENTOS_POR_PAGINA  = 100
+OH_MAX_PAGINAS_EVENTOS = 50
 # Política de intentos. Ambos valores son el NÚMERO TOTAL de intentos (el
 # primero incluido), no el número de reintentos:
 #   - OH_MAX_INTENTOS_INFRA = 2 → ante un fallo de infraestructura o del script
@@ -4011,6 +4016,120 @@ def _leer_salidas_rama(repo, rama: str, run_dir: str, nombres) -> tuple:
     return leidos, errores
 
 
+def _procesar_eventos_openhands(eventos: List[Dict[str, Any]], archivos: Dict[str, str],
+                                terminal_outputs: List[str]) -> Optional[str]:
+    """
+    Procesa una lista de eventos de OpenHands (cualquier página).
+
+    - FileEditorAction "create" / "str_replace": reconstruye en ``archivos`` los
+      archivos que editó el agente.
+    - Observaciones con texto: se añaden a ``terminal_outputs``.
+    Devuelve el mensaje del último FinishAction de la lista, o None.
+    """
+    finish_msg = None
+    for ev in eventos:
+        if not isinstance(ev, dict):
+            continue
+        act = ev.get("action")
+        if isinstance(act, dict):
+            kind = act.get("kind", "")
+            if kind == "FileEditorAction":
+                path = act.get("path", "")
+                cmd = act.get("command", "")
+                if cmd == "create" and act.get("file_text"):
+                    archivos[path] = act["file_text"]
+                elif cmd == "str_replace" and path in archivos:
+                    old = act.get("old_str", "")
+                    new = act.get("new_str", "")
+                    if old:
+                        archivos[path] = archivos[path].replace(old, new)
+            elif kind == "FinishAction":
+                finish_msg = act.get("message", "")
+        obs = ev.get("observation")
+        if isinstance(obs, dict):
+            oc = obs.get("content", [])
+            if isinstance(oc, list):
+                for c in oc:
+                    if isinstance(c, dict) and c.get("text"):
+                        terminal_outputs.append(c["text"])
+    return finish_msg
+
+
+def _clave_evento(ev: Dict[str, Any]) -> str:
+    """Identificador estable de un evento: su id si lo trae; si no, su contenido."""
+    if ev.get("id") is not None:
+        return f"id:{ev['id']}"
+    return "json:" + json.dumps(ev, sort_keys=True, default=str, ensure_ascii=False)
+
+
+def _leer_eventos_openhands(base: str, conv_id: str, headers: Dict[str, str],
+                            max_paginas: Optional[int] = None) -> tuple:
+    """
+    Lee todos los eventos de una conversación de OpenHands, página a página.
+
+    La API pagina así: la página siguiente se pide con ``page_id`` igual al
+    ``next_page_id`` de la respuesta anterior (GET .../events/search). Antes se
+    usaba ``start_id``, que la API no reconoce: devolvía siempre la misma página
+    y la lectura podía tardar decenas de minutos.
+
+    Protecciones contra bucles (cada una corta la lectura con un aviso):
+    - ``next_page_id`` repetido;
+    - una página que no trae eventos nuevos (se deduplican por id);
+    - más de ``max_paginas`` páginas (por defecto OH_MAX_PAGINAS_EVENTOS).
+
+    Devuelve (eventos_sin_duplicados, avisos). Si la primera página falla,
+    devuelve ([], [aviso]) y node_ejecutar sigue con la lectura de la rama.
+    """
+    limite = max_paginas or OH_MAX_PAGINAS_EVENTOS
+    url_base = f"{base}/conversation/{conv_id}/events/search?limit={OH_EVENTOS_POR_PAGINA}"
+    eventos: List[Dict[str, Any]] = []
+    avisos: List[str] = []
+    vistos: set = set()
+    tokens_usados: set = set()
+    page_id: Optional[str] = None
+
+    for numero in range(1, limite + 1):
+        url = url_base + (f"&page_id={quote(str(page_id), safe='')}" if page_id else "")
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            avisos.append(f"Eventos de OpenHands: la página {numero} respondió HTTP {r.status_code}; "
+                          "se usan los eventos leídos hasta ahí.")
+            break
+        datos = r.json() or {}
+        items = [ev for ev in (datos.get("items") or []) if isinstance(ev, dict)]
+        nuevos = []
+        for ev in items:
+            clave = _clave_evento(ev)
+            if clave not in vistos:
+                vistos.add(clave)
+                nuevos.append(ev)
+        eventos.extend(nuevos)
+        if numero == 1:
+            print(f"   📋 Eventos: {len(nuevos)}")
+        else:
+            print(f"   📋 Página {numero}: {len(nuevos)} eventos nuevos")
+
+        siguiente = datos.get("next_page_id")
+        if not siguiente:
+            break
+        if numero > 1 and not nuevos:
+            avisos.append(f"Eventos de OpenHands: la página {numero} no trajo eventos nuevos; "
+                          "se detiene la paginación.")
+            break
+        if siguiente == page_id or siguiente in tokens_usados:
+            avisos.append("Eventos de OpenHands: next_page_id repetido; se detiene la paginación.")
+            break
+        tokens_usados.add(siguiente)
+        page_id = siguiente
+    else:
+        avisos.append(f"Eventos de OpenHands: se alcanzó el máximo de {limite} páginas; "
+                      "puede haber eventos sin leer (los archivos de salida se leen de la rama).")
+
+    for aviso in avisos:
+        print(f"   ⚠️ {aviso}")
+    return eventos, avisos
+
+
 def node_ejecutar(state: DataPulseState) -> DataPulseState:
     """
     OpenHands Cloud API — sube archivo a GitHub + flujo real de 5 pasos.
@@ -4186,86 +4305,8 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         # ── PASO 5: Extraer código y score de eventos ───────────
         archivos = {}
         terminal_outputs = []
-        finish_msg = ""
-
-        r = requests.get(
-            f"{base}/conversation/{conv_id}/events/search?limit=100",
-            headers=headers, timeout=30,
-        )
-        if r.status_code == 200:
-            events = r.json().get("items", [])
-            print(f"   📋 Eventos: {len(events)}")
-
-            for ev in events:
-                if not isinstance(ev, dict):
-                    continue
-
-                act = ev.get("action")
-                if isinstance(act, dict):
-                    kind = act.get("kind", "")
-
-                    if kind == "FileEditorAction":
-                        path = act.get("path", "")
-                        cmd = act.get("command", "")
-                        if cmd == "create" and act.get("file_text"):
-                            archivos[path] = act["file_text"]
-                        elif cmd == "str_replace" and path in archivos:
-                            old = act.get("old_str", "")
-                            new = act.get("new_str", "")
-                            if old:
-                                archivos[path] = archivos[path].replace(old, new)
-
-                    elif kind == "FinishAction":
-                        finish_msg = act.get("message", "")
-
-                obs = ev.get("observation")
-                if isinstance(obs, dict):
-                    oc = obs.get("content", [])
-                    if isinstance(oc, list):
-                        for c in oc:
-                            if isinstance(c, dict) and c.get("text"):
-                                terminal_outputs.append(c["text"])
-
-            # Paginación — si hay next_page_id, cargar más
-            next_page = r.json().get("next_page_id")
-            while next_page:
-                r2 = requests.get(
-                    f"{base}/conversation/{conv_id}/events/search?limit=100&start_id={next_page}",
-                    headers=headers, timeout=30,
-                )
-                if r2.status_code != 200:
-                    break
-                page_data = r2.json()
-                page_events = page_data.get("items", [])
-                if not page_events:
-                    break
-                print(f"   📋 Página extra: {len(page_events)} eventos")
-                for ev in page_events:
-                    if not isinstance(ev, dict):
-                        continue
-                    act = ev.get("action")
-                    if isinstance(act, dict):
-                        kind = act.get("kind", "")
-                        if kind == "FileEditorAction":
-                            path = act.get("path", "")
-                            cmd = act.get("command", "")
-                            if cmd == "create" and act.get("file_text"):
-                                archivos[path] = act["file_text"]
-                            elif cmd == "str_replace" and path in archivos:
-                                old = act.get("old_str", "")
-                                new = act.get("new_str", "")
-                                if old:
-                                    archivos[path] = archivos[path].replace(old, new)
-                        elif kind == "FinishAction":
-                            finish_msg = act.get("message", "")
-                    obs = ev.get("observation")
-                    if isinstance(obs, dict):
-                        oc = obs.get("content", [])
-                        if isinstance(oc, list):
-                            for c in oc:
-                                if isinstance(c, dict) and c.get("text"):
-                                    terminal_outputs.append(c["text"])
-                next_page = page_data.get("next_page_id")
+        eventos, _avisos_eventos = _leer_eventos_openhands(base, conv_id, headers)
+        finish_msg = _procesar_eventos_openhands(eventos, archivos, terminal_outputs) or ""
 
         # Elegir script principal (.py más grande)
         codigo = ""
@@ -4306,8 +4347,13 @@ def node_ejecutar(state: DataPulseState) -> DataPulseState:
         run_dir = os.path.join("outputs", fecha + "-openhands")
         leidos, errores_lectura = _leer_salidas_rama(repo, rama, run_dir, SALIDAS_OPENHANDS)
         for nombre, contenido in leidos.items():
-            archivos.setdefault(nombre, contenido.decode("utf-8", errors="replace"))
-        if "datapulse_pipeline.py" in leidos and not py_files:
+            # La versión de la rama es la que realmente se ejecutó: reemplaza a
+            # la reconstruida desde los eventos (misma base de nombre), para no
+            # publicar el mismo archivo dos veces.
+            for ruta_evento in [p for p in archivos if p != nombre and os.path.basename(p) == nombre]:
+                del archivos[ruta_evento]
+            archivos[nombre] = contenido.decode("utf-8", errors="replace")
+        if "datapulse_pipeline.py" in leidos:
             codigo = archivos["datapulse_pipeline.py"]
         if score_reportado is None and "quality_report.json" in archivos:
             score_reportado = _leer_score_reportado(archivos["quality_report.json"])
@@ -4650,7 +4696,18 @@ def _build_files_to_commit(state: DataPulseState, ts: str) -> list:
     if not archivos_generados and state.get("codigo"):
         archivos_generados = {"datapulse_pipeline.py": state["codigo"]}
 
+    # Un archivo se publica una sola vez por destino. Si hay dos versiones con el
+    # mismo nombre (p. ej. la reconstruida desde los eventos de OpenHands y la
+    # leída de la rama), gana la que está guardada por su nombre simple: la de
+    # la rama, que es la que se ejecutó.
+    por_destino: Dict[str, tuple] = {}
     for original_path, content in archivos_generados.items():
+        fname = os.path.basename(original_path)
+        if fname in por_destino and original_path != fname:
+            continue
+        por_destino[fname] = (original_path, content)
+
+    for original_path, content in por_destino.values():
         fname = os.path.basename(original_path)
 
         # Omitir archivos vacíos o directorios
