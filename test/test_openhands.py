@@ -624,3 +624,152 @@ def test_es_archivo_datos():
     assert not dp._es_archivo_datos("outputs/ts/audit_log.json")
     assert not dp._es_archivo_datos("quality_report.json")
     assert not dp._es_archivo_datos("datapulse_pipeline.py")
+
+
+# ── Paginación de eventos de OpenHands ──────────────────────────────────────
+#
+# La API pagina con page_id = next_page_id de la página anterior. Antes se usaba
+# start_id, que la API ignora: devolvía siempre la misma página y la lectura
+# de eventos podía durar decenas de minutos.
+
+from urllib.parse import parse_qs, urlparse  # noqa: E402
+
+
+def _evento(i, extra=None):
+    ev = {"id": i, "observation": {"content": [{"text": f"paso {i}"}]}}
+    if extra:
+        ev.update(extra)
+    return ev
+
+
+class EventosPaginados:
+    """API de eventos simulada: devuelve páginas según page_id."""
+
+    def __init__(self, paginas, ignora_page_id=False, token_fijo=None):
+        self.paginas = paginas            # lista de listas de eventos
+        self.ignora_page_id = ignora_page_id
+        self.token_fijo = token_fijo
+        self.urls = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.urls.append(url)
+        consulta = parse_qs(urlparse(url).query)
+        page_id = consulta.get("page_id", [None])[0]
+        indice = 0 if (page_id is None or self.ignora_page_id) else int(page_id.split("-")[1])
+        siguiente = indice + 1
+        if self.token_fijo:
+            token = self.token_fijo
+        else:
+            token = f"pag-{siguiente}" if siguiente < len(self.paginas) else None
+        return _Resp({"items": self.paginas[indice], "next_page_id": token})
+
+
+def test_paginacion_usa_page_id_y_lee_todas_las_paginas(monkeypatch):
+    paginas = [
+        [_evento(i) for i in range(0, 100)],
+        [_evento(i) for i in range(100, 200)],
+        [_evento(200, EVENTO_SCRIPT), _evento(201, EVENTO_FIN)],
+    ]
+    api = EventosPaginados(paginas)
+    monkeypatch.setattr(dp.requests, "get", api.get)
+
+    eventos, avisos = dp._leer_eventos_openhands(BASE, "conv-1", {})
+    assert len(api.urls) == 3
+    assert all("start_id" not in u for u in api.urls)
+    assert "page_id=pag-1" in api.urls[1] and "page_id=pag-2" in api.urls[2]
+    assert len(eventos) == 202 and avisos == []
+
+    archivos, salidas = {}, []
+    fin = dp._procesar_eventos_openhands(eventos, archivos, salidas)
+    assert fin == "Listo"
+    assert archivos["/workspace/repo/datapulse_pipeline.py"].startswith("import sys")
+    assert len(salidas) == 202
+
+
+def test_paginacion_servidor_que_ignora_page_id_no_produce_bucle(monkeypatch):
+    """Si la API repite la misma página, se corta en la segunda petición."""
+    paginas = [[_evento(i) for i in range(100)], [_evento(999)]]
+    api = EventosPaginados(paginas, ignora_page_id=True, token_fijo="pag-1")
+    monkeypatch.setattr(dp.requests, "get", api.get)
+
+    eventos, avisos = dp._leer_eventos_openhands(BASE, "conv-1", {})
+    assert len(api.urls) == 2
+    assert len(eventos) == 100
+    assert avisos and "no trajo eventos nuevos" in avisos[0]
+
+
+def test_paginacion_next_page_id_repetido_corta(monkeypatch):
+    """Eventos nuevos pero el mismo next_page_id: también se corta."""
+    paginas = [[_evento(0)], [_evento(1)], [_evento(2)], [_evento(3)]]
+    api = EventosPaginados(paginas, token_fijo="pag-1")
+    monkeypatch.setattr(dp.requests, "get", api.get)
+
+    eventos, avisos = dp._leer_eventos_openhands(BASE, "conv-1", {})
+    assert len(api.urls) == 2
+    assert [e["id"] for e in eventos] == [0, 1]
+    assert avisos and "repetido" in avisos[0]
+
+
+def test_paginacion_corta_en_el_maximo_de_paginas(monkeypatch):
+    paginas = [[_evento(i)] for i in range(10)]
+    api = EventosPaginados(paginas)
+    monkeypatch.setattr(dp.requests, "get", api.get)
+
+    eventos, avisos = dp._leer_eventos_openhands(BASE, "conv-1", {}, max_paginas=3)
+    assert len(api.urls) == 3
+    assert len(eventos) == 3
+    assert avisos and "máximo de 3 páginas" in avisos[0]
+
+
+def test_paginacion_error_http_conserva_lo_leido(monkeypatch):
+    llamadas = []
+
+    def get(url, headers=None, timeout=None):
+        llamadas.append(url)
+        if len(llamadas) == 1:
+            return _Resp({"items": [_evento(0)], "next_page_id": "pag-1"})
+        return _Resp({}, status=429)
+
+    monkeypatch.setattr(dp.requests, "get", get)
+    eventos, avisos = dp._leer_eventos_openhands(BASE, "conv-1", {})
+    assert len(eventos) == 1
+    assert avisos and "HTTP 429" in avisos[0]
+
+
+# ── El script se publica una sola vez ───────────────────────────────────────
+
+def test_script_de_la_rama_reemplaza_al_de_los_eventos_y_se_publica_una_vez(entorno):
+    estado, configurar = entorno
+    salidas = {
+        "processed_data.csv": _limpio_csv(),
+        "quality_report.json": b'{"score": 90}',
+        "cleaning_log.json": b"[]",
+        "datapulse_pipeline.py": b"# version de la rama\nimport sys\n",
+    }
+    repo = RepoFalso(private=True, salidas=salidas)
+    oh = OpenHandsFalso(eventos=[EVENTO_SCRIPT, EVENTO_FIN])
+    configurar(repo, oh)
+
+    res = dp.node_ejecutar(estado)
+    scripts = [p for p in res["archivos_generados"] if os.path.basename(p) == "datapulse_pipeline.py"]
+    assert scripts == ["datapulse_pipeline.py"]
+    assert res["codigo"].startswith("# version de la rama")
+
+    publicados = dp._build_files_to_commit({**estado, **res}, "20260101-000000")
+    nombres = [path for path, _ in publicados if os.path.basename(path) == "datapulse_pipeline.py"]
+    assert nombres == ["datapulse_pipeline.py"]
+
+
+def test_build_files_to_commit_deduplica_por_nombre():
+    estado = {
+        "filename": "ventas.csv",
+        "archivos_generados": {
+            "/workspace/repo/datapulse_pipeline.py": "# eventos",
+            "datapulse_pipeline.py": "# rama",
+            "/workspace/repo/extra.py": "x = 1",
+        },
+    }
+    publicados = dict(dp._build_files_to_commit(estado, "20260101-000000"))
+    assert publicados["datapulse_pipeline.py"] == "# rama"
+    assert list(publicados).count("datapulse_pipeline.py") == 1
+    assert "outputs/20260101-000000/extra.py" in publicados
